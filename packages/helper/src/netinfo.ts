@@ -1,4 +1,7 @@
 import {
+  cidrContains,
+  DEVICE_NAME,
+  IPV4_BITS,
   normalizeHostAddress,
   normalizeIpv4,
   parseIpv4Destination,
@@ -13,8 +16,9 @@ import type { Logger } from './logger';
 
 /**
  * Answers "which device plays each interface role right now, and can routes go
- * through it?". Read-only: it runs `networksetup -listallhardwareports` and
- * `ipconfig getifaddr|getoption`, nothing else.
+ * through it?". Read-only: it runs `networksetup -listallhardwareports`,
+ * `ipconfig getifaddr|getoption` and, only when the DHCP lease has no router or
+ * no subnet mask for a role, `netstat -rn -f inet` (once per detection).
  *
  * How a role gets its device:
  * - `wifi` — the hardware port named `Wi-Fi` (compared without regard to
@@ -27,6 +31,15 @@ import type { Logger } from './logger';
  * - An override (`role -> en<digits>`) always wins over the heuristic, even
  *   when the device has no address. A device claimed by an override is never
  *   given to the other role.
+ *
+ * Where gateway and connected subnet come from:
+ * - First the DHCP lease: `ipconfig getoption <dev> router|subnet_mask`.
+ * - `ipconfig getoption` only reads the lease, so an interface with a manually
+ *   configured (static) address has neither. When an option has no value (not
+ *   when its query failed), the routing table is the fallback: the gateway is
+ *   the one of the device's `default` row, the connected subnet is the
+ *   device's `link#N` network row that contains the interface address.
+ * - Nothing read from the routing table is ever put into an argv.
  *
  * Error model: nothing here throws or rejects for a runtime condition. A
  * command that fails, times out or prints something unexpected degrades the
@@ -50,9 +63,6 @@ export const NETINFO_COMMAND_TIMEOUT_MS = 5_000;
 const IPCONFIG_NO_VALUE_EXIT_CODE = 1;
 const IPCONFIG_EXPECTED_EXIT_CODES: readonly number[] = [IPCONFIG_NO_VALUE_EXIT_CODE];
 
-const DEVICE_NAME = /^en\d+$/;
-/** Same bound as the wire schema's device name. */
-const DEVICE_NAME_MAX_LENGTH = 16;
 const WIFI_PORT_NAME = 'wi-fi';
 const LOGGED_INPUT_LIMIT = 64;
 
@@ -61,20 +71,54 @@ const DEVICE_KEY = 'Device:';
 /** Heading of the section after the port list; its blocks are not hardware ports. */
 const VLAN_SECTION = 'VLAN Configurations';
 
+/** The IPv4 routing table, numeric: the fallback source for gateway and connected subnet. */
+const NETSTAT_ROUTES_ARGS: readonly string[] = ['-rn', '-f', 'inet'];
+/** Title line of the IPv4 section of `netstat -rn`. */
+const NETSTAT_INET_SECTION = 'Internet:';
+/** First cell of the column header line; also the name of the destination column. */
+const NETSTAT_DESTINATION_COLUMN = 'Destination';
+const NETSTAT_GATEWAY_COLUMN = 'Gateway';
+const NETSTAT_FLAGS_COLUMN = 'Flags';
+const NETSTAT_NETIF_COLUMN = 'Netif';
+const NETSTAT_DEFAULT_DESTINATION = 'default';
+/** Gateway cell of a directly connected route: `link#<interface index>`. */
+const NETSTAT_LINK_PREFIX = 'link#';
+const NETSTAT_LINK_INDEX_MAX_DIGITS = 10;
+/** `RTF_IFSCOPE`: the route applies only to traffic bound to its interface. */
+const NETSTAT_SCOPED_FLAG = 'I';
+/**
+ * Bounds on the work done for one table. A real row is under 100 characters
+ * and a table that fits the runner's output limit has far fewer lines than
+ * this; a longer line is skipped, a longer output is not trusted at all.
+ */
+export const NETSTAT_MAX_LINE_LENGTH = 512;
+export const NETSTAT_MAX_LINES = 20_000;
+const OCTET_MAX = 255;
+const OCTET_MAX_DIGITS = 3;
+const PREFIX_MAX_DIGITS = 2;
+const BITS_PER_OCTET = 8;
+/** Highest first octet of class A, B and C: the networks `netstat` prints without a prefix. */
+const CLASS_A_MAX = 127;
+const CLASS_B_MAX = 191;
+const CLASS_C_MAX = 223;
+
 /**
  * Why a role cannot be used for routing; `null` on a usable role.
  * - `hardware-ports-unavailable` — `networksetup` failed or listed no port.
  * - `no-device` — no port can play the role (no Wi-Fi port; no `en*` port
  *   other than Wi-Fi).
- * - `invalid-override` — the override is not an `en<digits>` name.
+ * - `invalid-override` — the override is not an `en<digits>` name, or the
+ *   options passed to `detectInterfaces` could not be read at all.
  * - `override-not-found` — the overridden device is not a hardware port now.
  * - `override-conflict` — the device belongs to the other role's override.
  * - `no-address` — the device (or, for the Ethernet heuristic, every
  *   candidate) has no IPv4 address: cable unplugged, Wi-Fi not associated.
  * - `address-lookup-failed` — the address query itself failed.
- * - `no-gateway` — an address but no router from DHCP.
- * - `gateway-lookup-failed` — the router query failed or returned something
- *   that is not a usable IPv4 address.
+ * - `no-gateway` — an address, but neither a router in the DHCP lease nor a
+ *   `default` route through the device in the routing table.
+ * - `gateway-lookup-failed` — the router query (or, for the fallback, reading
+ *   the routing table) failed or returned something that is not a usable IPv4
+ *   address.
  */
 export type InterfaceDownReason =
   | 'hardware-ports-unavailable'
@@ -102,11 +146,14 @@ export interface InterfaceInfo {
   /** Hardware port name of `device`; `null` when the device is not a listed port. */
   readonly port: string | null;
   readonly ip: string | null;
-  /** Next hop for routes through this role. */
+  /** Next hop for routes through this role: the DHCP router, else the device's default route. */
   readonly gateway: string | null;
   /** Dotted subnet mask, e.g. `255.255.255.0`; `null` when unknown or not contiguous. */
   readonly netmask: string | null;
-  /** Connected subnet in canonical CIDR form, e.g. `192.168.1.0/24`. */
+  /**
+   * Connected subnet in canonical CIDR form, e.g. `192.168.1.0/24`: from the
+   * DHCP mask, else from the routing table. `null` when neither gives one.
+   */
   readonly subnet: string | null;
   /** The role has a device with an IPv4 address (the meaning `InterfaceState.up` has on the wire). */
   readonly up: boolean;
@@ -147,7 +194,12 @@ export interface DetectOptions {
 }
 
 export interface NetInfo {
-  /** Never rejects. Results are cached for `NETINFO_CACHE_TTL_MS` per set of overrides. */
+  /**
+   * Never rejects and never throws, whatever it is given: options that cannot
+   * be read give a result with both roles down (`invalid-override`) and
+   * `degraded` set. Results are cached for `NETINFO_CACHE_TTL_MS` per set of
+   * overrides.
+   */
   detectInterfaces(options?: DetectOptions): Promise<DetectedInterfaces>;
   /** Drops the cached result and detaches from any detection still running. */
   invalidate(): void;
@@ -160,8 +212,8 @@ export interface NetInfoDeps {
   readonly now?: () => number;
 }
 
-const isDeviceName = (value: unknown): value is string =>
-  typeof value === 'string' && value.length <= DEVICE_NAME_MAX_LENGTH && DEVICE_NAME.test(value);
+/** `en` + 1..14 digits: the one pattern shared with the config and wire schemas. */
+const isDeviceName = (value: unknown): value is string => typeof value === 'string' && DEVICE_NAME.test(value);
 
 /**
  * Parses `networksetup -listallhardwareports`: blank-line separated blocks of
@@ -210,6 +262,178 @@ export const netmaskToPrefix = (mask: string): number | null => {
   return prefix === 0 ? null : prefix;
 };
 
+/** A non-negative decimal number of at most `maxDigits` digits without a sign or leading zero. */
+const parseDecimal = (text: string, maxDigits: number): number | null => {
+  if (text.length === 0 || text.length > maxDigits) return null;
+  if (text.length > 1 && text.startsWith('0')) return null;
+  let value = 0;
+  for (let index = 0; index < text.length; index += 1) {
+    const digit = text.charCodeAt(index) - 48;
+    if (digit < 0 || digit > 9) return null;
+    value = value * 10 + digit;
+  }
+  return value;
+};
+
+/** Dotted mask of a prefix length 0..32. */
+const prefixToNetmask = (prefix: number): string => {
+  const bits = prefix === 0 ? 0 : (-1 << (IPV4_BITS - prefix)) >>> 0;
+  return [bits >>> 24, (bits >>> 16) & OCTET_MAX, (bits >>> 8) & OCTET_MAX, bits & OCTET_MAX].join('.');
+};
+
+/** Prefix `netstat` leaves out: the classful one of the first octet. `null` outside classes A..C. */
+const naturalPrefix = (firstOctet: number): number | null => {
+  if (firstOctet < 1 || firstOctet > CLASS_C_MAX) return null;
+  if (firstOctet <= CLASS_A_MAX) return BITS_PER_OCTET;
+  return firstOctet <= CLASS_B_MAX ? 2 * BITS_PER_OCTET : 3 * BITS_PER_OCTET;
+};
+
+/**
+ * Expands a network destination as `netstat -rn` prints it into canonical
+ * CIDR form, or `null` when it is not an unambiguous network.
+ *
+ * macOS drops trailing zero octets, and drops the prefix when it is the
+ * classful one of the address:
+ * - with a prefix, 1..4 octets are padded with zeros: `172.16/12` ->
+ *   `172.16.0.0/12`, `10.20.4/22` -> `10.20.4.0/22`, `192.168.1.64/26` as is;
+ * - without one, the octets must be exactly the network part of the class:
+ *   `10` -> `10.0.0.0/8`, `172.20` -> `172.20.0.0/16`, `192.168.1` ->
+ *   `192.168.1.0/24`. Anything else without a prefix is refused instead of
+ *   guessed: four octets are a host route, and `10.20.4` or `192.168` is not
+ *   something `netstat` prints for a network.
+ *
+ * Refused as well: octets that are not plain decimals 0..255, a destination
+ * whose host bits are set for its prefix, the non-contiguous `&0x…` form,
+ * `default` and everything that is not IPv4.
+ */
+export const expandNetstatDestination = (destination: string): string | null => {
+  if (destination.length > NETSTAT_MAX_LINE_LENGTH) return null;
+  const parts = destination.split('/');
+  const [addressPart, prefixPart] = parts;
+  if (parts.length > 2 || addressPart === undefined) return null;
+
+  const cells = addressPart.split('.');
+  if (cells.length > 4) return null;
+  const octets: number[] = [];
+  for (const cell of cells) {
+    const octet = parseDecimal(cell, OCTET_MAX_DIGITS);
+    if (octet === null || octet > OCTET_MAX) return null;
+    octets.push(octet);
+  }
+
+  let prefix: number | null;
+  if (prefixPart === undefined) {
+    prefix = naturalPrefix(octets[0] ?? 0);
+    if (prefix === null || prefix !== octets.length * BITS_PER_OCTET) return null;
+  } else {
+    prefix = parseDecimal(prefixPart, PREFIX_MAX_DIGITS);
+    if (prefix === null || prefix > IPV4_BITS) return null;
+  }
+
+  while (octets.length < 4) octets.push(0);
+  const address = octets.join('.');
+  const parsed = parseIpv4Destination(`${address}/${String(prefix)}`);
+  return parsed !== null && parsed.address === address ? parsed.cidr : null;
+};
+
+/** One row of the IPv4 routing table that belongs to an `en<digits>` device. */
+export interface RoutingTableRow {
+  /** First column as printed: `default`, `192.168.1`, `10.20.4/22`. Not validated. */
+  readonly destination: string;
+  /** Gateway column as printed: an address, or `link#<n>`. Not validated. */
+  readonly gateway: string;
+  /** Flags column as printed, e.g. `UGScIg`. */
+  readonly flags: string;
+  /** Interface column; always matches `DEVICE_NAME`. */
+  readonly device: string;
+}
+
+/** The rows of `netstat -rn -f inet` that netinfo can use, in table order. */
+export interface RoutingTable {
+  /** `default` rows. */
+  readonly defaults: readonly RoutingTableRow[];
+  /** Rows whose gateway is `link#<n>`: directly connected destinations. */
+  readonly connected: readonly RoutingTableRow[];
+}
+
+/** Whitespace-separated cells of one line; spaces, tabs and a stray CR all separate. */
+const splitCells = (line: string): string[] => {
+  const cells: string[] = [];
+  for (const part of line.replaceAll('\t', ' ').split(' ')) {
+    const cell = part.trim();
+    if (cell !== '') cells.push(cell);
+  }
+  return cells;
+};
+
+const isLinkGateway = (gateway: string): boolean =>
+  gateway.startsWith(NETSTAT_LINK_PREFIX) &&
+  parseDecimal(gateway.slice(NETSTAT_LINK_PREFIX.length), NETSTAT_LINK_INDEX_MAX_DIGITS) !== null;
+
+/**
+ * Parses `netstat -rn -f inet` (the wide `-l` form works too):
+ *
+ *     Routing tables
+ *
+ *     Internet:
+ *     Destination        Gateway            Flags               Netif Expire
+ *     default            192.168.1.1        UGScg                 en0
+ *     default            10.20.4.1          UGScIg                en5
+ *     192.168.1          link#15            UCS                   en0      !
+ *
+ * Lines are split into cells and trimmed, never pattern-matched. Rows are read
+ * only inside the `Internet:` section and only after its column header, which
+ * also says where the gateway, flags and interface cells are — so a missing
+ * `Expire` column or extra columns do not matter. Kept are the `default` rows
+ * and the `link#<n>` rows of devices named `en<digits>`; everything else (host
+ * routes through a gateway, other sections, other interfaces, short or
+ * over-long lines) is skipped.
+ *
+ * Returns `null` when the output cannot be trusted: no IPv4 section with a
+ * column header, or more than `NETSTAT_MAX_LINES` lines.
+ */
+export const parseRoutingTable = (stdout: string): RoutingTable | null => {
+  const defaults: RoutingTableRow[] = [];
+  const connected: RoutingTableRow[] = [];
+  let inInet = false;
+  let columns: { gateway: number; flags: number; netif: number } | null = null;
+  let sawHeader = false;
+  let lines = 0;
+
+  for (const raw of stdout.split('\n')) {
+    lines += 1;
+    if (lines > NETSTAT_MAX_LINES) return null;
+    if (raw.length > NETSTAT_MAX_LINE_LENGTH) continue;
+    const cells = splitCells(raw);
+    const [first] = cells;
+    if (first === undefined) continue;
+
+    if (cells.length === 1 && first.endsWith(':')) {
+      inInet = first === NETSTAT_INET_SECTION;
+      columns = null;
+      continue;
+    }
+    if (first === NETSTAT_DESTINATION_COLUMN) {
+      const gateway = cells.indexOf(NETSTAT_GATEWAY_COLUMN);
+      const flags = cells.indexOf(NETSTAT_FLAGS_COLUMN);
+      const netif = cells.indexOf(NETSTAT_NETIF_COLUMN);
+      columns = inInet && gateway > 0 && flags > 0 && netif > 0 ? { gateway, flags, netif } : null;
+      sawHeader ||= columns !== null;
+      continue;
+    }
+    if (!inInet || columns === null) continue;
+
+    const gateway = cells[columns.gateway];
+    const flags = cells[columns.flags];
+    const device = cells[columns.netif];
+    if (gateway === undefined || flags === undefined || !isDeviceName(device)) continue;
+    const row: RoutingTableRow = { destination: first, gateway, flags, device };
+    if (first === NETSTAT_DEFAULT_DESTINATION) defaults.push(row);
+    else if (isLinkGateway(gateway)) connected.push(row);
+  }
+  return sawHeader ? { defaults, connected } : null;
+};
+
 /** The wire form of one role: what `EngineState.interfaces` carries. */
 export const toInterfaceState = (info: InterfaceInfo): InterfaceState => ({
   device: info.device,
@@ -241,10 +465,31 @@ const describeInput = (value: unknown): string =>
 
 const describeThrown = (error: unknown): string => (error instanceof Error ? error.message : String(error));
 
-const overrideOf = (overrides: unknown, role: IfaceRole): unknown =>
-  typeof overrides === 'object' && overrides !== null
-    ? (overrides as Readonly<Record<string, unknown>>)[role]
+/** An own property of an object; inherited ones are ignored, so a polluted prototype injects nothing. */
+const ownProperty = (source: unknown, key: string): unknown =>
+  typeof source === 'object' && source !== null && Object.hasOwn(source, key)
+    ? (source as Readonly<Record<string, unknown>>)[key]
     : undefined;
+
+const overrideOf = (overrides: unknown, role: IfaceRole): unknown => ownProperty(overrides, role);
+
+/** What one call asks for, read once from the caller's objects (their getters run here and nowhere else). */
+interface DetectRequest {
+  readonly overrides: { readonly ethernet: unknown; readonly wifi: unknown };
+  readonly force: boolean;
+}
+
+/** Throws when `options` is neither `undefined` nor an object, or when reading it throws. */
+const readRequest = (options: unknown): DetectRequest => {
+  if (options !== undefined && (typeof options !== 'object' || options === null)) {
+    throw new TypeError(`detection options must be an object, got ${options === null ? 'null' : typeof options}`);
+  }
+  const overrides = ownProperty(options, 'overrides');
+  return {
+    overrides: { ethernet: overrideOf(overrides, 'ethernet'), wifi: overrideOf(overrides, 'wifi') },
+    force: ownProperty(options, 'force') === true,
+  };
+};
 
 /** Cache identity of a set of overrides; anything that is not a string counts as one "invalid" value. */
 const overridesKey = (overrides: unknown): string =>
@@ -257,6 +502,28 @@ const overridesKey = (overrides: unknown): string =>
   );
 
 type IpconfigQuery = 'address' | 'router' | 'subnet_mask';
+
+/** Where a role's gateway or subnet came from; `null` when there is none. Logged, not returned. */
+type ValueSource = 'dhcp' | 'routing-table' | null;
+
+interface SubnetLookup {
+  readonly netmask: string | null;
+  readonly subnet: string | null;
+  readonly failed: boolean;
+}
+
+interface RoleSources {
+  readonly gateway: ValueSource;
+  readonly subnet: ValueSource;
+}
+
+const NO_SOURCES: RoleSources = { gateway: null, subnet: null };
+
+/** A detection result plus what is only logged about it. */
+interface Detection {
+  readonly result: DetectedInterfaces;
+  readonly sources: { readonly ethernet: RoleSources; readonly wifi: RoleSources };
+}
 
 interface Lookup {
   /** Trimmed output; `null` when there is no value. */
@@ -297,6 +564,17 @@ const down = (role: IfaceRole, choice: RoleChoice, reason: InterfaceDownReason):
 });
 
 const NOTHING: RoleChoice = { device: null, port: null, overridden: false, reason: null };
+
+/** Both roles down for one reason, nothing listed: the answer when detection itself could not run. */
+const unavailable = (reason: InterfaceDownReason): Detection => ({
+  result: {
+    ethernet: down('ethernet', NOTHING, reason),
+    wifi: down('wifi', NOTHING, reason),
+    adapters: [],
+    degraded: true,
+  },
+  sources: { ethernet: NO_SOURCES, wifi: NO_SOURCES },
+});
 
 const freezeResult = (result: DetectedInterfaces): DetectedInterfaces => {
   for (const adapter of result.adapters) Object.freeze(adapter);
@@ -391,10 +669,7 @@ export const createNetInfo = (deps: NetInfoDeps): NetInfo => {
     return FAILED;
   };
 
-  const lookupSubnet = async (
-    device: string,
-    ip: string,
-  ): Promise<{ netmask: string | null; subnet: string | null; failed: boolean }> => {
+  const lookupSubnet = async (device: string, ip: string): Promise<SubnetLookup> => {
     const lookup = await ipconfig(device, 'subnet_mask');
     if (lookup.value === null) return { netmask: null, subnet: null, failed: lookup.failed };
     const prefix = netmaskToPrefix(lookup.value);
@@ -405,6 +680,79 @@ export const createNetInfo = (deps: NetInfoDeps): NetInfo => {
       return { netmask: null, subnet: null, failed: true };
     }
     return { netmask: netmask.value, subnet, failed: false };
+  };
+
+  /** `null` when the table could not be read or does not look like one. */
+  const loadRoutingTable = async (): Promise<RoutingTable | null> => {
+    const result = await run(ALLOWED_BINARIES.netstat, NETSTAT_ROUTES_ARGS);
+    if (result === null) return null;
+    if (!result.ok) {
+      logger.warn('could not read the routing table', { failure: result.failure, exitCode: result.exitCode });
+      return null;
+    }
+    const table = parseRoutingTable(result.stdout);
+    if (table === null) {
+      logger.warn('unexpected output from netstat', { outputLength: result.stdout.length });
+    }
+    return table;
+  };
+
+  /**
+   * Gateway of the device's `default` route. With several such rows the choice
+   * is fixed: rows that are not interface-scoped (no `I` flag — the route the
+   * system itself uses) before scoped ones, then table order; the first row
+   * whose gateway is a usable next hop wins. An on-link default (`link#<n>`)
+   * has no next hop and counts as "no gateway"; any other unusable gateway is
+   * a failed lookup, as it is for the DHCP router.
+   */
+  const gatewayFromRoutingTable = (table: RoutingTable | null, device: string): Lookup => {
+    if (table === null) return FAILED;
+    const rows = table.defaults.filter((row) => row.device === device);
+    const ordered = [
+      ...rows.filter((row) => !row.flags.includes(NETSTAT_SCOPED_FLAG)),
+      ...rows.filter((row) => row.flags.includes(NETSTAT_SCOPED_FLAG)),
+    ];
+    let unusable: RoutingTableRow | null = null;
+    for (const row of ordered) {
+      const gateway = normalizeHostAddress(row.gateway);
+      if (gateway.ok) {
+        logger.debug('gateway taken from the routing table', { device, gateway: gateway.value, candidates: rows.length });
+        return { value: gateway.value, failed: false };
+      }
+      if (!isLinkGateway(row.gateway)) unusable ??= row;
+    }
+    if (unusable === null) return NO_VALUE;
+    logger.warn('the routing table has an unusable default gateway', {
+      device,
+      value: describeInput(unusable.gateway),
+    });
+    return FAILED;
+  };
+
+  /**
+   * Connected subnet of the device: its `link#<n>` network row that contains
+   * the interface address. Host rows (`/32`, bare addresses) and `/0` are not
+   * subnets; rows for other networks of the device (`169.254`, `224.0.0/4`)
+   * do not contain the address. When several rows do, the most specific one
+   * is the subnet the address is in. No such row is "unknown", not an error.
+   */
+  const subnetFromRoutingTable = (table: RoutingTable | null, device: string, ip: string): SubnetLookup => {
+    if (table === null) return { netmask: null, subnet: null, failed: true };
+    let best: { cidr: string; prefix: number } | null = null;
+    for (const row of table.connected) {
+      if (row.device !== device) continue;
+      const cidr = expandNetstatDestination(row.destination);
+      const prefix = cidr === null ? null : (parseIpv4Destination(cidr)?.prefix ?? null);
+      if (cidr === null || prefix === null || prefix === 0 || prefix === IPV4_BITS) continue;
+      if (!cidrContains(cidr, ip)) continue;
+      if (best === null || prefix > best.prefix) best = { cidr, prefix };
+    }
+    if (best === null) {
+      logger.debug('no connected subnet for the address in the routing table', { device });
+      return { netmask: null, subnet: null, failed: false };
+    }
+    logger.debug('connected subnet taken from the routing table', { device, subnet: best.cidr });
+    return { netmask: prefixToNetmask(best.prefix), subnet: best.cidr, failed: false };
   };
 
   const listHardwarePorts = async (): Promise<HardwarePort[] | null> => {
@@ -450,18 +798,30 @@ export const createNetInfo = (deps: NetInfoDeps): NetInfo => {
     role: IfaceRole,
     choice: RoleChoice,
     addresses: ReadonlyMap<string, Lookup>,
-  ): Promise<{ info: InterfaceInfo; degraded: boolean }> => {
+    routingTable: () => Promise<RoutingTable | null>,
+  ): Promise<{ info: InterfaceInfo; degraded: boolean; sources: RoleSources }> => {
     if (choice.reason !== null || choice.device === null) {
-      return { info: down(role, choice, choice.reason ?? 'no-device'), degraded: false };
+      return { info: down(role, choice, choice.reason ?? 'no-device'), degraded: false, sources: NO_SOURCES };
     }
     const { device } = choice;
     const address = addresses.get(device) ?? FAILED;
     if (address.value === null) {
       const reason = address.failed ? 'address-lookup-failed' : 'no-address';
-      return { info: down(role, choice, reason), degraded: address.failed };
+      return { info: down(role, choice, reason), degraded: address.failed, sources: NO_SOURCES };
     }
     const ip = address.value;
-    const [gateway, subnet] = await Promise.all([lookupGateway(device), lookupSubnet(device, ip)]);
+    const [leaseGateway, leaseSubnet] = await Promise.all([lookupGateway(device), lookupSubnet(device, ip)]);
+    // The routing table is consulted only for what the lease does not have. A
+    // lease query that failed is not "no value": it stays failed.
+    const gatewayMissing = leaseGateway.value === null && !leaseGateway.failed;
+    const subnetMissing = leaseSubnet.subnet === null && !leaseSubnet.failed;
+    const table = gatewayMissing || subnetMissing ? await routingTable() : null;
+    const gateway = gatewayMissing ? gatewayFromRoutingTable(table, device) : leaseGateway;
+    const subnet = subnetMissing ? subnetFromRoutingTable(table, device, ip) : leaseSubnet;
+    const sourceOf = (present: boolean, fromTable: boolean): ValueSource => {
+      if (!present) return null;
+      return fromTable ? 'routing-table' : 'dhcp';
+    };
     const noGatewayReason = gateway.failed ? 'gateway-lookup-failed' : 'no-gateway';
     return {
       info: {
@@ -478,19 +838,16 @@ export const createNetInfo = (deps: NetInfoDeps): NetInfo => {
         overridden: choice.overridden,
       },
       degraded: gateway.failed || subnet.failed,
+      sources: {
+        gateway: sourceOf(gateway.value !== null, gatewayMissing),
+        subnet: sourceOf(subnet.subnet !== null, subnetMissing),
+      },
     };
   };
 
-  const detect = async (overrides: unknown): Promise<DetectedInterfaces> => {
+  const detect = async (overrides: DetectRequest['overrides']): Promise<Detection> => {
     const ports = await listHardwarePorts();
-    if (ports === null) {
-      return {
-        ethernet: down('ethernet', NOTHING, 'hardware-ports-unavailable'),
-        wifi: down('wifi', NOTHING, 'hardware-ports-unavailable'),
-        adapters: [],
-        degraded: true,
-      };
-    }
+    if (ports === null) return unavailable('hardware-ports-unavailable');
 
     // Only `en<digits>` devices are ever considered; anything else in the
     // listing (bridge0, a garbled name) is dropped here.
@@ -543,34 +900,49 @@ export const createNetInfo = (deps: NetInfoDeps): NetInfo => {
     };
     const ethernetChoice = ethernetOverride ?? pickEthernet();
 
+    // At most one `netstat` per detection, and none when no role needs it.
+    let tableLoad: Promise<RoutingTable | null> | null = null;
+    const routingTable = (): Promise<RoutingTable | null> => (tableLoad ??= loadRoutingTable());
+
     const [ethernet, wifi] = await Promise.all([
-      describeRole('ethernet', ethernetChoice, addresses),
-      describeRole('wifi', wifiChoice, addresses),
+      describeRole('ethernet', ethernetChoice, addresses, routingTable),
+      describeRole('wifi', wifiChoice, addresses, routingTable),
     ]);
 
     return {
-      ethernet: ethernet.info,
-      wifi: wifi.info,
-      adapters: listed.map((port) => ({
-        device: port.device,
-        port: port.port.slice(0, PROTOCOL_LIMITS.adapterPortMaxLength),
-        ip: addresses.get(port.device)?.value ?? null,
-      })),
-      degraded: ethernet.degraded || wifi.degraded || [...addresses.values()].some((lookup) => lookup.failed),
+      result: {
+        ethernet: ethernet.info,
+        wifi: wifi.info,
+        adapters: listed.map((port) => ({
+          device: port.device,
+          port: port.port.slice(0, PROTOCOL_LIMITS.adapterPortMaxLength),
+          ip: addresses.get(port.device)?.value ?? null,
+        })),
+        degraded: ethernet.degraded || wifi.degraded || [...addresses.values()].some((lookup) => lookup.failed),
+      },
+      sources: { ethernet: ethernet.sources, wifi: wifi.sources },
     };
   };
 
-  const summaryOf = ({ device, ip, gateway, subnet, reason }: InterfaceInfo) => ({ device, ip, gateway, subnet, reason });
+  const summaryOf = ({ device, ip, gateway, subnet, reason }: InterfaceInfo, sources: RoleSources) => ({
+    device,
+    ip,
+    gateway,
+    subnet,
+    reason,
+    gatewaySource: sources.gateway,
+    subnetSource: sources.subnet,
+  });
 
   /**
    * One line per actual detection: `info` when the outcome differs from the
    * previous detection of this instance (or is the first), `debug` when it is
    * the same — the 60 s drift check would otherwise repeat it forever.
    */
-  const logSummary = (result: DetectedInterfaces, durationMs: number): void => {
+  const logSummary = ({ result, sources }: Detection, durationMs: number): void => {
     const context = {
-      ethernet: summaryOf(result.ethernet),
-      wifi: summaryOf(result.wifi),
+      ethernet: summaryOf(result.ethernet, sources.ethernet),
+      wifi: summaryOf(result.wifi, sources.wifi),
       adapters: result.adapters.length,
       degraded: result.degraded,
     };
@@ -579,30 +951,37 @@ export const createNetInfo = (deps: NetInfoDeps): NetInfo => {
     lastSummary = summary;
   };
 
-  const detectAndLog = async (overrides: unknown): Promise<DetectedInterfaces> => {
+  const detectAndLog = async (overrides: DetectRequest['overrides']): Promise<DetectedInterfaces> => {
     const startedAt = now();
-    let result: DetectedInterfaces;
+    let detection: Detection;
     try {
-      result = await detect(overrides);
+      detection = await detect(overrides);
     } catch (error) {
       // Nothing above is expected to throw; a daemon must still get an answer.
       logger.error('interface detection failed', { error: describeThrown(error) });
-      result = {
-        ethernet: down('ethernet', NOTHING, 'hardware-ports-unavailable'),
-        wifi: down('wifi', NOTHING, 'hardware-ports-unavailable'),
-        adapters: [],
-        degraded: true,
-      };
+      detection = unavailable('hardware-ports-unavailable');
     }
-    logSummary(result, Math.max(0, Math.round(now() - startedAt)));
-    return freezeResult(result);
+    logSummary(detection, Math.max(0, Math.round(now() - startedAt)));
+    return freezeResult(detection.result);
   };
 
-  const detectInterfaces = (options: DetectOptions = {}): Promise<DetectedInterfaces> => {
-    const overrides: unknown = options.overrides;
+  /** The uncached answer to a call that could not be served at all; never a detection result. */
+  const refused = (message: string, reason: InterfaceDownReason, error: unknown): DetectedInterfaces => {
+    logger.error(message, { error: describeThrown(error) });
+    return freezeResult(unavailable(reason).result);
+  };
+
+  const start = (options: unknown): Promise<DetectedInterfaces> => {
+    let request: DetectRequest;
+    try {
+      request = readRequest(options);
+    } catch (error) {
+      return Promise.resolve(refused('detection options could not be read', 'invalid-override', error));
+    }
+    const { overrides } = request;
     const key = overridesKey(overrides);
 
-    if (options.force !== true && cache !== null && cache.key === key) {
+    if (!request.force && cache !== null && cache.key === key) {
       const age = now() - cache.at;
       // A negative age means the clock went backwards: do not trust the entry.
       if (age >= 0 && age < NETINFO_CACHE_TTL_MS) return Promise.resolve(cache.value);
@@ -612,14 +991,27 @@ export const createNetInfo = (deps: NetInfoDeps): NetInfo => {
     }
 
     const startedIn = generation;
-    const promise = detectAndLog(overrides).then((value) => {
-      // A result that `invalidate()` overtook is returned to its callers but not kept.
-      if (startedIn === generation) cache = { key, at: now(), value };
-      if (inFlight?.promise === promise) inFlight = null;
-      return value;
-    });
+    const promise: Promise<DetectedInterfaces> = detectAndLog(overrides)
+      .then((value) => {
+        if (inFlight?.promise === promise) inFlight = null;
+        // A result that `invalidate()` overtook is returned to its callers but not kept.
+        if (startedIn === generation) cache = { key, at: now(), value };
+        return value;
+      })
+      .catch((error: unknown) => {
+        if (inFlight?.promise === promise) inFlight = null;
+        return refused('interface detection failed', 'hardware-ports-unavailable', error);
+      });
     inFlight = { key, generation, promise };
     return promise;
+  };
+
+  const detectInterfaces = (options?: DetectOptions): Promise<DetectedInterfaces> => {
+    try {
+      return start(options);
+    } catch (error) {
+      return Promise.resolve(refused('interface detection failed', 'hardware-ports-unavailable', error));
+    }
   };
 
   const invalidate = (): void => {

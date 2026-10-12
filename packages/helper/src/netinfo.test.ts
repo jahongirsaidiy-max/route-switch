@@ -5,12 +5,17 @@ import type { CommandRunner } from './exec';
 import { createLogger, createMemorySink, type LogEntry } from './logger';
 import {
   createNetInfo,
+  expandNetstatDestination,
   NETINFO_CACHE_TTL_MS,
   NETINFO_COMMAND_TIMEOUT_MS,
+  NETSTAT_MAX_LINE_LENGTH,
+  NETSTAT_MAX_LINES,
   netmaskToPrefix,
   parseHardwarePorts,
+  parseRoutingTable,
   toInterfaceState,
   toWireInterfaces,
+  type DetectOptions,
   type IfaceOverrides,
 } from './netinfo';
 import { createFakeCommandRunner, type FakeCommandResponse, type FakeCommandRunner } from './test-utils';
@@ -18,6 +23,24 @@ import { createFakeCommandRunner, type FakeCommandResponse, type FakeCommandRunn
 const NETWORKSETUP = '/usr/sbin/networksetup';
 const IPCONFIG = '/usr/sbin/ipconfig';
 const LIST_PORTS = ['-listallhardwareports'];
+const NETSTAT = '/usr/sbin/netstat';
+const ROUTES = ['-rn', '-f', 'inet'];
+
+const ROUTES_HEADER = [
+  'Routing tables',
+  '',
+  'Internet:',
+  'Destination        Gateway            Flags               Netif Expire',
+];
+
+/** A `netstat -rn -f inet` output with the given rows under the usual header. */
+const routes = (...rows: string[]): string => [...ROUTES_HEADER, ...rows, ''].join('\n');
+
+// What the table looks like when no en* device has a route: only loopback.
+const LOOPBACK_ROUTES = routes(
+  '127                127.0.0.1          UCS                   lo0       ',
+  '127.0.0.1          127.0.0.1          UH                    lo0       ',
+);
 
 // Shape captured from `networksetup -listallhardwareports` on macOS 26.3.1 and
 // anonymised: generic port names and devices, documentation MAC addresses.
@@ -88,6 +111,8 @@ const value = (text: string | undefined): FakeCommandResponse =>
 const setup = (ports: string = PORTS, ifaces: Readonly<Record<string, FakeIface>> = {}) => {
   const runner = createFakeCommandRunner();
   runner.when(NETWORKSETUP, LIST_PORTS, { stdout: ports });
+  // Consulted only when a lease has no router or mask; tests of the fallback replace it.
+  runner.when(NETSTAT, ROUTES, { stdout: LOOPBACK_ROUTES });
   runner.whenMatching((bin, args) => {
     if (bin !== IPCONFIG) return undefined;
     const [command, device = '', option] = args;
@@ -1099,5 +1124,837 @@ describe('logging', () => {
     const [entry] = warnings(entries);
     expect(entry?.msg).toBe('interface override is not a device name');
     expect(String(entry?.context?.['value'])).toHaveLength(64);
+  });
+});
+
+// Shape captured from `netstat -rn -f inet` on macOS 26.3.1 and anonymised:
+// generic devices, RFC 1918 addresses, documentation MAC addresses. en0 is the
+// primary interface (plain `default`), en5 the secondary one (its `default`
+// carries the interface-scope flag `I`). Note the abbreviated destinations
+// (`127`, `169.254`, `192.168.1`, `10.20.4/22`, `224.0.0/4`), the `/32` and
+// bare-address host rows next to the network rows, the `link#N` host row, the
+// rule-style host route through the gateway and the optional Expire column.
+const ROUTING_TABLE = routes(
+  'default            192.168.1.1        UGScg                 en0       ',
+  'default            10.20.4.1          UGScIg                en5       ',
+  '127                127.0.0.1          UCS                   lo0       ',
+  '127.0.0.1          127.0.0.1          UH                    lo0       ',
+  '169.254            link#15            UCS                   en0      !',
+  '169.254            link#13            UCSI                  en5      !',
+  '10.20.4/22         link#13            UCS                   en5      !',
+  '10.20.4.1/32       link#13            UCS                   en5      !',
+  '10.20.4.1          0:0:5e:0:53:a1     UHLWIir               en5   1060',
+  '10.20.4.57/32      link#13            UCS                   en5      !',
+  '10.20.4.57         0:0:5e:0:53:5      UHLWI                 lo0       ',
+  '10.20.4.60         link#13            UHLWI                 en5      !',
+  '172.16.12.40       10.20.4.1          UGHS                  en5       ',
+  '192.168.1          link#15            UCS                   en0      !',
+  '192.168.1.1/32     link#15            UCS                   en0      !',
+  '192.168.1.1        0:0:5e:0:53:1      UHLWIir               en0   1197',
+  '192.168.1.23/32    link#15            UCS                   en0      !',
+  '192.168.1.23       0:0:5e:0:53:0      UHLWI                 lo0       ',
+  '192.168.1.255      ff:ff:ff:ff:ff:ff  UHLWbI                en0      !',
+  '224.0.0/4          link#15            UmCS                  en0      !',
+  '224.0.0/4          link#13            UmCSI                 en5      !',
+  '255.255.255.255/32 link#15            UCS                   en0      !',
+  '255.255.255.255/32 link#13            UCSI                  en5      !',
+);
+
+/** An interface with a manually configured address: the lease has neither router nor mask. */
+const STATIC_ETHERNET: FakeIface = { ip: '10.20.4.57' };
+const STATIC_WIFI: FakeIface = { ip: '192.168.1.23' };
+
+const netstatCalls = (runner: FakeCommandRunner): number => runner.calls.filter((call) => call.bin === NETSTAT).length;
+
+/** Detection with en5 on a static address and the given routing table. */
+const detectStatic = async (table: string, ethernet: FakeIface = STATIC_ETHERNET) => {
+  const context = setup(PORTS, { en0: WIFI, en5: ethernet });
+  context.runner.when(NETSTAT, ROUTES, { stdout: table });
+  const result = await context.netinfo.detectInterfaces();
+  return { ...context, result };
+};
+
+describe('expandNetstatDestination', () => {
+  it.each([
+    ['192.168.1', '192.168.1.0/24'],
+    ['10', '10.0.0.0/8'],
+    ['127', '127.0.0.0/8'],
+    ['169.254', '169.254.0.0/16'],
+    ['172.20', '172.20.0.0/16'],
+    ['223.255.255', '223.255.255.0/24'],
+    ['172.16/12', '172.16.0.0/12'],
+    ['10.20.4/22', '10.20.4.0/22'],
+    ['10.20/16', '10.20.0.0/16'],
+    ['10/8', '10.0.0.0/8'],
+    ['192.168/16', '192.168.0.0/16'],
+    ['192.168.1.64/26', '192.168.1.64/26'],
+    ['192.168.1.0/24', '192.168.1.0/24'],
+    ['10.20.4.57/32', '10.20.4.57/32'],
+    ['224.0.0/4', '224.0.0.0/4'],
+    ['0/0', '0.0.0.0/0'],
+  ])('%s -> %s', (destination, cidr) => {
+    expect(expandNetstatDestination(destination)).toBe(cidr);
+  });
+
+  it.each([
+    'default',
+    '',
+    '10.20.4.57', // four octets without a prefix: a host route
+    '10.20.4', // not how a class A network is printed: /24 would be a guess
+    '10.20',
+    '192.168', // class C needs three octets
+    '172', // class B needs two
+    '224.0.0', // no classful prefix beyond class C
+    '240',
+    '0',
+    '10.20.4.1/22', // host bits set
+    '10.20.5/22',
+    '172.17/12',
+    '10.20.4/33',
+    '10.20.4/022',
+    '10.20.4/',
+    '10.20.4/22/1',
+    '10.20.4/-1',
+    '10.20.4/2x',
+    '010.20.4/22',
+    '10.256.4/22',
+    '10..4/22',
+    '10.20.4.0.0/24',
+    '.10/8',
+    '10./8',
+    '0x0a/8',
+    '10.20.4&0xffff00ff',
+    ' 10',
+    '10 ',
+    'link#13',
+    'fe80::/64',
+    '1e1/8',
+    '+10/8',
+    `10${'0'.repeat(10_000)}`,
+  ])('refuses %j', (destination) => {
+    expect(expandNetstatDestination(destination)).toBeNull();
+  });
+});
+
+describe('parseRoutingTable', () => {
+  it('keeps the default rows and the link rows of en* devices, in table order', () => {
+    expect(parseRoutingTable(ROUTING_TABLE)).toEqual({
+      defaults: [
+        { destination: 'default', gateway: '192.168.1.1', flags: 'UGScg', device: 'en0' },
+        { destination: 'default', gateway: '10.20.4.1', flags: 'UGScIg', device: 'en5' },
+      ],
+      connected: [
+        { destination: '169.254', gateway: 'link#15', flags: 'UCS', device: 'en0' },
+        { destination: '169.254', gateway: 'link#13', flags: 'UCSI', device: 'en5' },
+        { destination: '10.20.4/22', gateway: 'link#13', flags: 'UCS', device: 'en5' },
+        { destination: '10.20.4.1/32', gateway: 'link#13', flags: 'UCS', device: 'en5' },
+        { destination: '10.20.4.57/32', gateway: 'link#13', flags: 'UCS', device: 'en5' },
+        { destination: '10.20.4.60', gateway: 'link#13', flags: 'UHLWI', device: 'en5' },
+        { destination: '192.168.1', gateway: 'link#15', flags: 'UCS', device: 'en0' },
+        { destination: '192.168.1.1/32', gateway: 'link#15', flags: 'UCS', device: 'en0' },
+        { destination: '192.168.1.23/32', gateway: 'link#15', flags: 'UCS', device: 'en0' },
+        { destination: '224.0.0/4', gateway: 'link#15', flags: 'UmCS', device: 'en0' },
+        { destination: '224.0.0/4', gateway: 'link#13', flags: 'UmCSI', device: 'en5' },
+        { destination: '255.255.255.255/32', gateway: 'link#15', flags: 'UCS', device: 'en0' },
+        { destination: '255.255.255.255/32', gateway: 'link#13', flags: 'UCSI', device: 'en5' },
+      ],
+    });
+  });
+
+  it('tolerates CRLF, tabs, indentation and trailing whitespace', () => {
+    const text = ROUTING_TABLE.split('\n')
+      .map((line) => `  ${line.replace('link#13 ', 'link#13\t')}  \r`)
+      .join('\n');
+
+    expect(parseRoutingTable(text)).toEqual(parseRoutingTable(ROUTING_TABLE));
+  });
+
+  it('finds the columns from the header: no Expire column, or the wide form', () => {
+    const narrow = [
+      'Internet:',
+      'Destination Gateway Flags Netif',
+      'default 10.20.4.1 UGScIg en5',
+      '10.20.4/22 link#13 UCS en5',
+    ].join('\n');
+    const wide = [
+      'Routing tables',
+      '',
+      'Internet:',
+      'Destination        Gateway            RT_IFA             Flags        Refs      Use    Mtu          Netif Expire',
+      'default            10.20.4.1          10.20.4.57         UGScIg          2        0   1500            en5       ',
+      '10.20.4/22         link#13            10.20.4.57         UCS             0        0   1500            en5      !',
+    ].join('\n');
+    const expected = {
+      defaults: [{ destination: 'default', gateway: '10.20.4.1', flags: 'UGScIg', device: 'en5' }],
+      connected: [{ destination: '10.20.4/22', gateway: 'link#13', flags: 'UCS', device: 'en5' }],
+    };
+
+    expect(parseRoutingTable(narrow)).toEqual(expected);
+    expect(parseRoutingTable(wide)).toEqual(expected);
+  });
+
+  it('reads only the IPv4 section, and only after its column header', () => {
+    const text = [
+      'Routing tables',
+      'default 10.9.9.1 UGSc en5', // before any section
+      'Internet:',
+      'default 10.9.9.2 UGSc en5', // before the column header
+      'Destination Gateway Flags Netif Expire',
+      'default 10.20.4.1 UGScIg en5',
+      '',
+      'Internet6:',
+      'Destination Gateway Flags Netif Expire',
+      'default 10.9.9.3 UGSc en5',
+      'default fe80::1%en5 UGcIg en5',
+      'Something:',
+      'default 10.9.9.4 UGSc en5',
+    ].join('\n');
+
+    expect(parseRoutingTable(text)).toEqual({
+      defaults: [{ destination: 'default', gateway: '10.20.4.1', flags: 'UGScIg', device: 'en5' }],
+      connected: [],
+    });
+  });
+
+  it('skips rows of other interfaces, short rows and rows that are neither default nor link', () => {
+    const table = parseRoutingTable(
+      routes(
+        'default 10.9.9.1 UGSc utun3',
+        'default 10.9.9.2 UGSc bridge0',
+        'default 10.9.9.3 UGSc EN5',
+        'default 10.9.9.4 UGSc en5;reboot',
+        'default 10.9.9.5 UGSc en123456789012345', // 15 digits: not a device name
+        'default 10.9.9.6 UGSc',
+        'default 10.9.9.7',
+        'default',
+        '10.20.4/22 link#13 UCS lo0',
+        '10.20.4/22 link# UCS en5',
+        '10.20.4/22 link#x UCS en5',
+        '10.20.4/22 link#13x UCS en5',
+        '10.20.4/22 link#12345678901 UCS en5',
+        '10.20.4/22 link#013 UCS en5',
+        '10.20.4/22 xlink#13 UCS en5',
+        '10.20.4/22 10.20.4.1 UGS en5',
+        '10.30/16 link#9 UCS en12345678901234', // 14 digits: the longest device name
+      ),
+    );
+
+    expect(table).toEqual({
+      defaults: [],
+      connected: [{ destination: '10.30/16', gateway: 'link#9', flags: 'UCS', device: 'en12345678901234' }],
+    });
+  });
+
+  it.each([
+    ['empty', ''],
+    ['whitespace', ' \r\n\r\n\t'],
+    ['garbled', 'Routng tbles\n\u0000\u0007 Internet\nDestnation Gatewy\ndefault 10.20.4.1 UGSc en5\n'],
+    ['rows without a header', 'default 10.20.4.1 UGSc en5\n10.20.4/22 link#13 UCS en5\n'],
+    ['a header without a section', 'Destination Gateway Flags Netif Expire\ndefault 10.20.4.1 UGSc en5\n'],
+    ['a header without a Netif column', 'Internet:\nDestination Gateway Flags\ndefault 10.20.4.1 UGSc en5\n'],
+    ['only another section', 'Internet6:\nDestination Gateway Flags Netif Expire\ndefault fe80::1 UGc en5\n'],
+    ['an error message', 'netstat: kvm not available\n'],
+  ])('does not trust %s output', (_label, stdout) => {
+    expect(parseRoutingTable(stdout)).toBeNull();
+  });
+
+  it('accepts a table without any usable row', () => {
+    expect(parseRoutingTable(LOOPBACK_ROUTES)).toEqual({ defaults: [], connected: [] });
+  });
+
+  it('skips an over-long line and does not trust an output with too many lines', () => {
+    const longRow = `default 10.9.9.1 UGSc en5${' '.repeat(NETSTAT_MAX_LINE_LENGTH)}`;
+    expect(parseRoutingTable(routes(longRow, 'default 10.20.4.1 UGScIg en5'))?.defaults).toEqual([
+      { destination: 'default', gateway: '10.20.4.1', flags: 'UGScIg', device: 'en5' },
+    ]);
+
+    const row = '10.20.4/22 link#13 UCS en5';
+    const atLimit = [...ROUTES_HEADER, ...Array.from({ length: NETSTAT_MAX_LINES - ROUTES_HEADER.length }, () => row)];
+    expect(parseRoutingTable(atLimit.join('\n'))?.connected).toHaveLength(NETSTAT_MAX_LINES - ROUTES_HEADER.length);
+    expect(parseRoutingTable([...atLimit, row].join('\n'))).toBeNull();
+  });
+
+  it.each([
+    ['one megabyte of whitespace on one line', ' \r\t'.repeat(350_000)],
+    ['one megabyte of newlines', '\n'.repeat(1_000_000)],
+    ['a megabyte row', `${ROUTES_HEADER.join('\n')}\ndefault ${'1.'.repeat(500_000)} UGSc en5\n`],
+    ['a megabyte of short rows', `${ROUTES_HEADER.join('\n')}\n${'d l U en5\n'.repeat(19_000)}`],
+    ['a megabyte of section titles', 'Internet:\n'.repeat(19_000)],
+  ])('handles %s in bounded time', (_label, stdout) => {
+    const startedAt = performance.now();
+
+    parseRoutingTable(stdout);
+
+    expect(performance.now() - startedAt).toBeLessThan(1_000);
+  });
+});
+
+describe('detectInterfaces: routing-table fallback (static address)', () => {
+  it('takes gateway and subnet of a static Ethernet from the routing table (scoped default row)', async () => {
+    const { result, runner, entries } = await detectStatic(ROUTING_TABLE);
+
+    expect(result.ethernet).toEqual({
+      role: 'ethernet',
+      device: 'en5',
+      port: 'USB 10/100/1000 LAN',
+      ip: '10.20.4.57',
+      gateway: '10.20.4.1',
+      netmask: '255.255.252.0',
+      subnet: '10.20.4.0/22',
+      up: true,
+      routable: true,
+      reason: null,
+      overridden: false,
+    });
+    expect(result.wifi).toMatchObject({ device: 'en0', gateway: '192.168.1.1', subnet: '192.168.1.0/24' });
+    expect(result.degraded).toBe(false);
+    expect(warnings(entries)).toEqual([]);
+    // The DHCP-case commands, then exactly one routing-table read.
+    expect(argvOf(runner)).toEqual([
+      'networksetup -listallhardwareports',
+      'ipconfig getifaddr en5',
+      'ipconfig getifaddr en0',
+      'ipconfig getifaddr en1',
+      'ipconfig getifaddr en7',
+      'ipconfig getoption en5 router',
+      'ipconfig getoption en5 subnet_mask',
+      'ipconfig getoption en0 router',
+      'ipconfig getoption en0 subnet_mask',
+      'netstat -rn -f inet',
+    ]);
+    expect(runner.calls.at(-1)?.options).toEqual({ timeoutMs: NETINFO_COMMAND_TIMEOUT_MS });
+  });
+
+  it('takes gateway and subnet of a static primary interface from the plain default row', async () => {
+    const { netinfo, runner, entries } = setup(PORTS, { en0: STATIC_WIFI, en5: ETHERNET });
+    runner.when(NETSTAT, ROUTES, { stdout: ROUTING_TABLE });
+
+    const result = await netinfo.detectInterfaces();
+
+    expect(result.wifi).toMatchObject({
+      device: 'en0',
+      ip: '192.168.1.23',
+      gateway: '192.168.1.1',
+      netmask: '255.255.255.0',
+      subnet: '192.168.1.0/24',
+      up: true,
+      routable: true,
+      reason: null,
+    });
+    expect(result.ethernet).toMatchObject({ gateway: '10.20.4.1', subnet: '10.20.4.0/22' });
+    expect(result.degraded).toBe(false);
+    expect(warnings(entries)).toEqual([]);
+    expect(netstatCalls(runner)).toBe(1);
+  });
+
+  it('reads the routing table once when both roles need it', async () => {
+    const { netinfo, runner } = setup(PORTS, { en0: STATIC_WIFI, en5: STATIC_ETHERNET });
+    runner.when(NETSTAT, ROUTES, { stdout: ROUTING_TABLE });
+
+    const result = await netinfo.detectInterfaces();
+
+    expect(result.ethernet).toMatchObject({ gateway: '10.20.4.1', subnet: '10.20.4.0/22', routable: true });
+    expect(result.wifi).toMatchObject({ gateway: '192.168.1.1', subnet: '192.168.1.0/24', routable: true });
+    expect(netstatCalls(runner)).toBe(1);
+    expect(runner.calls).toHaveLength(9 + 1);
+  });
+
+  it('does not read the routing table when DHCP has router and mask for every role', async () => {
+    const { netinfo, runner } = setup(PORTS, BOTH);
+    // Would change the answer if it were consulted.
+    runner.when(NETSTAT, ROUTES, { stdout: routes('default 10.99.0.1 UGSc en5', 'default 10.99.0.2 UGSc en0') });
+
+    const result = await netinfo.detectInterfaces();
+
+    expect(result.ethernet).toMatchObject({ gateway: '10.20.4.1', subnet: '10.20.4.0/22' });
+    expect(result.wifi).toMatchObject({ gateway: '192.168.1.1', subnet: '192.168.1.0/24' });
+    expect(netstatCalls(runner)).toBe(0);
+    expect(runner.calls).toHaveLength(9);
+  });
+
+  it('does not read the routing table for a role without an address', async () => {
+    const { netinfo, runner } = setup(PORTS, { en0: WIFI });
+    runner.when(NETSTAT, ROUTES, { stdout: ROUTING_TABLE });
+
+    await netinfo.detectInterfaces();
+
+    expect(netstatCalls(runner)).toBe(0);
+  });
+
+  it('fills only what the lease lacks', async () => {
+    const table = routes('default 10.99.0.1 UGScI en5', '10.20/16 link#13 UCS en5');
+
+    const noRouter = await detectStatic(table, { ip: '10.20.4.57', mask: '255.255.252.0' });
+    expect(noRouter.result.ethernet).toMatchObject({
+      gateway: '10.99.0.1',
+      netmask: '255.255.252.0',
+      subnet: '10.20.4.0/22',
+      routable: true,
+    });
+    expect(netstatCalls(noRouter.runner)).toBe(1);
+
+    const noMask = await detectStatic(table, { ip: '10.20.4.57', router: '10.20.4.1' });
+    expect(noMask.result.ethernet).toMatchObject({
+      gateway: '10.20.4.1',
+      netmask: '255.255.0.0',
+      subnet: '10.20.0.0/16',
+      routable: true,
+    });
+    expect(netstatCalls(noMask.runner)).toBe(1);
+  });
+
+  it('does not fall back when a lease query failed, as opposed to having no value', async () => {
+    const { netinfo, runner } = setup(PORTS, BOTH);
+    runner.when(NETSTAT, ROUTES, { stdout: ROUTING_TABLE });
+    runner.when(IPCONFIG, ['getoption', 'en5', 'router'], { failure: 'timeout', error: 'Timed out' });
+    runner.when(IPCONFIG, ['getoption', 'en5', 'subnet_mask'], { stdout: '255.0.255.0\n' });
+
+    const result = await netinfo.detectInterfaces();
+
+    expect(result.ethernet).toMatchObject({ gateway: null, subnet: null, reason: 'gateway-lookup-failed' });
+    expect(result.degraded).toBe(true);
+    expect(netstatCalls(runner)).toBe(0);
+  });
+
+  it('never puts a value from the routing table into an argv', async () => {
+    const { runner } = await detectStatic(
+      routes('default 10.20.4.1 UGScI en5', 'default 10.9.9.9 UGSc en9', '10.20.4/22 link#13 UCS en5', '10.50/16 link#20 UCS en9'),
+    );
+
+    const args = runner.calls.flatMap((call) => call.args);
+    for (const fromTable of ['10.20.4.1', '10.9.9.9', 'en9', 'link#13', '10.20.4/22']) {
+      expect(args).not.toContain(fromTable);
+    }
+  });
+
+  it.each([
+    ['192.168.1', '192.168.1.77', '192.168.1.0/24', '255.255.255.0'],
+    ['10', '10.20.4.57', '10.0.0.0/8', '255.0.0.0'],
+    ['172.16/12', '172.20.1.9', '172.16.0.0/12', '255.240.0.0'],
+    ['10.20.4/22', '10.20.7.254', '10.20.4.0/22', '255.255.252.0'],
+    ['192.168.1.64/26', '192.168.1.70', '192.168.1.64/26', '255.255.255.192'],
+    ['172.20', '172.20.3.4', '172.20.0.0/16', '255.255.0.0'],
+    ['169.254', '169.254.10.20', '169.254.0.0/16', '255.255.0.0'],
+    ['10.20.4.56/31', '10.20.4.57', '10.20.4.56/31', '255.255.255.254'],
+    ['64/2', '100.64.0.9', '64.0.0.0/2', '192.0.0.0'],
+  ])('derives the subnet from the connected row %s', async (destination, ip, subnet, netmask) => {
+    const { result, entries } = await detectStatic(routes(`${destination} link#13 UCS en5 !`), { ip });
+
+    expect(result.ethernet).toMatchObject({ ip, netmask, subnet, up: true });
+    expect(result.degraded).toBe(false);
+    expect(warnings(entries)).toEqual([]);
+  });
+
+  it.each([
+    ['a network that does not contain the address', '10.30/16 link#13 UCS en5'],
+    ['only the link-local and multicast rows', '169.254 link#13 UCSI en5\n224.0.0/4 link#13 UmCSI en5'],
+    ['only host rows', '10.20.4.57/32 link#13 UCS en5\n10.20.4.57 link#13 UHLWI en5\n255.255.255.255/32 link#13 UCS en5'],
+    ['a row of another device', '10.20.4/22 link#15 UCS en0'],
+    ['a row that is not a link row', '10.20.4/22 10.20.4.1 UGS en5'],
+    ['an ambiguous abbreviation', '10.20.4 link#13 UCS en5'],
+    ['a destination with host bits', '10.20.4.57/22 link#13 UCS en5'],
+    ['a /0 row', '0/0 link#13 UCS en5'],
+    ['a non-contiguous mask', '10.20.4&0xffff00ff link#13 UCS en5'],
+    ['garbage in the destination', 'ten.twenty/22 link#13 UCS en5'],
+    ['no row at all', ''],
+  ])('reports no subnet, without an error, for %s', async (_label, rows) => {
+    const { result, entries } = await detectStatic(routes('default 10.20.4.1 UGScI en5', ...rows.split('\n')));
+
+    expect(result.ethernet).toMatchObject({
+      ip: '10.20.4.57',
+      gateway: '10.20.4.1',
+      netmask: null,
+      subnet: null,
+      routable: true,
+      reason: null,
+    });
+    expect(result.degraded).toBe(false);
+    expect(warnings(entries)).toEqual([]);
+  });
+
+  it('picks the most specific connected row that contains the address', async () => {
+    const { result } = await detectStatic(
+      routes('10 link#13 UCS en5', '10.20.4/22 link#13 UCS en5', '10.20/16 link#13 UCS en5', '10.20.8/24 link#13 UCS en5'),
+    );
+
+    expect(result.ethernet).toMatchObject({ subnet: '10.20.4.0/22', netmask: '255.255.252.0' });
+  });
+
+  it.each([
+    ['prefers the unscoped row over a scoped one', ['default 10.20.4.2 UGScIg en5', 'default 10.20.4.1 UGScg en5'], '10.20.4.1'],
+    ['takes the first of two unscoped rows', ['default 10.20.4.1 UGSc en5', 'default 10.20.4.2 UGSc en5'], '10.20.4.1'],
+    ['takes the first of two scoped rows', ['default 10.20.4.2 UGScI en5', 'default 10.20.4.1 UGScI en5'], '10.20.4.2'],
+    ['skips an unusable row for a usable one', ['default 127.0.0.1 UGSc en5', 'default 10.20.4.1 UGScI en5'], '10.20.4.1'],
+    ['skips an on-link row for a usable one', ['default link#13 UCS en5', 'default 10.20.4.1 UGScI en5'], '10.20.4.1'],
+    ['ignores the rows of other devices', ['default 192.168.1.1 UGScg en0', 'default 10.20.4.1 UGScIg en5'], '10.20.4.1'],
+  ])('with several default rows: %s', async (_label, rows, gateway) => {
+    const { result, entries } = await detectStatic(routes(...rows));
+
+    expect(result.ethernet).toMatchObject({ gateway, routable: true, reason: null });
+    expect(result.degraded).toBe(false);
+    expect(warnings(entries)).toEqual([]);
+  });
+
+  it.each([
+    ['only another device has a default row', ['default 192.168.1.1 UGScg en0', 'default 10.9.9.1 UGSc utun3']],
+    ['there is no default row', ['10.20.4/22 link#13 UCS en5']],
+    ['the default row is on-link', ['default link#13 UCScI en5']],
+    ['the device name only resembles it', ['default 10.20.4.1 UGSc en50', 'default 10.20.4.1 UGSc en']],
+  ])('reports no gateway, without an error, when %s', async (_label, rows) => {
+    const { result, entries } = await detectStatic(routes(...rows));
+
+    expect(result.ethernet).toMatchObject({
+      device: 'en5',
+      ip: '10.20.4.57',
+      gateway: null,
+      up: true,
+      routable: false,
+      reason: 'no-gateway',
+    });
+    expect(result.degraded).toBe(false);
+    expect(warnings(entries)).toEqual([]);
+  });
+
+  it.each([
+    ['a loopback address', '127.0.0.1'],
+    ['the unspecified address', '0.0.0.0'],
+    ['a link-local address', '169.254.1.1'],
+    ['a multicast address', '224.0.0.1'],
+    ['the broadcast address', '255.255.255.255'],
+    ['an octal-looking address', '010.20.4.1'],
+    ['a short address', '10.20.4'],
+    ['an address with a prefix', '10.20.4.1/32'],
+    ['a MAC address', '0:0:5e:0:53:a1'],
+    ['an IPv6 address', 'fe80::1%en5'],
+    ['a host name', 'gateway.corp.local'],
+    ['something link-like', 'link#13x'],
+  ])('reports a failed gateway lookup when the default row carries %s', async (_label, gateway) => {
+    const { result, entries, runner } = await detectStatic(
+      routes(`default ${gateway} UGScI en5`, '10.20.4/22 link#13 UCS en5'),
+    );
+
+    expect(result.ethernet).toMatchObject({
+      gateway: null,
+      subnet: '10.20.4.0/22',
+      up: true,
+      routable: false,
+      reason: 'gateway-lookup-failed',
+    });
+    expect(result.wifi).toMatchObject({ routable: true });
+    expect(result.degraded).toBe(true);
+    expect(warnings(entries).map((entry) => entry.msg)).toEqual(['the routing table has an unusable default gateway']);
+    expect(runner.calls.flatMap((call) => call.args)).not.toContain(gateway);
+  });
+
+  it('bounds what it logs about an unusable gateway', async () => {
+    const { entries } = await detectStatic(routes(`default ${'9'.repeat(400)} UGScI en5`));
+
+    expect(String(warnings(entries)[0]?.context?.['value'])).toHaveLength(64);
+  });
+
+  it.each([...FAILURES, ['an exit code 1 without output', { exitCode: 1 }] as const])(
+    'leaves gateway and subnet empty, and does not reject, when netstat fails with %s',
+    async (_label, response) => {
+      const { netinfo, runner, entries } = setup(PORTS, { en0: STATIC_WIFI, en5: STATIC_ETHERNET });
+      runner.when(NETSTAT, ROUTES, response);
+
+      const result = await netinfo.detectInterfaces();
+
+      for (const role of ['ethernet', 'wifi'] as const) {
+        expect(result[role]).toMatchObject({
+          gateway: null,
+          netmask: null,
+          subnet: null,
+          up: true,
+          routable: false,
+          reason: 'gateway-lookup-failed',
+        });
+      }
+      expect(result.ethernet.ip).toBe('10.20.4.57');
+      expect(result.degraded).toBe(true);
+      expect(netstatCalls(runner)).toBe(1);
+      expect(warnings(entries).map((entry) => entry.msg)).toEqual(['could not read the routing table']);
+    },
+  );
+
+  it.each([
+    ['empty', ''],
+    ['whitespace', ' \r\n\r\n'],
+    ['garbled', 'Routng tbles\n\u0000\u0007\ndefault 10.20.4.1 UGSc en5\n'],
+    ['an error message', 'netstat: sysctl: net.route.0.0.dump estimate: Cannot allocate memory\n'],
+    ['too many lines', `${routes('default 10.20.4.1 UGScI en5')}${'\n'.repeat(NETSTAT_MAX_LINES)}`],
+    ['one megabyte of noise', 'default 10.20.4.1 UGSc en5 \r'.repeat(36_000)],
+  ])('treats %s netstat output as a failed lookup', async (_label, stdout) => {
+    const startedAt = performance.now();
+    const { result, entries } = await detectStatic(stdout);
+
+    expect(result.ethernet).toMatchObject({
+      gateway: null,
+      subnet: null,
+      up: true,
+      routable: false,
+      reason: 'gateway-lookup-failed',
+    });
+    expect(result.wifi).toMatchObject({ routable: true });
+    expect(result.degraded).toBe(true);
+    expect(warnings(entries).map((entry) => entry.msg)).toEqual(['unexpected output from netstat']);
+    expect(warnings(entries)[0]?.context).toEqual({ component: 'netinfo', outputLength: stdout.length });
+    expect(performance.now() - startedAt).toBeLessThan(1_000);
+  });
+
+  it('uses a huge but well-formed table', async () => {
+    const hosts = Array.from(
+      { length: 15_000 },
+      (_unused, index) => `10.${String(100 + (index >> 8))}.${String(index & 255)}.7 10.20.4.1 UGHS en5`,
+    );
+    const table = routes('default 10.20.4.1 UGScI en5', ...hosts, '10.20.4/22 link#13 UCS en5 !');
+    const startedAt = performance.now();
+
+    const { result } = await detectStatic(table);
+
+    expect(result.ethernet).toMatchObject({ gateway: '10.20.4.1', subnet: '10.20.4.0/22', routable: true });
+    expect(result.degraded).toBe(false);
+    expect(performance.now() - startedAt).toBeLessThan(1_000);
+  });
+
+  it('does not reject when the netstat call is refused by the runner', async () => {
+    const fake = createFakeCommandRunner().when(NETWORKSETUP, LIST_PORTS, { stdout: WIFI_ONLY_PORTS });
+    fake.when(IPCONFIG, ['getifaddr', 'en0'], { stdout: '192.168.1.23\n' });
+    fake.whenMatching((bin) => (bin === IPCONFIG ? NO_VALUE : undefined));
+    const memory = createMemorySink();
+    const netinfo = createNetInfo({ runner: fake, logger: createLogger({ sinks: [memory.sink] }) });
+
+    // No netstat stub: the fake rejects the call.
+    const result = await netinfo.detectInterfaces();
+
+    expect(result.wifi).toMatchObject({ ip: '192.168.1.23', gateway: null, subnet: null, reason: 'gateway-lookup-failed' });
+    expect(result.degraded).toBe(true);
+    expect(memory.entries.some((entry) => entry.level === 'error' && entry.msg === 'command could not be started')).toBe(
+      true,
+    );
+  });
+
+  it('says in the summary where gateway and subnet came from', async () => {
+    const { entries } = await detectStatic(ROUTING_TABLE);
+
+    expect(summaries(entries)[0]?.context).toMatchObject({
+      ethernet: { gateway: '10.20.4.1', gatewaySource: 'routing-table', subnetSource: 'routing-table' },
+      wifi: { gateway: '192.168.1.1', gatewaySource: 'dhcp', subnetSource: 'dhcp' },
+    });
+
+    const none = await detectStatic(LOOPBACK_ROUTES);
+    expect(summaries(none.entries)[0]?.context).toMatchObject({
+      ethernet: { gateway: null, gatewaySource: null, subnetSource: null, reason: 'no-gateway' },
+    });
+  });
+
+  it('caches a result that came from the routing table like any other', async () => {
+    const { netinfo, runner } = setup(PORTS, { en0: WIFI, en5: STATIC_ETHERNET });
+    runner.when(NETSTAT, ROUTES, { stdout: ROUTING_TABLE });
+
+    const first = await netinfo.detectInterfaces();
+    expect(await netinfo.detectInterfaces()).toBe(first);
+    expect(netstatCalls(runner)).toBe(1);
+
+    await netinfo.detectInterfaces({ force: true });
+    expect(netstatCalls(runner)).toBe(2);
+  });
+});
+
+describe('detectInterfaces: QA observations of TASK-101', () => {
+  const DOWN = {
+    device: null,
+    port: null,
+    ip: null,
+    gateway: null,
+    netmask: null,
+    subnet: null,
+    up: false,
+    routable: false,
+    reason: 'invalid-override',
+    overridden: false,
+  };
+
+  const throwingOverrides = (): unknown => {
+    const overrides = {};
+    Object.defineProperty(overrides, 'ethernet', {
+      enumerable: true,
+      get: () => {
+        throw new Error('getter exploded');
+      },
+    });
+    return { overrides };
+  };
+  const throwingOptions = (): unknown => {
+    const options = {};
+    Object.defineProperty(options, 'overrides', {
+      enumerable: true,
+      get: () => {
+        throw new Error('getter exploded');
+      },
+    });
+    return options;
+  };
+  const throwingProxy = (): unknown =>
+    new Proxy(
+      {},
+      {
+        getOwnPropertyDescriptor: () => {
+          throw new Error('trap exploded');
+        },
+      },
+    );
+
+  it.each([
+    ['null', (): unknown => null],
+    ['a string', (): unknown => 'en5'],
+    ['a number', (): unknown => 7],
+    ['a boolean', (): unknown => true],
+    ['a function', (): unknown => () => ({})],
+    ['a symbol', (): unknown => Symbol('options')],
+    ['an overrides object with a throwing getter', throwingOverrides],
+    ['options with a throwing getter', throwingOptions],
+    ['a proxy with a throwing trap', throwingProxy],
+    ['overrides that are a proxy with a throwing trap', (): unknown => ({ overrides: throwingProxy() })],
+  ])('neither throws nor rejects for %s as options: both roles are down', async (_label, make) => {
+    const { netinfo, runner, entries } = setup(PORTS, BOTH);
+    let returned: unknown;
+
+    expect(() => {
+      returned = netinfo.detectInterfaces(make() as DetectOptions);
+    }).not.toThrow();
+    expect(returned).toBeInstanceOf(Promise);
+    const result = await (returned as ReturnType<typeof netinfo.detectInterfaces>);
+
+    expect(result.ethernet).toEqual({ role: 'ethernet', ...DOWN });
+    expect(result.wifi).toEqual({ role: 'wifi', ...DOWN });
+    expect(result.adapters).toEqual([]);
+    expect(result.degraded).toBe(true);
+    expect(Object.isFrozen(result) && Object.isFrozen(result.ethernet)).toBe(true);
+    // Nothing ran, the refusal is logged once, and it is not cached.
+    expect(runner.calls).toHaveLength(0);
+    expect(warnings(entries).map((entry) => [entry.level, entry.msg])).toEqual([
+      ['error', 'detection options could not be read'],
+    ]);
+    expect((await netinfo.detectInterfaces()).ethernet).toMatchObject({ device: 'en5', routable: true });
+  });
+
+  it('still takes undefined, an empty object and an array as "no options"', async () => {
+    const plain = await setup(PORTS, BOTH).netinfo.detectInterfaces();
+
+    for (const options of [undefined, {}, [], { overrides: undefined, force: undefined }]) {
+      const { netinfo } = setup(PORTS, BOTH);
+      expect(await netinfo.detectInterfaces(options as DetectOptions)).toEqual(plain);
+    }
+  });
+
+  it('reads each getter of the options exactly once', async () => {
+    const { netinfo } = setup(PORTS, { ...BOTH, en7: { ip: '10.30.0.9', router: '10.30.0.1', mask: '255.255.0.0' } });
+    let reads = 0;
+    const overrides = {
+      get ethernet(): string {
+        reads += 1;
+        // A second read would name a different device.
+        return reads === 1 ? 'en7' : 'en1';
+      },
+    };
+
+    const result = await netinfo.detectInterfaces({ overrides });
+
+    expect(reads).toBe(1);
+    expect(result.ethernet).toMatchObject({ device: 'en7', overridden: true });
+  });
+
+  it('does not reject when the clock throws', async () => {
+    const { runner } = setup(PORTS, BOTH);
+    const memory = createMemorySink();
+    const netinfo = createNetInfo({
+      runner,
+      logger: createLogger({ sinks: [memory.sink] }),
+      now: () => {
+        throw new Error('clock exploded');
+      },
+    });
+
+    const result = await netinfo.detectInterfaces();
+
+    expect(result.ethernet).toMatchObject({ device: null, reason: 'hardware-ports-unavailable' });
+    expect(result.degraded).toBe(true);
+    expect(memory.entries.some((entry) => entry.level === 'error' && entry.msg === 'interface detection failed')).toBe(true);
+  });
+
+  it('ignores inherited properties: a polluted prototype cannot inject an override or force', async () => {
+    const plain = await setup(PORTS, { ...BOTH, en7: ETHERNET }).netinfo.detectInterfaces();
+    const prototype = Object.prototype as Record<string, unknown>;
+    const { netinfo, runner } = setup(PORTS, { ...BOTH, en7: ETHERNET });
+
+    prototype['ethernet'] = 'en7';
+    prototype['wifi'] = 'en7';
+    prototype['overrides'] = { ethernet: 'en7' };
+    prototype['force'] = true;
+    try {
+      const first = await netinfo.detectInterfaces({});
+      const inheritedOnly = await netinfo.detectInterfaces({ overrides: Object.create({ ethernet: 'en7' }) as IfaceOverrides });
+
+      expect(first).toEqual(plain);
+      expect(first.ethernet).toMatchObject({ device: 'en5', overridden: false });
+      // Same (empty) overrides and no inherited `force`: served from the cache.
+      expect(inheritedOnly).toBe(first);
+      expect(runner.calls.filter((call) => call.bin === NETWORKSETUP)).toHaveLength(1);
+    } finally {
+      delete prototype['ethernet'];
+      delete prototype['wifi'];
+      delete prototype['overrides'];
+      delete prototype['force'];
+    }
+    // An own property is still honoured.
+    const own = await netinfo.detectInterfaces({ overrides: { ethernet: 'en7' } });
+    expect(own.ethernet).toMatchObject({ device: 'en7', overridden: true });
+  });
+
+  it.each([2, 64, 255])(
+    'treats exit code %i with empty stdout and stderr as a failed lookup, not as "no value"',
+    async (exitCode) => {
+      const address = setup(PORTS, BOTH);
+      address.runner.when(IPCONFIG, ['getifaddr', 'en0'], { exitCode });
+      const noAddress = await address.netinfo.detectInterfaces();
+      expect(noAddress.wifi).toMatchObject({ ip: null, up: false, reason: 'address-lookup-failed' });
+      expect(noAddress.degraded).toBe(true);
+      expect(warnings(address.entries).map((entry) => entry.context)).toEqual([
+        { component: 'netinfo', device: 'en0', query: 'address', failure: 'nonzero-exit', exitCode },
+      ]);
+
+      const router = setup(PORTS, BOTH);
+      router.runner.when(NETSTAT, ROUTES, { stdout: ROUTING_TABLE });
+      router.runner.when(IPCONFIG, ['getoption', 'en5', 'router'], { exitCode });
+      const noGateway = await router.netinfo.detectInterfaces();
+      expect(noGateway.ethernet).toMatchObject({ gateway: null, routable: false, reason: 'gateway-lookup-failed' });
+      expect(noGateway.degraded).toBe(true);
+      // A failed query is not "no value": the routing table is not consulted.
+      expect(netstatCalls(router.runner)).toBe(0);
+
+      const mask = setup(PORTS, BOTH);
+      mask.runner.when(NETSTAT, ROUTES, { stdout: ROUTING_TABLE });
+      mask.runner.when(IPCONFIG, ['getoption', 'en5', 'subnet_mask'], { exitCode });
+      const noSubnet = await mask.netinfo.detectInterfaces();
+      expect(noSubnet.ethernet).toMatchObject({ netmask: null, subnet: null, routable: true });
+      expect(noSubnet.degraded).toBe(true);
+      expect(netstatCalls(mask.runner)).toBe(0);
+    },
+  );
+
+  it('accepts exactly the device names of the shared DEVICE_NAME pattern', async () => {
+    const longest = `en${'1'.repeat(14)}`;
+    const tooLong = `en${'1'.repeat(15)}`;
+    const ports = `Hardware Port: Wi-Fi\nDevice: en0\n\nHardware Port: Long\nDevice: ${longest}\n\nHardware Port: Longer\nDevice: ${tooLong}\n`;
+    const { netinfo, runner } = setup(ports, { en0: WIFI, [longest]: ETHERNET, [tooLong]: ETHERNET });
+
+    const result = await netinfo.detectInterfaces();
+    expect(result.adapters.map((adapter) => adapter.device)).toEqual(['en0', longest]);
+    expect(result.ethernet).toMatchObject({ device: longest, routable: true });
+    expect(argvOf(runner).some((argv) => argv.includes(tooLong))).toBe(false);
+
+    const pinned = await netinfo.detectInterfaces({ overrides: { ethernet: tooLong } });
+    expect(pinned.ethernet).toMatchObject({ device: null, reason: 'invalid-override' });
   });
 });
