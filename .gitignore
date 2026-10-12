@@ -1,0 +1,26 @@
+# Dependencies
+node_modules/
+
+# Build outputs
+dist/
+out/
+build/
+release/
+*.tsbuildinfo
+.vite/
+
+# Test
+coverage/
+
+# IDE / OS
+.idea/
+.vscode/
+.DS_Store
+
+# Secrets va imzolash materiali (hech qachon commit qilinmaydi)
+.env
+.env.*
+!.env.example
+*.p12
+*.cer
+*.provisionprofile
