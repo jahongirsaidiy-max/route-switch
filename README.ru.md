@@ -122,6 +122,14 @@ npm run verify     # линтер + проверка типов + тесты
 Отдельные шаги также доступны как `npm run lint`, `npm run typecheck` и
 `npm test`.
 
+Запуск приложения Electron:
+
+```bash
+npm run dev -w @routeswitch/app      # запустить приложение с горячей перезагрузкой
+npm run build -w @routeswitch/app    # production-сборка в packages/app/out
+npm run start -w @routeswitch/app    # собрать и запустить production-сборку
+```
+
 ## Не входит в MVP
 
 - Wildcard-домены (`*.example.com`) — для них нужен DNS-прокси

@@ -1,5 +1,8 @@
+import { builtinModules } from 'node:module';
+
 import js from '@eslint/js';
 import { defineConfig } from 'eslint/config';
+import reactHooks from 'eslint-plugin-react-hooks';
 import tseslint from 'typescript-eslint';
 
 const WORKSPACE_PACKAGES = ['shared', 'helper', 'app'];
@@ -27,29 +30,130 @@ const importsOfPackage = (target) => ({
 });
 
 // `no-restricted-imports` does not merge across config objects, so every
-// package block carries the child_process restriction together with its own
-// boundary patterns.
-const restrictedImports = (forbiddenPackages) => [
+// block that sets it carries the child_process restriction and the package
+// boundary together with its own extra patterns.
+const restrictedImports = (forbiddenPackages, extraPatterns = []) => [
   'error',
   {
     paths: CHILD_PROCESS_RESTRICTION,
-    patterns: forbiddenPackages.map(importsOfPackage),
+    patterns: [...forbiddenPackages.map(importsOfPackage), ...extraPatterns],
   },
 ];
 
+const forbiddenPackagesFor = (name) =>
+  WORKSPACE_PACKAGES.filter((other) => other !== name && !ALLOWED_WORKSPACE_IMPORTS[name].includes(other));
+
+const SOURCE_FILES = '*.{ts,tsx,mts,cts,js,mjs,cjs}';
+
 const boundaryConfigs = WORKSPACE_PACKAGES.map((name) => ({
   name: `routeswitch/boundaries/${name}`,
-  files: [`packages/${name}/**/*.{ts,tsx,mts,cts,js,mjs,cjs}`],
+  files: [`packages/${name}/**/${SOURCE_FILES}`],
   rules: {
-    'no-restricted-imports': restrictedImports(
-      WORKSPACE_PACKAGES.filter(
-        (other) => other !== name && !ALLOWED_WORKSPACE_IMPORTS[name].includes(other),
-      ),
-    ),
+    'no-restricted-imports': restrictedImports(forbiddenPackagesFor(name)),
   },
 }));
 
+// The Electron app's three contexts. The renderer is a sandboxed web page: it
+// reaches the system only through the preload API, so it may not import
+// Electron, Node built-ins or the code of the other two contexts. The preload
+// is bundled on its own and must not pull in main-process code.
+const BARE_NODE_BUILTINS = builtinModules.filter((name) => !name.startsWith('node:') && !name.startsWith('_'));
+
+// Relative paths that climb out to `src/main` (or `src/preload`).
+const importsOfAppContext = (contexts, from) => ({
+  regex: `^(?:\\.\\./)+(?:src/)?(?:${contexts.join('|')})(?:/|$)`,
+  message: `Electron context boundary: ${from} code must not import ${contexts.join(' or ')}-process code.`,
+});
+
+const RENDERER_RESTRICTIONS = [
+  {
+    regex: '^electron(?:/|$)',
+    message: 'The renderer must not import electron. Use the API the preload exposes.',
+  },
+  {
+    regex: `^(?:node:|(?:${BARE_NODE_BUILTINS.join('|')})(?:/|$))`,
+    message: 'The renderer must not import Node built-ins. Use the API the preload exposes.',
+  },
+  importsOfAppContext(['main', 'preload'], 'renderer'),
+];
+
+const PRELOAD_RESTRICTIONS = [importsOfAppContext(['main'], 'preload')];
+
 const CHILD_PROCESS_SOURCE = '/^(node:)?child_process$/';
+
+// `no-restricted-syntax` does not merge across config objects either.
+const NO_SHELL_SYNTAX = [
+  {
+    selector: 'ObjectExpression > Property[key.name="shell"]:not([value.value=false])',
+    message: 'No shell: the `shell` option is forbidden. Use execFile/spawn with an argument array.',
+  },
+  {
+    selector: 'ObjectExpression > Property[key.value="shell"]:not([value.value=false])',
+    message: 'No shell: the `shell` option is forbidden. Use execFile/spawn with an argument array.',
+  },
+  {
+    selector: `ImportExpression[source.value=${CHILD_PROCESS_SOURCE}]`,
+    message: 'Import child_process statically by name so exec/execSync stay blocked.',
+  },
+  {
+    selector: `CallExpression[callee.name="require"][arguments.0.value=${CHILD_PROCESS_SOURCE}]`,
+    message: 'Import child_process statically by name so exec/execSync stay blocked.',
+  },
+];
+
+// Every class that carries a webContents with its own webPreferences.
+const WINDOW_CLASSES = '/^(?:BrowserWindow|BaseWindow|WebContentsView|BrowserView)$/';
+
+const BROWSER_WINDOW_SYNTAX = [
+  {
+    selector: `NewExpression:matches([callee.name=${WINDOW_CLASSES}], [callee.property.name=${WINDOW_CLASSES}])`,
+    message: 'Windows are created only by createWindowFactory() in packages/app/src/main/windows.ts.',
+  },
+];
+
+// The static-import restrictions above do not see `import()` or `require()`.
+// `\\u002f` is a slash: esquery ends a regex at the first literal one.
+const RENDERER_FORBIDDEN_SOURCE = `/^(?:electron|node:.*|${BARE_NODE_BUILTINS.filter((name) => !name.includes('/')).join('|')})(?:\\u002f.*)?$/`;
+
+const RENDERER_SYNTAX = [
+  {
+    selector: `ImportExpression[source.value=${RENDERER_FORBIDDEN_SOURCE}]`,
+    message: 'The renderer must not import electron or Node built-ins. Use the API the preload exposes.',
+  },
+  {
+    selector: 'CallExpression[callee.name="require"]',
+    message: 'The renderer has no require(). Use ES imports, and the API the preload exposes.',
+  },
+];
+
+const appConfigs = [
+  {
+    name: 'routeswitch/app/single-window-factory',
+    files: [`packages/app/**/${SOURCE_FILES}`],
+    ignores: ['packages/app/src/main/windows.ts'],
+    rules: {
+      'no-restricted-syntax': ['error', ...NO_SHELL_SYNTAX, ...BROWSER_WINDOW_SYNTAX],
+    },
+  },
+  {
+    name: 'routeswitch/app/renderer',
+    files: [`packages/app/src/renderer/**/${SOURCE_FILES}`],
+    plugins: { 'react-hooks': reactHooks },
+    rules: {
+      'no-restricted-syntax': ['error', ...NO_SHELL_SYNTAX, ...BROWSER_WINDOW_SYNTAX, ...RENDERER_SYNTAX],
+      'no-restricted-imports': restrictedImports(forbiddenPackagesFor('app'), RENDERER_RESTRICTIONS),
+      'react-hooks/rules-of-hooks': 'error',
+      'react-hooks/exhaustive-deps': 'error',
+    },
+  },
+  {
+    name: 'routeswitch/app/preload',
+    files: [`packages/app/src/preload/**/${SOURCE_FILES}`],
+    rules: {
+      'no-restricted-imports': restrictedImports(forbiddenPackagesFor('app'), PRELOAD_RESTRICTIONS),
+    },
+  },
+];
 
 export default defineConfig(
   {
@@ -78,26 +182,9 @@ export default defineConfig(
     rules: {
       '@typescript-eslint/no-explicit-any': 'error',
       'no-restricted-imports': restrictedImports([]),
-      'no-restricted-syntax': [
-        'error',
-        {
-          selector: 'ObjectExpression > Property[key.name="shell"]:not([value.value=false])',
-          message: 'No shell: the `shell` option is forbidden. Use execFile/spawn with an argument array.',
-        },
-        {
-          selector: 'ObjectExpression > Property[key.value="shell"]:not([value.value=false])',
-          message: 'No shell: the `shell` option is forbidden. Use execFile/spawn with an argument array.',
-        },
-        {
-          selector: `ImportExpression[source.value=${CHILD_PROCESS_SOURCE}]`,
-          message: 'Import child_process statically by name so exec/execSync stay blocked.',
-        },
-        {
-          selector: `CallExpression[callee.name="require"][arguments.0.value=${CHILD_PROCESS_SOURCE}]`,
-          message: 'Import child_process statically by name so exec/execSync stay blocked.',
-        },
-      ],
+      'no-restricted-syntax': ['error', ...NO_SHELL_SYNTAX],
     },
   },
   ...boundaryConfigs,
+  ...appConfigs,
 );
