@@ -115,6 +115,31 @@ export const findIfaceConflicts = (rules: readonly RoutedRule[]): IfaceConflict[
   return conflicts;
 };
 
+export interface DuplicateId {
+  /** Index of the first rule that uses the id. */
+  readonly first: number;
+  /** Index of a later rule that reuses it. */
+  readonly second: number;
+}
+
+/**
+ * Rules that reuse the id of an earlier rule. Ids are compared without regard
+ * to case, because a UUID is the same value in either case.
+ */
+export const findDuplicateIds = (rules: readonly Pick<Rule, 'id'>[]): DuplicateId[] => {
+  const firstById = new Map<string, number>();
+  const duplicates: DuplicateId[] = [];
+
+  rules.forEach((rule, index) => {
+    const key = rule.id.toLowerCase();
+    const first = firstById.get(key);
+    if (first === undefined) firstById.set(key, index);
+    else duplicates.push({ first, second: index });
+  });
+
+  return duplicates;
+};
+
 export interface Overlap<T> {
   /** The rule with the shorter prefix (or the earlier one when both are equal). */
   readonly wider: T;
@@ -157,6 +182,16 @@ export const Config = z
   })
   .check((ctx) => {
     const { rules } = ctx.value;
+    for (const { first, second } of findDuplicateIds(rules)) {
+      const id = rules[second]?.id ?? '';
+      ctx.issues.push({
+        code: 'custom',
+        message: `Rule id ${id} is already used by rule #${String(first + 1)}`,
+        input: id,
+        path: ['rules', second, 'id'],
+        params: { code: 'duplicate-id', first, second },
+      });
+    }
     for (const { first, second } of findIfaceConflicts(rules)) {
       const target = rules[second]?.target ?? '';
       ctx.issues.push({

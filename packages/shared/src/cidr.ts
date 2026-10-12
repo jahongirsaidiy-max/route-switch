@@ -15,15 +15,26 @@ export type ValidationCode =
   | 'invalid-ipv4'
   | 'invalid-cidr'
   | 'invalid-prefix'
+  | 'prefix-too-wide'
   | 'invalid-domain'
   | 'invalid-destination'
   | 'default-route'
+  | 'this-network'
   | 'loopback'
-  | 'multicast';
+  | 'link-local'
+  | 'multicast'
+  | 'broadcast';
 
 export type ForbiddenReason = Extract<
   ValidationCode,
-  'invalid-destination' | 'default-route' | 'loopback' | 'multicast'
+  | 'invalid-destination'
+  | 'prefix-too-wide'
+  | 'default-route'
+  | 'this-network'
+  | 'loopback'
+  | 'link-local'
+  | 'multicast'
+  | 'broadcast'
 >;
 
 export interface ValidationError {
@@ -47,7 +58,12 @@ export interface Destination {
 }
 
 export const IPV4_BITS = 32;
-export const MIN_SUBNET_PREFIX = 1;
+/**
+ * The widest subnet a rule may route. Anything wider (`/1`..`/7`) is rejected:
+ * a pair such as `0.0.0.0/1` + `128.0.0.0/1` would shadow the default route
+ * without ever being `/0`.
+ */
+export const MIN_SUBNET_PREFIX = 8;
 export const MAX_DOMAIN_LENGTH = 253;
 export const MAX_DOMAIN_LABEL_LENGTH = 63;
 
@@ -55,26 +71,35 @@ export const MAX_DOMAIN_LABEL_LENGTH = 63;
 export const DEFAULT_ROUTE_KEYWORD = 'default';
 export const DEFAULT_ROUTE_CIDR = '0.0.0.0/0';
 
+export const LIMITED_BROADCAST_ADDRESS = '255.255.255.255';
+
 /**
  * Ranges that must never be added to or removed from the routing table, next
  * to the default route itself. A destination is forbidden when it lies
  * entirely inside one of them.
  */
 export const FORBIDDEN_RANGES: readonly { readonly cidr: string; readonly reason: ForbiddenReason }[] = [
+  { cidr: '0.0.0.0/8', reason: 'this-network' },
   { cidr: '127.0.0.0/8', reason: 'loopback' },
+  { cidr: '169.254.0.0/16', reason: 'link-local' },
   { cidr: '224.0.0.0/4', reason: 'multicast' },
+  { cidr: `${LIMITED_BROADCAST_ADDRESS}/${String(IPV4_BITS)}`, reason: 'broadcast' },
 ];
 
 const MESSAGES: Record<ValidationCode, string> = {
   'invalid-ipv4': 'Must be an IPv4 address in dotted decimal form, e.g. 172.16.12.40',
   'invalid-cidr': 'Must be an IPv4 subnet in CIDR form, e.g. 10.0.0.0/8',
-  'invalid-prefix': `Subnet prefix must be between ${String(MIN_SUBNET_PREFIX)} and ${String(IPV4_BITS)}`,
+  'invalid-prefix': `Subnet prefix must be a number between ${String(MIN_SUBNET_PREFIX)} and ${String(IPV4_BITS)}`,
+  'prefix-too-wide': `Subnet is too wide: the prefix must be between ${String(MIN_SUBNET_PREFIX)} and ${String(IPV4_BITS)}`,
   'invalid-domain':
     'Must be a lower-case domain name (a-z, 0-9, "-" and "." only), e.g. corp.local; wildcards are not supported',
   'invalid-destination': 'Must be an IPv4 address or an IPv4 subnet in CIDR form',
   'default-route': 'The default route (0.0.0.0/0) must never be changed',
+  'this-network': '"This network" addresses (0.0.0.0/8) must never be routed',
   loopback: 'Loopback addresses (127.0.0.0/8) must never be routed',
+  'link-local': 'Link-local addresses (169.254.0.0/16) must never be routed',
   multicast: 'Multicast addresses (224.0.0.0/4) must never be routed',
+  broadcast: 'The limited broadcast address (255.255.255.255) must never be routed',
 };
 
 const ok = <T>(value: T): Normalised<T> => ({ ok: true, value });
@@ -141,7 +166,10 @@ const forbiddenReasonOf = ({ network, prefix }: ParsedDestination): ForbiddenRea
   for (const range of FORBIDDEN_PARSED) {
     if (prefix >= range.prefix && network.match(range.network, range.prefix)) return range.reason;
   }
-  return null;
+
+  // Checked after the ranges so `224.0.0.0/4` keeps its more specific reason.
+  // Nothing wider than the minimum prefix is ever routable, whoever asks.
+  return prefix < MIN_SUBNET_PREFIX ? 'prefix-too-wide' : null;
 };
 
 /**
@@ -159,7 +187,9 @@ export const parseIpv4Destination = (input: string): Destination | null => {
  * resolved IPs: a bare IPv4 address or a CIDR.
  *
  * Forbidden: the literal `default`, `0.0.0.0/0` (any `/0`, and the bare
- * `0.0.0.0`), anything inside `127.0.0.0/8`, anything inside `224.0.0.0/4`.
+ * `0.0.0.0`), anything inside `0.0.0.0/8`, `127.0.0.0/8`, `169.254.0.0/16` or
+ * `224.0.0.0/4`, the limited broadcast address `255.255.255.255`, and any
+ * block wider than `/8` (`prefix-too-wide`).
  * Fails closed: input that is not a valid IPv4 destination (IPv6, host names,
  * garbage) is reported as `invalid-destination`.
  */
@@ -178,26 +208,35 @@ export const normalizeIpv4 = (input: string): Normalised => {
   return address === null ? fail('invalid-ipv4') : ok(address.toString());
 };
 
-/** Syntax only: IPv4 CIDR with prefix 1..32, host bits cleared. */
+/**
+ * Syntax and prefix range only: IPv4 CIDR with prefix 8..32, host bits
+ * cleared. Does not look at the forbidden ranges; use `normalizeSubnet` for a
+ * rule target.
+ */
 export const normalizeCidr = (input: string): Normalised => {
   const parsed = parseCidr(input);
   if (typeof parsed === 'string') return fail(parsed);
   // `/0` is the default route whatever the address part says (`10.0.0.0/0`).
   if (parsed.prefix === 0) return fail('default-route');
+  if (parsed.prefix < MIN_SUBNET_PREFIX) return fail('prefix-too-wide');
   return ok(toDestination(parsed).cidr);
 };
 
-const rejectForbidden = (result: Normalised): Normalised => {
-  if (!result.ok) return result;
-  const reason = forbiddenDestinationReason(result.value);
-  return reason === null ? result : fail(reason);
+/** A routable single address: valid IPv4 and not a forbidden destination. */
+export const normalizeHostAddress = (input: string): Normalised => {
+  const address = parseAddress(input);
+  if (address === null) return fail('invalid-ipv4');
+  const reason = forbiddenReasonOf({ network: address, prefix: IPV4_BITS });
+  return reason === null ? ok(address.toString()) : fail(reason);
 };
 
-/** A routable single address: valid IPv4 and not a forbidden destination. */
-export const normalizeHostAddress = (input: string): Normalised => rejectForbidden(normalizeIpv4(input));
-
-/** A routable subnet: valid CIDR (prefix 1..32) and not a forbidden destination. */
-export const normalizeSubnet = (input: string): Normalised => rejectForbidden(normalizeCidr(input));
+/** A routable subnet: valid CIDR (prefix 8..32) and not a forbidden destination. */
+export const normalizeSubnet = (input: string): Normalised => {
+  const parsed = parseCidr(input);
+  if (typeof parsed === 'string') return fail(parsed);
+  const reason = forbiddenReasonOf(parsed);
+  return reason === null ? ok(toDestination(parsed).cidr) : fail(reason);
+};
 
 const DOMAIN_CHARSET = /^[a-z0-9.-]+$/;
 const NUMERIC_LABEL = /^\d+$/;

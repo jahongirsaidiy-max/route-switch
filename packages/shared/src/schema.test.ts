@@ -7,6 +7,7 @@ import {
   Rule,
   RuleKind,
   destinationKey,
+  findDuplicateIds,
   findIfaceConflicts,
   findOverlaps,
   normalizeTarget,
@@ -118,7 +119,10 @@ describe('Rule', () => {
       ['10.0.0.0/8', '10.0.0.0/8'],
       ['10.1.2.3/8', '10.0.0.0/8'],
       ['172.16.12.40/32', '172.16.12.40/32'],
-      ['128.0.0.0/1', '128.0.0.0/1'],
+      ['128.0.0.0/8', '128.0.0.0/8'],
+      ['1.0.0.0/8', '1.0.0.0/8'],
+      ['169.253.0.0/16', '169.253.0.0/16'],
+      ['169.255.0.0/16', '169.255.0.0/16'],
     ])('accepts %s as %s', (target, expected) => {
       expect(Rule.parse(rule({ kind: 'subnet', target })).target).toBe(expected);
     });
@@ -129,11 +133,43 @@ describe('Rule', () => {
         expect(issuesOf(Rule.safeParse(rule({ kind: 'subnet', target })))).toEqual(['target: custom']);
       },
     );
+
+    it.each([
+      ['0.0.0.0/1', 'prefix-too-wide'],
+      ['128.0.0.0/1', 'prefix-too-wide'],
+      ['10.0.0.0/7', 'prefix-too-wide'],
+      ['0.0.0.0/8', 'this-network'],
+      ['0.10.0.0/16', 'this-network'],
+      ['169.254.0.0/16', 'link-local'],
+      ['169.254.10.0/24', 'link-local'],
+      ['255.255.255.255/32', 'broadcast'],
+    ])('rejects %s (%s)', (target, code) => {
+      const result = Rule.safeParse(rule({ kind: 'subnet', target }));
+      expect(result.success ? [] : result.error.issues).toMatchObject([
+        { code: 'custom', path: ['target'], params: { code } },
+      ]);
+    });
   });
 
   describe('ip target', () => {
-    it('accepts an IPv4 address', () => {
-      expect(Rule.parse(rule({ kind: 'ip', target: '172.16.12.40' })).target).toBe('172.16.12.40');
+    it.each(['172.16.12.40', '1.0.0.0', '169.253.255.255', '169.255.0.0', '255.255.255.254'])(
+      'accepts %s',
+      (target) => {
+        expect(Rule.parse(rule({ kind: 'ip', target })).target).toBe(target);
+      },
+    );
+
+    it.each([
+      ['0.0.0.1', 'this-network'],
+      ['0.255.255.255', 'this-network'],
+      ['169.254.0.0', 'link-local'],
+      ['169.254.255.255', 'link-local'],
+      ['255.255.255.255', 'broadcast'],
+    ])('rejects %s (%s)', (target, code) => {
+      const result = Rule.safeParse(rule({ kind: 'ip', target }));
+      expect(result.success ? [] : result.error.issues).toMatchObject([
+        { code: 'custom', path: ['target'], params: { code } },
+      ]);
     });
 
     it.each(['127.0.0.1', '224.0.0.251', '0.0.0.0', '010.1.1.1', '1.2.3', '::1', '10.0.0.0/8', 'default', 'corp.local'])(
@@ -184,6 +220,37 @@ describe('Rule', () => {
         expect(issuesOf(Rule.safeParse(rule({ kind: 'domain', target: 'corp.local', dns })))).toEqual(['dns: custom']);
       },
     );
+
+    it.each(['1.0.0.0', '169.253.255.255', '169.255.0.0', '255.255.255.254'])('accepts %s', (dns) => {
+      expect(Rule.parse(rule({ kind: 'domain', target: 'corp.local', dns })).dns).toBe(dns);
+    });
+
+    it.each([
+      ['0.0.0.1', 'this-network'],
+      ['0.255.255.255', 'this-network'],
+      ['169.254.0.0', 'link-local'],
+      ['169.254.169.254', 'link-local'],
+      ['169.254.255.255', 'link-local'],
+      ['255.255.255.255', 'broadcast'],
+    ])('rejects %s (%s)', (dns, code) => {
+      const result = Rule.safeParse(rule({ kind: 'domain', target: 'corp.local', dns }));
+      expect(result.success ? [] : result.error.issues).toMatchObject([
+        { code: 'custom', path: ['dns'], params: { code } },
+      ]);
+    });
+
+    it.each([
+      ['subnet', '10.0.0.0/8'],
+      ['ip', '172.16.12.40'],
+    ] as const)('is accepted and left alone on a %s rule, which ignores it', (kind, target) => {
+      const parsed = Rule.parse(rule({ kind, target, dns: '10.20.0.10' }));
+      expect(parsed).toMatchObject({ kind, target, dns: '10.20.0.10' });
+    });
+
+    it('is still validated on a rule that ignores it', () => {
+      const result = Rule.safeParse(rule({ kind: 'subnet', target: '10.0.0.0/8', dns: '169.254.0.1' }));
+      expect(issuesOf(result)).toEqual(['dns: custom']);
+    });
   });
 
   describe('refreshSec', () => {
@@ -307,6 +374,58 @@ describe('Config', () => {
     });
   });
 
+  describe('unique rule ids', () => {
+    it('accepts rules with distinct ids', () => {
+      const result = Config.safeParse(
+        config([rule(), rule({ id: uuid(2), target: '192.168.0.0/16' }), rule({ id: uuid(3), target: '172.16.0.0/12' })]),
+      );
+      expect(result.success).toBe(true);
+    });
+
+    it('rejects two rules with the same id and points at the second one', () => {
+      const result = Config.safeParse(config([rule(), rule({ target: '192.168.0.0/16' })]));
+      expect(result.success ? [] : result.error.issues).toMatchObject([
+        { code: 'custom', path: ['rules', 1, 'id'], params: { code: 'duplicate-id', first: 0, second: 1 } },
+      ]);
+    });
+
+    it('reports every later rule that reuses an id', () => {
+      const result = Config.safeParse(
+        config([
+          rule({ id: uuid(7) }),
+          rule({ id: uuid(2), target: '192.168.0.0/16' }),
+          rule({ id: uuid(7), target: '172.16.0.0/12' }),
+          rule({ id: uuid(7), kind: 'domain', target: 'corp.local' }),
+        ]),
+      );
+      expect(issuesOf(result)).toEqual(['rules.2.id: custom', 'rules.3.id: custom']);
+      expect(result.success ? [] : result.error.issues).toMatchObject([
+        { params: { code: 'duplicate-id', first: 0, second: 2 } },
+        { params: { code: 'duplicate-id', first: 0, second: 3 } },
+      ]);
+    });
+
+    it('rejects a duplicate id even when the rule is disabled', () => {
+      const result = Config.safeParse(config([rule(), rule({ target: '192.168.0.0/16', enabled: false })]));
+      expect(issuesOf(result)).toEqual(['rules.1.id: custom']);
+    });
+
+    it('treats ids that differ only in case as the same id', () => {
+      const id = 'b3f1c2d4-5e6f-4a7b-8c9d-0e1f2a3b4c5d';
+      const result = Config.safeParse(config([rule({ id }), rule({ id: id.toUpperCase(), target: '192.168.0.0/16' })]));
+      expect(issuesOf(result)).toEqual(['rules.1.id: custom']);
+    });
+
+    it('reports a duplicate id and an interface conflict on the same rule separately', () => {
+      const result = Config.safeParse(config([rule(), rule({ iface: 'wifi' })]));
+      expect(issuesOf(result)).toEqual(['rules.1.id: custom', 'rules.1.target: custom']);
+      expect(result.success ? [] : result.error.issues).toMatchObject([
+        { params: { code: 'duplicate-id' } },
+        { params: { code: 'iface-conflict' } },
+      ]);
+    });
+  });
+
   describe('same target on two interfaces', () => {
     it('rejects the same subnet bound to ethernet and wifi', () => {
       const result = Config.safeParse(config([rule(), rule({ id: uuid(2), iface: 'wifi' })]));
@@ -381,6 +500,21 @@ describe('destinationKey', () => {
 
   it('returns null for an invalid IP target', () => {
     expect(destinationKey({ kind: 'ip', target: 'not-an-ip' })).toBeNull();
+  });
+});
+
+describe('findDuplicateIds', () => {
+  it('returns nothing for distinct ids', () => {
+    expect(findDuplicateIds([{ id: uuid(1) }, { id: uuid(2) }, { id: uuid(3) }])).toEqual([]);
+    expect(findDuplicateIds([])).toEqual([]);
+  });
+
+  it('pairs every repeat with the first rule that used the id', () => {
+    expect(findDuplicateIds([{ id: uuid(1) }, { id: uuid(2) }, { id: uuid(1) }, { id: uuid(2) }, { id: uuid(1) }])).toEqual([
+      { first: 0, second: 2 },
+      { first: 1, second: 3 },
+      { first: 0, second: 4 },
+    ]);
   });
 });
 

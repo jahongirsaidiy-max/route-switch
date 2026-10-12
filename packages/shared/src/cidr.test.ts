@@ -1,7 +1,9 @@
 import { describe, expect, it } from 'vitest';
 
 import {
+  FORBIDDEN_RANGES,
   MAX_DOMAIN_LENGTH,
+  MIN_SUBNET_PREFIX,
   cidrContains,
   cidrsOverlap,
   forbiddenDestinationReason,
@@ -55,10 +57,28 @@ describe('normalizeCidr', () => {
     ['172.16.12.40/24', '172.16.12.0/24'],
     ['172.16.12.40/32', '172.16.12.40/32'],
     ['192.168.1.129/25', '192.168.1.128/25'],
-    ['255.255.255.255/1', '128.0.0.0/1'],
+    ['255.255.255.255/8', '255.0.0.0/8'],
+    ['128.0.0.0/8', '128.0.0.0/8'],
     ['10.0.0.1/31', '10.0.0.0/31'],
   ])('normalises %s to %s', (input, expected) => {
     expect(valueOf(normalizeCidr(input))).toBe(expected);
+  });
+
+  it('keeps the minimum prefix at 8', () => {
+    expect(MIN_SUBNET_PREFIX).toBe(8);
+  });
+
+  it.each([1, 2, 3, 4, 5, 6, 7])('rejects prefix %d as too wide', (prefix) => {
+    expect(codeOf(normalizeCidr(`10.0.0.0/${String(prefix)}`))).toBe('prefix-too-wide');
+  });
+
+  it.each(['0.0.0.0/1', '128.0.0.0/1', '255.255.255.255/1', '10.0.0.0/7'])('rejects %s as too wide', (input) => {
+    expect(codeOf(normalizeCidr(input))).toBe('prefix-too-wide');
+  });
+
+  it('says which prefixes are allowed when the subnet is too wide', () => {
+    const result = normalizeCidr('10.0.0.0/7');
+    expect(result.ok ? '' : result.error.message).toMatch(/between 8 and 32/);
   });
 
   it.each([
@@ -100,6 +120,28 @@ describe('forbiddenDestinationReason', () => {
     ['224.0.0.251', 'multicast'],
     ['239.255.255.255', 'multicast'],
     ['239.1.0.0/16', 'multicast'],
+    ['0.0.0.0/8', 'this-network'],
+    ['0.0.0.1', 'this-network'],
+    ['0.0.0.1/32', 'this-network'],
+    ['0.1.2.3/8', 'this-network'],
+    ['0.10.0.0/16', 'this-network'],
+    ['0.255.255.255', 'this-network'],
+    ['169.254.0.0/16', 'link-local'],
+    ['169.254.0.0', 'link-local'],
+    ['169.254.10.0/24', 'link-local'],
+    ['169.254.169.254', 'link-local'],
+    ['169.254.255.255', 'link-local'],
+    ['255.255.255.255', 'broadcast'],
+    ['255.255.255.255/32', 'broadcast'],
+    ['0.0.0.0/1', 'prefix-too-wide'],
+    ['128.0.0.0/1', 'prefix-too-wide'],
+    ['192.0.0.0/2', 'prefix-too-wide'],
+    ['224.0.0.0/3', 'prefix-too-wide'],
+    ['240.0.0.0/4', 'prefix-too-wide'],
+    ['0.0.0.0/7', 'prefix-too-wide'],
+    ['10.0.0.0/7', 'prefix-too-wide'],
+    ['126.0.0.0/7', 'prefix-too-wide'],
+    ['127.0.0.0/7', 'prefix-too-wide'],
     ['', 'invalid-destination'],
     ['::/0', 'invalid-destination'],
     ['::1', 'invalid-destination'],
@@ -120,20 +162,57 @@ describe('forbiddenDestinationReason', () => {
     '128.0.0.1',
     '223.255.255.255',
     '240.0.0.1',
-    '0.0.0.0/1',
-    '128.0.0.0/1',
-    '126.0.0.0/7',
-    '192.0.0.0/2',
+    '1.0.0.0',
+    '1.0.0.0/8',
+    '126.0.0.0/8',
+    '128.0.0.0/8',
+    '169.253.255.255',
+    '169.253.0.0/16',
+    '169.255.0.0',
+    '169.255.0.0/16',
+    '255.255.255.254',
+    '255.255.255.254/31',
+    '240.0.0.0/8',
   ])('allows %s', (destination) => {
     expect(forbiddenDestinationReason(destination)).toBeNull();
     expect(isForbiddenDestination(destination)).toBe(false);
   });
+
+  // "Inside" semantics: only /8 and narrower can exist, so a block can still
+  // cover the two forbidden ranges that are narrower than /8.
+  it.each(['169.0.0.0/8', '169.254.0.0/15', '255.0.0.0/8', '255.255.255.0/24'])(
+    'allows %s, which covers a forbidden range without lying inside it',
+    (destination) => {
+      expect(forbiddenDestinationReason(destination)).toBeNull();
+    },
+  );
+
+  it('forbids every prefix wider than the minimum, whatever the address', () => {
+    for (const address of ['0.0.0.0', '10.0.0.0', '128.0.0.0', '200.0.0.0', '255.255.255.255']) {
+      for (let prefix = 0; prefix < MIN_SUBNET_PREFIX; prefix += 1) {
+        expect(isForbiddenDestination(`${address}/${String(prefix)}`)).toBe(true);
+      }
+    }
+  });
+
+  it('lists every forbidden range', () => {
+    expect(FORBIDDEN_RANGES).toEqual([
+      { cidr: '0.0.0.0/8', reason: 'this-network' },
+      { cidr: '127.0.0.0/8', reason: 'loopback' },
+      { cidr: '169.254.0.0/16', reason: 'link-local' },
+      { cidr: '224.0.0.0/4', reason: 'multicast' },
+      { cidr: '255.255.255.255/32', reason: 'broadcast' },
+    ]);
+  });
 });
 
 describe('normalizeHostAddress', () => {
-  it('accepts a routable address', () => {
-    expect(valueOf(normalizeHostAddress('172.16.12.40'))).toBe('172.16.12.40');
-  });
+  it.each(['172.16.12.40', '1.0.0.0', '169.253.255.255', '169.255.0.0', '255.255.255.254'])(
+    'accepts the routable address %s',
+    (input) => {
+      expect(valueOf(normalizeHostAddress(input))).toBe(input);
+    },
+  );
 
   it.each([
     ['127.0.0.1', 'loopback'],
@@ -141,6 +220,11 @@ describe('normalizeHostAddress', () => {
     ['224.0.0.1', 'multicast'],
     ['239.0.0.1', 'multicast'],
     ['0.0.0.0', 'default-route'],
+    ['0.0.0.1', 'this-network'],
+    ['0.255.255.255', 'this-network'],
+    ['169.254.0.0', 'link-local'],
+    ['169.254.255.255', 'link-local'],
+    ['255.255.255.255', 'broadcast'],
     ['10.0.0.0/8', 'invalid-ipv4'],
     ['::1', 'invalid-ipv4'],
   ])('rejects %s (%s)', (input, code) => {
@@ -153,10 +237,18 @@ describe('normalizeSubnet', () => {
     expect(valueOf(normalizeSubnet('10.1.2.3/8'))).toBe('10.0.0.0/8');
   });
 
-  it('accepts prefix 1 and prefix 32', () => {
-    expect(valueOf(normalizeSubnet('0.0.0.0/1'))).toBe('0.0.0.0/1');
+  it('accepts prefix 8 and prefix 32', () => {
+    expect(valueOf(normalizeSubnet('1.0.0.0/8'))).toBe('1.0.0.0/8');
+    expect(valueOf(normalizeSubnet('128.200.0.1/8'))).toBe('128.0.0.0/8');
     expect(valueOf(normalizeSubnet('172.16.12.40/32'))).toBe('172.16.12.40/32');
   });
+
+  it.each(['169.253.0.0/16', '169.255.0.0/16', '169.0.0.0/8', '255.255.255.254/32', '240.0.0.0/8'])(
+    'accepts %s next to a forbidden range',
+    (input) => {
+      expect(valueOf(normalizeSubnet(input))).toBe(input);
+    },
+  );
 
   it.each([
     ['0.0.0.0/0', 'default-route'],
@@ -166,6 +258,18 @@ describe('normalizeSubnet', () => {
     ['127.0.0.1/32', 'loopback'],
     ['224.0.0.0/4', 'multicast'],
     ['232.0.0.0/8', 'multicast'],
+    ['0.0.0.0/8', 'this-network'],
+    ['0.1.2.3/8', 'this-network'],
+    ['0.0.0.1/32', 'this-network'],
+    ['169.254.0.0/16', 'link-local'],
+    ['169.254.10.0/24', 'link-local'],
+    ['169.254.1.1/16', 'link-local'],
+    ['255.255.255.255/32', 'broadcast'],
+    ['0.0.0.0/1', 'prefix-too-wide'],
+    ['128.0.0.0/1', 'prefix-too-wide'],
+    ['10.0.0.0/7', 'prefix-too-wide'],
+    ['126.0.0.0/7', 'prefix-too-wide'],
+    ['224.0.0.0/3', 'prefix-too-wide'],
     ['10.0.0.0', 'invalid-cidr'],
   ])('rejects %s (%s)', (input, code) => {
     expect(codeOf(normalizeSubnet(input))).toBe(code);

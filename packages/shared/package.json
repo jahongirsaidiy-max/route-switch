@@ -12,6 +12,6 @@
   },
   "dependencies": {
     "ipaddr.js": "2.5.0",
-    "zod": "4.6.6"
+    "zod": "4.6.5"
   }
 }
