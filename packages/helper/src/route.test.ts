@@ -4,6 +4,7 @@ import { createLogger, createMemorySink, type LogEntry } from './logger';
 import {
   classifyExistingRoute,
   createRouteOperations,
+  inspectRouteEntry,
   parseRouteGetOutput,
   type RouteAddRequest,
   type RouteDeleteRequest,
@@ -920,81 +921,513 @@ describe('routeAdd', () => {
 });
 
 describe('routeDelete', () => {
-  it('deletes a subnet with -net', async () => {
-    const { runner, ops, entries } = setup();
-    runner.when(ROUTE, ['-n', 'delete', '-net', '10.0.0.0/8'], { stdout: 'delete net 10.0.0.0\n' });
+  const NET = '10.0.0.0/8';
+  const GET = ['-n', 'get', '-net', NET];
+  const DELETE = ['-n', 'delete', '-net', NET];
+  /** The exact entry for 10.0.0.0/8 or, with other fields, whatever a test needs in its place. */
+  const net = (extra: Partial<GetBlock> = {}): string =>
+    getBlock({ to: '10.0.0.0', destination: '10.0.0.0', mask: '255.0.0.0', gateway: GW, iface: 'en5', flags: NET_GATEWAY_FLAGS, ...extra });
+  const host = (extra: Partial<GetBlock> = {}): string =>
+    getBlock({ to: '10.1.2.3', destination: '10.1.2.3', gateway: GW, iface: 'en5', flags: HOST_GATEWAY_FLAGS, ...extra });
 
-    const result = await ops.routeDelete({ dst: '10.0.0.0/8' });
+  /** Every `get` answers `lookup`, every `delete` answers `removal`. */
+  const table = (lookup: FakeCommandResponse, removal: FakeCommandResponse = { stdout: 'delete net 10.0.0.0\n' }) => {
+    const context = setup();
+    context.runner.whenMatching((_bin, args) => (args[1] === 'get' ? lookup : args[1] === 'delete' ? removal : undefined));
+    return context;
+  };
 
-    expect(result).toEqual({ ok: true, outcome: 'deleted', dst: '10.0.0.0/8', kind: 'net' });
-    expect(runner.calls).toHaveLength(1);
-    expect(only(entries).context).toEqual({
-      component: 'route',
-      op: 'delete',
-      dst: '10.0.0.0/8',
-      gateway: null,
-      kind: 'net',
-      outcome: 'deleted',
+  describe('an exact route through a gateway', () => {
+    it('looks the entry up, then deletes a subnet with -net', async () => {
+      const { runner, ops, entries } = table({ stdout: net({ gateway: OTHER_GW, iface: 'en0' }) });
+
+      const result = await ops.routeDelete({ dst: NET });
+
+      expect(result).toEqual({ ok: true, outcome: 'deleted', dst: NET, kind: 'net' });
+      expect(argvOf(runner)).toEqual([GET, DELETE]);
+      const entry = only(entries);
+      expect(entry.level).toBe('info');
+      expect(entry.context).toEqual({
+        component: 'route',
+        op: 'delete',
+        dst: NET,
+        gateway: null,
+        kind: 'net',
+        outcome: 'deleted',
+        existing: 'gateway-route',
+        existingGateway: OTHER_GW,
+        existingIface: 'en0',
+      });
+    });
+
+    it('deletes a single address with -host and does not pass the gateway to either command', async () => {
+      const { runner, ops, entries } = table({ stdout: host({ to: '10.0.0.0', destination: '10.0.0.0' }) });
+
+      const result = await ops.routeDelete({ dst: '10.0.0.0/32', gateway: GW });
+
+      expect(result).toEqual({ ok: true, outcome: 'deleted', dst: '10.0.0.0', kind: 'host' });
+      expect(argvOf(runner)).toEqual([
+        ['-n', 'get', '-host', '10.0.0.0'],
+        ['-n', 'delete', '-host', '10.0.0.0'],
+      ]);
+      expect(only(entries).context).toMatchObject({ dst: '10.0.0.0', gateway: GW, existingGateway: GW });
+    });
+
+    it('accepts an explicitly undefined gateway', async () => {
+      const { runner, ops } = table({ stdout: GET_VIA_GATEWAY });
+
+      expect(await ops.routeDelete({ dst: '172.16.12.40', gateway: undefined })).toMatchObject({ ok: true, outcome: 'deleted' });
+      expect(runner.calls.map((call) => call.args[1])).toEqual(['get', 'delete']);
+    });
+
+    it('deletes the subnet route and the host route captured from a real table when they go through our gateway', async () => {
+      const subnet = table({ stdout: GET_GATEWAY_SUBNET });
+      expect(await subnet.ops.routeDelete({ dst: '198.51.100.0/24', gateway: OTHER_GW })).toMatchObject({ outcome: 'deleted' });
+      expect(argvOf(subnet.runner)).toEqual([
+        ['-n', 'get', '-net', '198.51.100.0/24'],
+        ['-n', 'delete', '-net', '198.51.100.0/24'],
+      ]);
+
+      const single = table({ stdout: GET_VIA_GATEWAY });
+      expect(await single.ops.routeDelete({ dst: '172.16.12.40', gateway: GW })).toMatchObject({ outcome: 'deleted' });
+      expect(argvOf(single.runner)).toEqual([
+        ['-n', 'get', '-host', '172.16.12.40'],
+        ['-n', 'delete', '-host', '172.16.12.40'],
+      ]);
+    });
+
+    it('reads a hexadecimal mask, CRLF line endings and unknown lines the same way', async () => {
+      const lookup = `${net({ mask: '0xff000000' })}     ifscope: en5\nsomething new\n`.replaceAll('\n', '\r\n');
+      const { runner, ops } = table({ stdout: lookup });
+
+      expect(await ops.routeDelete({ dst: NET, gateway: GW })).toMatchObject({ ok: true, outcome: 'deleted' });
+      expect(argvOf(runner)).toEqual([GET, DELETE]);
+    });
+
+    // The entry was there at the lookup and gone at the delete.
+    it.each<[string, FakeCommandResponse]>([
+      ['a non-zero exit code', DELETE_MISSING],
+      ['exit code 0 and the error only in the output', { ...DELETE_MISSING, exitCode: 0 }],
+      ['only the stderr line', { exitCode: 0, stderr: 'route: writing to routing socket: not in table\n' }],
+      ['only the stdout line', { exitCode: 0, stdout: 'delete net 10.0.0.0: not in table\n' }],
+      ['the errno wording', { exitCode: 1, stderr: 'route: writing to routing socket: No such process\n' }],
+    ])('reports a route that vanished before the delete as not-found (%s)', async (_name, response) => {
+      const { runner, ops, entries } = table({ stdout: net() }, response);
+
+      const result = await ops.routeDelete({ dst: NET, gateway: GW });
+
+      expect(result).toEqual({ ok: true, outcome: 'not-found', dst: NET, kind: 'net' });
+      expect(argvOf(runner)).toEqual([GET, DELETE]);
+      const entry = only(entries);
+      expect(entry.level).toBe('info');
+      expect(entry.context).toMatchObject({ component: 'route', op: 'delete', outcome: 'not-found', gateway: GW });
+    });
+
+    it.each<[string, FakeCommandResponse, Record<string, unknown>]>([
+      [
+        'not being root',
+        { exitCode: 77, stderr: 'route: must be root to alter routing table\n' },
+        { failure: 'nonzero-exit', exitCode: 77, message: 'must be root to alter routing table' },
+      ],
+      [
+        'exit code 0 with another error',
+        { exitCode: 0, stdout: 'delete net 10.0.0.0: entry in use\n' },
+        { failure: 'reported-error', exitCode: 0, message: 'entry in use' },
+      ],
+      ['a timeout', { failure: 'timeout', error: 'Timed out after 10000 ms' }, { failure: 'timeout' }],
+    ])('returns a failure value when the delete ends in %s', async (_name, response, expected) => {
+      const { runner, ops, entries } = table({ stdout: net() }, response);
+
+      const result = await ops.routeDelete({ dst: NET });
+
+      expect(result).toMatchObject({ ok: false, outcome: 'failed', step: 'delete', ...expected });
+      expect(argvOf(runner)).toEqual([GET, DELETE]);
+      expect(only(entries).level).toBe('error');
     });
   });
 
-  it('deletes a single address with -host and does not pass the gateway to the command', async () => {
-    const { runner, ops, entries } = setup();
-    runner.when(ROUTE, ['-n', 'delete', '-host', '10.0.0.0'], {});
+  describe('no exact entry', () => {
+    it.each<[string, string, FakeCommandResponse]>([
+      ['"not in table" with exit code 0 (real)', NET, { exitCode: 0, stderr: 'route: writing to routing socket: not in table\n' }],
+      ['"not in table" with a non-zero exit code', NET, { exitCode: 1, stderr: 'route: writing to routing socket: not in table\n' }],
+      // A lookup without an exact entry falls through to the best wider one.
+      ['the default route, for a subnet (real)', NET, { stdout: getBlock({ ...DEFAULT_ROUTE, to: '10.0.0.0' }) }],
+      ['the default route, for an address (real)', '10.1.2.3', { stdout: getBlock({ ...DEFAULT_ROUTE, to: '10.1.2.3' }) }],
+      ['the default route printed without a mask', NET, { stdout: getBlock({ ...DEFAULT_ROUTE, to: '10.0.0.0', mask: undefined }) }],
+      [
+        'the connected subnet that covers the address (real)',
+        '192.168.1.77',
+        { stdout: getBlock({ to: '192.168.1.77', destination: '192.168.1.0', mask: '255.255.255.0', iface: 'en0', flags: CONNECTED_FLAGS }) },
+      ],
+      [
+        'the gateway subnet route that covers the address (real)',
+        '198.51.100.8',
+        { stdout: GET_GATEWAY_SUBNET.replace('route to: 198.51.100.0', 'route to: 198.51.100.8') },
+      ],
+      ['a wider subnet with the same network address', '10.0.0.0/16', { stdout: net() }],
+      ['a wider subnet for an address with a zero host part', '10.0.0.0', { stdout: net() }],
+      ['a wider subnet that starts lower', '10.64.0.0/10', { stdout: net({ to: '10.64.0.0' }) }],
+      ['a wider subnet with a hexadecimal mask', '10.1.2.3', { stdout: host({ destination: '10.0.0.0', mask: '0xff000000', flags: NET_GATEWAY_FLAGS }) }],
+    ])('reports not-found without a delete when the lookup shows %s', async (_name, dst, lookup) => {
+      const { runner, ops, entries } = table(lookup);
 
-    const result = await ops.routeDelete({ dst: '10.0.0.0/32', gateway: GW });
+      const result = await ops.routeDelete({ dst, gateway: GW });
 
-    expect(result).toEqual({ ok: true, outcome: 'deleted', dst: '10.0.0.0', kind: 'host' });
-    expect(argvOf(runner)).toEqual([['-n', 'delete', '-host', '10.0.0.0']]);
-    expect(only(entries).context).toMatchObject({ dst: '10.0.0.0', gateway: GW });
+      expect(result).toMatchObject({ ok: true, outcome: 'not-found', dst });
+      expect(runner.calls.map((call) => call.args[1])).toEqual(['get']);
+      const entry = only(entries);
+      expect(entry.level).toBe('info');
+      expect(entry.context).toMatchObject({ component: 'route', op: 'delete', outcome: 'not-found', existing: 'none' });
+    });
   });
 
-  it('accepts an explicitly undefined gateway', async () => {
-    const { runner, ops } = setup();
-    runner.whenMatching(() => ({}));
+  describe('an entry that is not our route', () => {
+    it('never deletes the connected subnet of an interface: [get], not-ours, warn', async () => {
+      const { runner, ops, entries } = table({ stdout: GET_CONNECTED_SUBNET });
 
-    expect(await ops.routeDelete({ dst: '172.16.12.40', gateway: undefined })).toMatchObject({ ok: true });
+      const result = await ops.routeDelete({ dst: '192.168.1.0/24', gateway: GW });
+
+      expect(result).toEqual({
+        ok: true,
+        outcome: 'not-ours',
+        dst: '192.168.1.0/24',
+        kind: 'net',
+        reason: 'connected',
+        message:
+          'the entry for 192.168.1.0/24 is a connected route on en0 and was left in place (the existing entry has no GATEWAY flag)',
+      });
+      expect(argvOf(runner)).toEqual([['-n', 'get', '-net', '192.168.1.0/24']]);
+      const entry = only(entries);
+      expect(entry.level).toBe('warn');
+      expect(entry.context).toEqual({
+        component: 'route',
+        op: 'delete',
+        dst: '192.168.1.0/24',
+        gateway: GW,
+        kind: 'net',
+        outcome: 'not-ours',
+        existing: 'connected',
+        existingIface: 'en0',
+      });
+    });
+
+    it.each<[string, string, string]>([
+      ["the neighbour entry of the interface's gateway (real)", '192.168.1.1', GET_GATEWAY_NEIGHBOUR],
+      ["the interface's own address, on lo0 (real)", '192.168.1.23', GET_OWN_ADDRESS],
+      ['an on-link neighbour (real)', '192.168.1.20', GET_ON_LINK],
+      [
+        'a /32 link entry printed with a mask (real shape)',
+        '192.168.1.1',
+        getBlock({ to: '192.168.1.1', destination: '192.168.1.1', mask: '255.255.255.255', iface: 'en0', flags: CONNECTED_FLAGS }),
+      ],
+      ['an interface route with a link#N gateway and no GATEWAY flag', NET, net({ gateway: 'link#15', flags: 'UP,DONE,STATIC' })],
+      ['a link#N gateway even with the GATEWAY flag', NET, net({ gateway: 'link#15' })],
+      ['a MAC-address gateway even with the GATEWAY flag', '10.1.2.3', host({ gateway: '0:0:5e:0:53:a' })],
+      ['an entry without the GATEWAY flag even though it prints our gateway', NET, net({ flags: CONNECTED_FLAGS })],
+    ])('never deletes %s', async (_name, dst, stdout) => {
+      for (const request of [{ dst, gateway: GW }, { dst }]) {
+        const { runner, ops, entries } = table({ stdout });
+
+        const result = await ops.routeDelete(request);
+
+        expect(result).toMatchObject({ ok: true, outcome: 'not-ours', reason: 'connected' });
+        expect(runner.calls.map((call) => call.args[1])).toEqual(['get']);
+        expect(only(entries).level).toBe('warn');
+      }
+    });
+
+    it('leaves a route through another gateway alone: someone replaced ours', async () => {
+      const { runner, ops, entries } = table({ stdout: net({ gateway: OTHER_GW, iface: 'en0' }) });
+
+      const result = await ops.routeDelete({ dst: NET, gateway: GW });
+
+      expect(result).toEqual({
+        ok: true,
+        outcome: 'not-ours',
+        dst: NET,
+        kind: 'net',
+        reason: 'other-gateway',
+        message: `the entry for ${NET} goes through ${OTHER_GW} on en0, not through the expected gateway, and was left in place`,
+      });
+      expect(argvOf(runner)).toEqual([GET]);
+      const entry = only(entries);
+      expect(entry.level).toBe('warn');
+      expect(entry.context).toEqual({
+        component: 'route',
+        op: 'delete',
+        dst: NET,
+        gateway: GW,
+        kind: 'net',
+        outcome: 'not-ours',
+        existing: 'other-gateway',
+        existingGateway: OTHER_GW,
+        existingIface: 'en0',
+      });
+    });
+
+    it('leaves the real captured routes alone when they go through another gateway than ours', async () => {
+      const subnet = table({ stdout: GET_GATEWAY_SUBNET });
+      expect(await subnet.ops.routeDelete({ dst: '198.51.100.0/24', gateway: GW })).toMatchObject({ outcome: 'not-ours', reason: 'other-gateway' });
+      expect(subnet.runner.calls.map((call) => call.args[1])).toEqual(['get']);
+
+      const single = table({ stdout: GET_VIA_GATEWAY });
+      expect(await single.ops.routeDelete({ dst: '172.16.12.40', gateway: OTHER_GW })).toMatchObject({ outcome: 'not-ours', reason: 'other-gateway' });
+      expect(single.runner.calls.map((call) => call.args[1])).toEqual(['get']);
+    });
+
+    it.each(['REJECT', 'BLACKHOLE'])('leaves a %s route alone even though it names our gateway', async (flag) => {
+      const { runner, ops } = table({ stdout: net({ flags: `${NET_GATEWAY_FLAGS},${flag}` }) });
+
+      expect(await ops.routeDelete({ dst: NET, gateway: GW })).toMatchObject({ ok: true, outcome: 'not-ours', reason: 'other-gateway' });
+      expect(argvOf(runner)).toEqual([GET]);
+    });
+
+    it('without a gateway in the request deletes whatever gateway route is there, and still no connected one', async () => {
+      const other = table({ stdout: net({ gateway: OTHER_GW, flags: `${NET_GATEWAY_FLAGS},REJECT` }) });
+      expect(await other.ops.routeDelete({ dst: NET })).toMatchObject({ ok: true, outcome: 'deleted' });
+      expect(argvOf(other.runner)).toEqual([GET, DELETE]);
+
+      const connected = table({ stdout: GET_CONNECTED_SUBNET });
+      expect(await connected.ops.routeDelete({ dst: '192.168.1.0/24' })).toMatchObject({ outcome: 'not-ours', reason: 'connected' });
+      expect(connected.runner.calls.map((call) => call.args[1])).toEqual(['get']);
+    });
   });
 
-  it.each<[string, FakeCommandResponse]>([
-    ['a non-zero exit code', DELETE_MISSING],
-    ['exit code 0 and the error only in the output', { ...DELETE_MISSING, exitCode: 0 }],
-    ['only the stderr line', { exitCode: 0, stderr: 'route: writing to routing socket: not in table\n' }],
-    ['only the stdout line', { exitCode: 0, stdout: 'delete net 10.0.0.0: not in table\n' }],
-    ['the errno wording', { exitCode: 1, stderr: 'route: writing to routing socket: No such process\n' }],
-  ])('reports a missing route as not-found (%s)', async (_name, response) => {
-    const { runner, ops, entries } = setup();
-    runner.whenMatching(() => response);
+  describe('an entry that cannot be identified', () => {
+    it.each<[string, string, string]>([
+      ['a narrower block with the same network address', NET, net({ mask: '255.255.0.0' })],
+      ['a block that does not contain the destination', NET, net({ destination: '172.16.0.0', mask: '255.240.0.0' })],
+      ['a wider block printed with host bits set', '10.1.2.3', host({ destination: '10.1.0.0', mask: '255.0.0.0', flags: NET_GATEWAY_FLAGS })],
+      ['another host entry', '10.1.2.3', host({ destination: '10.1.2.4' })],
+      ['a host entry for a subnet', NET, net({ mask: undefined, flags: HOST_GATEWAY_FLAGS })],
+      ['a host entry printed with a subnet mask', NET, net({ flags: HOST_GATEWAY_FLAGS })],
+      ['a covering entry that carries the HOST flag', '10.1.2.3', host({ destination: '10.0.0.0', mask: '255.0.0.0' })],
+      ['an entry without a mask and without the HOST flag', '10.1.2.3', host({ flags: NET_GATEWAY_FLAGS })],
+      ['an entry without a mask, for a subnet', NET, net({ mask: undefined })],
+      ['another address in "route to"', '10.1.2.3', host({ to: '10.1.2.4' })],
+      ['the default route for another address', NET, getBlock({ ...DEFAULT_ROUTE, to: '10.0.0.1' })],
+      ['no "route to" line', NET, net({ to: undefined })],
+      ['no "destination" line', NET, net({ destination: undefined })],
+      ['a shortened destination', NET, net({ destination: '10' })],
+      ['a destination printed as a CIDR', NET, net({ destination: '10.0.0.0/8' })],
+      ['"default" with a real mask', NET, net({ destination: 'default' })],
+      ['the word "Default"', NET, net({ destination: 'Default', mask: 'default' })],
+      ['a mask without the 0x prefix', NET, net({ mask: 'ff000000' })],
+      ['a mask printed as a prefix length', NET, net({ mask: '8' })],
+      ['a mask whose bits are not contiguous', NET, net({ mask: '255.0.255.0' })],
+      ['an empty mask', NET, net({ mask: '' })],
+      ['the word "default" as the mask of a real destination', NET, net({ mask: 'default' })],
+      ['no flags line', NET, net({ flags: undefined })],
+      ['empty flags', NET, net({ flags: '' })],
+      ['flags that are not a list of names', NET, net({ flags: 'UP,gateway,DONE' })],
+      ['the GATEWAY flag without a gateway line', NET, net({ gateway: undefined })],
+      ['a gateway that is not an address', NET, net({ gateway: 'router.corp.local' })],
+      ['a gateway with an octet out of range', NET, net({ gateway: '999.1.1.1' })],
+      ['a loopback gateway', NET, net({ gateway: '127.0.0.1' })],
+      ['an IPv6 gateway', NET, net({ gateway: 'fe80::1%en0' })],
+      ['no interface line', NET, net({ iface: undefined })],
+      ['an interface that is not a device name', NET, net({ iface: 'en0 en5' })],
+      ['two destination lines', NET, `${net()}destination: 10.0.0.0\n`],
+      ['two contradicting flags lines', NET, `      flags: <UP,DONE,CLONING,STATIC>\n${net()}`],
+      ['the exact block followed by a default-route block', NET, `${net()}${getBlock({ ...DEFAULT_ROUTE, to: '10.0.0.0' })}`],
+      ['a default-route block followed by the exact block', NET, `${getBlock({ ...DEFAULT_ROUTE, to: '10.0.0.0' })}${net()}`],
+      ['empty output', NET, ''],
+      ['garbage', NET, 'garbage\n\u0000\u0001: <<>>\n:::\n'],
+      ['only the metrics table', NET, METRICS],
+      ['every line joined into one', NET, net().replaceAll('\n', ' ')],
+      ['lines separated by a bare carriage return', NET, net().replaceAll('\n', '\r')],
+    ])('never deletes when route get shows %s', async (_name, dst, stdout) => {
+      const { runner, ops, entries } = table({ stdout });
 
-    const result = await ops.routeDelete({ dst: '10.0.0.0/8', gateway: GW });
+      const result = await ops.routeDelete({ dst, gateway: GW });
 
-    expect(result).toEqual({ ok: true, outcome: 'not-found', dst: '10.0.0.0/8', kind: 'net' });
-    expect(runner.calls).toHaveLength(1);
-    const entry = only(entries);
-    expect(entry.level).toBe('info');
-    expect(entry.context).toMatchObject({ component: 'route', op: 'delete', outcome: 'not-found', gateway: GW });
+      expect(result).toMatchObject({
+        ok: false,
+        outcome: 'failed',
+        step: 'inspect',
+        failure: 'existing-route-unknown',
+        exitCode: 0,
+        stdout,
+      });
+      expect(runner.calls.map((call) => call.args[1])).toEqual(['get']);
+      const entry = only(entries);
+      expect(entry.level).toBe('error');
+      expect(entry.context).toMatchObject({ component: 'route', op: 'delete', step: 'inspect', failure: 'existing-route-unknown', existing: 'unknown' });
+    });
+
+    // The lookup itself did not give an answer; whatever it printed is not read as one.
+    it.each<[string, FakeCommandResponse, string]>([
+      ['a timeout', { failure: 'timeout', error: 'Timed out after 10000 ms' }, 'route get failed: Timed out after 10000 ms'],
+      [
+        'a timeout that had already printed our exact route',
+        { failure: 'timeout', error: 'Timed out after 10000 ms', stdout: net() },
+        'route get failed: Timed out after 10000 ms',
+      ],
+      ['a spawn error', { failure: 'spawn-error', error: 'ENOENT: spawn /sbin/route ENOENT' }, 'route get failed: ENOENT: spawn /sbin/route ENOENT'],
+      ['too much output', { failure: 'output-overflow', stdout: net() }, 'route get failed: output-overflow'],
+      ['a signal', { failure: 'signal', signal: 'SIGKILL', stdout: net() }, 'route get failed: signal'],
+      ['a non-zero exit with a diagnostic', { exitCode: 68, stderr: 'route: bad address: 10.0.0.0/8\n' }, 'route get failed: bad address: 10.0.0.0/8'],
+      ['a silent non-zero exit next to our exact route', { exitCode: 1, stdout: net() }, 'route get failed: nonzero-exit'],
+      [
+        'exit code 0 with an error next to our exact route',
+        { exitCode: 0, stdout: net(), stderr: 'route: writing to routing socket: Operation not permitted\n' },
+        'route get failed: writing to routing socket: Operation not permitted',
+      ],
+      [
+        'a timeout whose partial output says "not in table"',
+        { failure: 'timeout', error: 'Timed out after 10000 ms', stderr: 'route: writing to routing socket: not in table\n' },
+        'route get failed: writing to routing socket: not in table',
+      ],
+    ])('never deletes when route get ends in %s', async (_name, lookup, detail) => {
+      const { runner, ops, entries } = table(lookup);
+
+      const result = await ops.routeDelete({ dst: NET, gateway: GW });
+
+      expect(result).toMatchObject({
+        ok: false,
+        outcome: 'failed',
+        step: 'inspect',
+        failure: 'existing-route-unknown',
+        message: `the route for ${NET} could not be identified and was left in place: ${detail}`,
+      });
+      expect(argvOf(runner)).toEqual([GET]);
+      expect(only(entries).level).toBe('error');
+    });
+  });
+});
+
+describe('inspectRouteEntry: the exactness rule, against an independent oracle', () => {
+  const toNumber = (address: string): number => address.split('.').reduce((sum, octet) => sum * 256 + Number(octet), 0);
+  const toAddress = (value: number): string => [24, 16, 8, 0].map((shift) => String(Math.floor(value / 2 ** shift) % 256)).join('.');
+  const maskOf = (prefix: number): number => 2 ** 32 - 2 ** (32 - prefix);
+  const networkOf = (value: number, prefix: number): number => value - (value % 2 ** (32 - prefix));
+  /** Deterministic pseudo-random numbers (mulberry32). */
+  const random = (seed: number) => {
+    let state = seed;
+    return (): number => {
+      state = (state + 0x6d2b79f5) | 0;
+      let t = Math.imul(state ^ (state >>> 15), 1 | state);
+      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  };
+
+  interface Entry {
+    readonly destination: number;
+    /** Null: no mask line. */
+    readonly prefix: number | null;
+    readonly hostFlag: boolean;
+    readonly gatewayFlag: boolean;
+    readonly gateway: string | undefined;
+  }
+
+  /** What the block means, worked out from the numbers it was built from. */
+  const oracle = (wanted: { kind: 'host' | 'net'; address: number; prefix: number }, entry: Entry): string => {
+    const sameAddress = entry.destination === wanted.address;
+    const exact =
+      sameAddress &&
+      (wanted.kind === 'host'
+        ? entry.prefix === null
+          ? entry.hostFlag
+          : entry.prefix === 32
+        : entry.prefix === wanted.prefix && !entry.hostFlag);
+    if (exact) {
+      if (!entry.gatewayFlag) return 'connected';
+      if (entry.gateway === 'link#15') return 'connected';
+      return entry.gateway === undefined ? 'unknown' : 'gateway';
+    }
+    const covers =
+      entry.prefix !== null &&
+      !entry.hostFlag &&
+      entry.prefix < wanted.prefix &&
+      networkOf(entry.destination, entry.prefix) === entry.destination &&
+      networkOf(wanted.address, entry.prefix) === entry.destination;
+    return covers ? 'absent' : 'unknown';
+  };
+
+  const render = (to: number, entry: Entry): string =>
+    getBlock({
+      to: toAddress(to),
+      destination: toAddress(entry.destination),
+      mask: entry.prefix === null ? undefined : toAddress(maskOf(entry.prefix)),
+      gateway: entry.gateway,
+      iface: 'en0',
+      flags: ['UP', ...(entry.gatewayFlag ? ['GATEWAY'] : []), ...(entry.hostFlag ? ['HOST'] : []), 'DONE', 'STATIC'].join(','),
+    });
+
+  it('agrees with the oracle on 40 000 generated blocks, and sees every state', () => {
+    const next = random(20261012);
+    const pick = <T>(items: readonly T[]): T => items[Math.floor(next() * items.length)] as T;
+    const seen: Record<string, number> = { gateway: 0, connected: 0, absent: 0, unknown: 0 };
+
+    for (let round = 0; round < 40_000; round += 1) {
+      const isHost = next() < 0.4;
+      const prefix = isHost ? 32 : 8 + Math.floor(next() * 24);
+      const address = networkOf(toNumber('10.0.0.0') + Math.floor(next() * 2 ** 24), prefix);
+      const wanted = { kind: isHost ? 'host' : 'net', address, prefix } as const;
+
+      const otherPrefix = Math.floor(next() * 33);
+      const destination = pick([
+        address,
+        address,
+        networkOf(address, otherPrefix),
+        networkOf(address, otherPrefix) + (otherPrefix < 32 ? 1 : 0),
+        address + 2 ** Math.floor(next() * 8),
+        toNumber('172.16.0.0'),
+      ]);
+      const entry: Entry = {
+        destination,
+        prefix: pick([null, prefix, prefix, otherPrefix, otherPrefix, Math.max(0, prefix - 1), Math.min(32, prefix + 1)]),
+        hostFlag: next() < 0.35,
+        gatewayFlag: next() < 0.7,
+        gateway: pick([GW, OTHER_GW, 'link#15', undefined]),
+      };
+
+      const verdict = inspectRouteEntry({ kind: wanted.kind, address: toAddress(address), prefix }, render(address, entry));
+      const expected = oracle(wanted, entry);
+      expect([round, verdict.state]).toEqual([round, expected]);
+      seen[expected] = (seen[expected] ?? 0) + 1;
+    }
+
+    for (const count of Object.values(seen)) expect(count).toBeGreaterThan(500);
   });
 
-  it.each<[string, FakeCommandResponse, Record<string, unknown>]>([
-    [
-      'not being root',
-      { exitCode: 77, stderr: 'route: must be root to alter routing table\n' },
-      { failure: 'nonzero-exit', exitCode: 77, message: 'must be root to alter routing table' },
-    ],
-    [
-      'exit code 0 with another error',
-      { exitCode: 0, stdout: 'delete net 10.0.0.0: entry in use\n' },
-      { failure: 'reported-error', exitCode: 0, message: 'entry in use' },
-    ],
-    ['a timeout', { failure: 'timeout', error: 'Timed out after 10000 ms' }, { failure: 'timeout' }],
-  ])('returns a failure value for %s', async (_name, response, expected) => {
-    const { runner, ops, entries } = setup();
-    runner.whenMatching(() => response);
+  it('never reads the exact entry as absent, whatever its flags and gateway', () => {
+    for (let prefix = 8; prefix <= 32; prefix += 1) {
+      const kind = prefix === 32 ? 'host' : 'net';
+      const address = networkOf(toNumber('10.77.201.137'), prefix);
+      for (const gatewayFlag of [true, false]) {
+        for (const gateway of [GW, OTHER_GW, 'link#15', undefined]) {
+          for (const withMask of prefix === 32 ? [true, false] : [true]) {
+            const entry: Entry = { destination: address, prefix: withMask ? prefix : null, hostFlag: prefix === 32, gatewayFlag, gateway };
+            const verdict = inspectRouteEntry({ kind, address: toAddress(address), prefix }, render(address, entry));
+            expect(['gateway', 'connected', 'unknown']).toContain(verdict.state);
+            expect(verdict.state).toBe(oracle({ kind, address, prefix }, entry));
+          }
+        }
+      }
+    }
+  });
 
-    const result = await ops.routeDelete({ dst: '10.0.0.0/8' });
+  it('reads every strictly wider covering subnet as absent and nothing narrower or equal', () => {
+    for (let prefix = 8; prefix <= 32; prefix += 1) {
+      const kind = prefix === 32 ? 'host' : 'net';
+      const address = networkOf(toNumber('10.77.201.137'), prefix);
+      for (let other = 0; other <= 32; other += 1) {
+        const entry: Entry = { destination: networkOf(address, other), prefix: other, hostFlag: false, gatewayFlag: true, gateway: OTHER_GW };
+        const verdict = inspectRouteEntry({ kind, address: toAddress(address), prefix }, render(address, entry));
+        // Equal prefix: the exact entry for a subnet; for a host, a /32 mask is its exact entry too.
+        expect([prefix, other, verdict.state]).toEqual([prefix, other, other < prefix ? 'absent' : other === prefix ? 'gateway' : 'unknown']);
+      }
+    }
+  });
 
-    expect(result).toMatchObject({ ok: false, outcome: 'failed', step: 'delete', ...expected });
-    expect(only(entries).level).toBe('error');
+  it('keeps classifyExistingRoute on "unknown" for an absent entry: route add has just said one exists', () => {
+    const wanted = { kind: 'net', address: '10.0.0.0', prefix: 8 } as const;
+    const fallen = getBlock({ ...DEFAULT_ROUTE, to: '10.0.0.0' });
+    expect(inspectRouteEntry(wanted, fallen).state).toBe('absent');
+    expect(classifyExistingRoute(wanted, GW, fallen).state).toBe('unknown');
+    expect(inspectRouteEntry(wanted, GET_CONNECTED_SUBNET).state).toBe('unknown');
   });
 });
 

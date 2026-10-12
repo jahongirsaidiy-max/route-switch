@@ -29,7 +29,11 @@ import type { RouteAddResult, RouteDeleteResult, RouteOperations } from './route
  * Invariants:
  * - It never runs a command: every side effect goes through `routes`, every
  *   observation through `netinfo`.
- * - It deletes only routes that are in its own `applied` map.
+ * - It deletes only routes that are in its own `applied` map, and `route.ts`
+ *   deletes one only while the table entry is still that route (same
+ *   destination, through the gateway it was added with). An entry that has
+ *   become something else -- a connected route, a route through another
+ *   gateway -- is left alone and forgotten.
  * - Every destination passes `forbiddenDestinationReason` here, before
  *   `route.ts` checks it again.
  * - `reconcile` never rejects and never throws: whatever happens ends up in
@@ -96,6 +100,11 @@ export interface ReconcileOptions {
 
 export interface ReconcileSummary {
   readonly added: number;
+  /**
+   * Routes of ours that are gone from the table: deleted, or already absent.
+   * A route that was forgotten because the entry at its destination is no
+   * longer ours is not counted here (nothing was removed).
+   */
   readonly removed: number;
   /** Route commands that failed, were refused or threw. */
   readonly failed: number;
@@ -191,6 +200,21 @@ export interface Engine {
 export const DEGRADED_ACCEPT_AFTER = 3;
 
 const ROLES: readonly IfaceRole[] = ['ethernet', 'wifi'];
+
+/**
+ * A rule whose route the wrapper refused because a connected route is in the
+ * way stays refused until something that could change that happens. Its
+ * `route add` is attempted again only in a pass with one of these reasons, or
+ * when the detected interface facts differ from those at the refusal; the
+ * periodic reasons (`drift-check`, `dns-refresh`) do not re-run the command.
+ */
+export const REFUSAL_RETRY_REASONS: ReadonlySet<ReconcileReason> = new Set<ReconcileReason>([
+  'startup',
+  'config-change',
+  'enabled-change',
+  'network-change',
+  'manual',
+]);
 const MAX_RESTORED_ROUTES = 500 * PROTOCOL_LIMITS.maxAppliedDestinationsPerRule;
 const MAX_RULE_IDS_PER_ROUTE = 500;
 
@@ -431,6 +455,9 @@ export const guardCoversEveryRole = (detected: DetectedInterfaces, trusted: read
 
 const ACTIVE: Verdict = { status: 'active', reasonCode: null, reason: null };
 
+const connectedRouteText = (dst: string): string =>
+  `${dst} is a network an interface is directly connected to; its route was left in place`;
+
 const errorVerdict = (reasonCode: RuleReasonCode, reason: string): Verdict => ({ status: 'error', reasonCode, reason });
 
 export const createEngine = (deps: EngineDeps): Engine => {
@@ -459,6 +486,12 @@ export const createEngine = (deps: EngineDeps): Engine => {
    * never make the guard weaker than the last trusted one.
    */
   let trusted: readonly GuardFacts[] | null = null;
+  /**
+   * Route key -> what the refusal was made under (gateway and interface
+   * facts), for every wanted route the wrapper refused as `connected-route`
+   * and that is still wanted. See `REFUSAL_RETRY_REASONS`.
+   */
+  const refusedAdds = new Map<string, string>();
 
   const appliedSnapshot = (): AppliedRoute[] =>
     [...applied.values()].map(({ dst, gateway, ruleIds }) => ({ dst, gateway, ruleIds: [...ruleIds] }));
@@ -698,6 +731,8 @@ export const createEngine = (deps: EngineDeps): Engine => {
     mode: PassMode,
     allowAdds: boolean,
     reason: ReconcileReason,
+    /** The guard-relevant interface facts of this pass, as one comparable string. */
+    facts: string,
   ): Promise<Counters> => {
     const holding = mode === 'hold' || mode === 'failed';
     const counters: Counters = { added: 0, removed: 0, failed: 0, kept: 0, deferred: 0, changed: false };
@@ -729,6 +764,20 @@ export const createEngine = (deps: EngineDeps): Engine => {
       if ('thrown' in result) {
         counters.failed += 1;
         stuck.set(key, { reasonCode: 'internal', reason: `Removing the route for ${entry.dst} failed: ${result.thrown}` });
+      } else if (result.ok && result.outcome === 'not-ours') {
+        // The entry at the destination is no longer the route this engine
+        // added (an interface joined that very subnet, or someone replaced the
+        // route). The wrapper deleted nothing; the route is not ours to track.
+        applied.delete(key);
+        counters.changed = true;
+        logger.warn('applied route is no longer ours; forgotten, nothing was deleted', {
+          reason,
+          dst: entry.dst,
+          gateway: entry.gateway,
+          ruleIds: entry.ruleIds,
+          found: result.reason,
+          detail: result.message,
+        });
       } else if (result.ok) {
         applied.delete(key);
         counters.removed += 1;
@@ -784,6 +833,15 @@ export const createEngine = (deps: EngineDeps): Engine => {
         continue;
       }
 
+      const refusal = `${route.gateway}|${facts}`;
+      if (refusedAdds.get(key) === refusal && !REFUSAL_RETRY_REASONS.has(reason)) {
+        // Refused before, nothing relevant changed and this is a periodic
+        // pass: the rule keeps its verdict without `route add` running again.
+        fail('connected-network', connectedRouteText(route.dst));
+        continue;
+      }
+      refusedAdds.delete(key);
+
       const result = await safeAdd(route);
       if ('thrown' in result) {
         counters.failed += 1;
@@ -819,7 +877,8 @@ export const createEngine = (deps: EngineDeps): Engine => {
           // The wrapper found the kernel's connected route in the way and left
           // it alone: the guard here did not know that subnet (static IP, or a
           // detection that has gone stale). Same verdict as the guard's own.
-          fail('connected-network', `${route.dst} is a network an interface is directly connected to; its route was left in place`);
+          refusedAdds.set(key, refusal);
+          fail('connected-network', connectedRouteText(route.dst));
         } else if (result.failure === 'existing-route-unknown') {
           fail('route-failed', `Could not add the route for ${route.dst}: ${result.message}`);
         } else {
@@ -839,6 +898,8 @@ export const createEngine = (deps: EngineDeps): Engine => {
     for (const [key, issue] of stuck) {
       for (const ruleId of applied.get(key)?.ruleIds ?? []) recordIssue(drafts.get(ruleId), issue.reasonCode, issue.reason);
     }
+    // A refusal is remembered only while its route is still wanted.
+    for (const key of refusedAdds.keys()) if (!desired.has(key)) refusedAdds.delete(key);
     return counters;
   };
 
@@ -931,7 +992,7 @@ export const createEngine = (deps: EngineDeps): Engine => {
     const allowAdds = mode === 'normal' || (mode === 'accepted' && detected !== null && guardCoversEveryRole(detected, trusted));
 
     const plan = await buildPlan(snapshot, detected, guardInterfaces);
-    const counters = await applyDiff(plan, mode, allowAdds, reason);
+    const counters = await applyDiff(plan, mode, allowAdds, reason, JSON.stringify(current));
     const owning = new Set([...applied.values()].flatMap((entry) => entry.ruleIds));
     const verdictOf = (draft: Draft): Verdict => {
       if (draft.issue !== null) return errorVerdict(draft.issue.reasonCode, draft.issue.reason);
