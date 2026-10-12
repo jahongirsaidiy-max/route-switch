@@ -24,3 +24,7 @@ coverage/
 *.p12
 *.cer
 *.provisionprofile
+
+# AI workflow va GitHub shablonlari — lokal, repoga tushmaydi
+CLAUDE.md
+.github/
