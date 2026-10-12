@@ -40,6 +40,9 @@ export const DEFAULT_TIMEOUT_MS = 10_000;
 export const MAX_TIMEOUT_MS = 60_000;
 export const DEFAULT_MAX_OUTPUT_BYTES = 1024 * 1024;
 export const MAX_OUTPUT_BYTES = 8 * 1024 * 1024;
+/** Upper bound on the length of `RunOptions.expectedExitCodes`. */
+export const MAX_EXPECTED_EXIT_CODES = 16;
+const MAX_EXIT_CODE = 255;
 
 const STDERR_LOG_LIMIT = 1000;
 
@@ -144,6 +147,14 @@ export interface RunOptions {
   readonly timeoutMs?: number;
   /** Kill the process when stdout or stderr exceeds this size. Default 1 MiB, at most 8 MiB. */
   readonly maxOutputBytes?: number;
+  /**
+   * Non-zero exit codes that are an ordinary answer for this command (e.g.
+   * `ipconfig getifaddr` exits 1 on an interface without an address). The
+   * result is the same as for any other non-zero exit — `ok: false`,
+   * `failure: 'nonzero-exit'` — only the log entry is written at `debug`
+   * instead of `warn`. Integers 1..255, at most `MAX_EXPECTED_EXIT_CODES`.
+   */
+  readonly expectedExitCodes?: readonly number[];
 }
 
 /**
@@ -204,6 +215,8 @@ export interface CommandRunnerDeps {
 interface Limits {
   readonly timeoutMs: number;
   readonly maxOutputBytes: number;
+  /** A private copy: the caller's array is not consulted after validation. */
+  readonly expectedExitCodes: readonly number[];
 }
 
 const resolveLimit = (name: string, value: number | undefined, fallback: number, max: number) => {
@@ -221,6 +234,32 @@ const resolveLimit = (name: string, value: number | undefined, fallback: number,
   return value;
 };
 
+const resolveExpectedExitCodes = (value: unknown): readonly number[] => {
+  if (value === undefined) {
+    return [];
+  }
+  if (!Array.isArray(value) || value.length > MAX_EXPECTED_EXIT_CODES) {
+    throw new CommandRejectedError(
+      'invalid-options',
+      `expectedExitCodes must be an array of at most ${String(MAX_EXPECTED_EXIT_CODES)} exit codes`,
+    );
+  }
+  const codes: number[] = [];
+  // Indexed loop so that holes in a sparse array are visited as well.
+  for (let index = 0; index < value.length; index += 1) {
+    const code: unknown = value[index];
+    // `0` is success and can never be an "expected failure".
+    if (typeof code !== 'number' || !Number.isInteger(code) || code < 1 || code > MAX_EXIT_CODE) {
+      throw new CommandRejectedError(
+        'invalid-options',
+        `expectedExitCodes must contain only integers between 1 and ${String(MAX_EXIT_CODE)}`,
+      );
+    }
+    codes.push(code);
+  }
+  return codes;
+};
+
 const resolveLimits = (options: RunOptions): Limits => ({
   timeoutMs: resolveLimit('timeoutMs', options.timeoutMs, DEFAULT_TIMEOUT_MS, MAX_TIMEOUT_MS),
   maxOutputBytes: resolveLimit(
@@ -229,6 +268,7 @@ const resolveLimits = (options: RunOptions): Limits => ({
     DEFAULT_MAX_OUTPUT_BYTES,
     MAX_OUTPUT_BYTES,
   ),
+  expectedExitCodes: resolveExpectedExitCodes(options.expectedExitCodes),
 });
 
 type Outcome = Pick<CommandResult, 'exitCode' | 'signal' | 'failure' | 'error'>;
@@ -272,9 +312,10 @@ const describeThrown = (error: unknown): string =>
 /**
  * Builds the real runner. Every call is logged once, when it settles, with
  * `component: 'exec'`, the binary, the arguments, the exit code and the
- * duration: `info` for exit 0, `warn` for a non-zero exit (often an expected
- * answer, e.g. "no address on this interface"), `error` for a timeout, output
- * overflow, signal, spawn failure or a refused call.
+ * duration: `info` for exit 0, `warn` for a non-zero exit (`debug` when the
+ * caller listed the code in `expectedExitCodes`, e.g. "no address on this
+ * interface"), `error` for a timeout, output overflow, signal, spawn failure
+ * or a refused call.
  */
 export const createCommandRunner = (deps: CommandRunnerDeps): CommandRunner => {
   const logger = deps.logger.child({ component: 'exec' });
@@ -343,7 +384,7 @@ export const createCommandRunner = (deps: CommandRunnerDeps): CommandRunner => {
       }
     });
 
-  const logResult = (result: CommandResult): void => {
+  const logResult = (result: CommandResult, expectedExitCodes: readonly number[]): void => {
     const context = {
       bin: result.bin,
       args: result.args,
@@ -361,10 +402,12 @@ export const createCommandRunner = (deps: CommandRunnerDeps): CommandRunner => {
       error: result.error,
       stderr: result.stderr.slice(0, STDERR_LOG_LIMIT),
     };
-    if (result.failure === 'nonzero-exit') {
-      logger.warn('command exited with a non-zero code', details);
-    } else {
+    if (result.failure !== 'nonzero-exit') {
       logger.error('command failed', details);
+    } else if (result.exitCode !== null && expectedExitCodes.includes(result.exitCode)) {
+      logger.debug('command exited with an expected non-zero code', details);
+    } else {
+      logger.warn('command exited with a non-zero code', details);
     }
   };
 
@@ -382,7 +425,7 @@ export const createCommandRunner = (deps: CommandRunnerDeps): CommandRunner => {
         stderr,
         durationMs: Math.max(0, Math.round(now() - startedAt)),
       };
-      logResult(result);
+      logResult(result, limits.expectedExitCodes);
       return result;
     },
   };

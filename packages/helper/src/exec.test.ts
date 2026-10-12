@@ -10,6 +10,7 @@ import {
   DEFAULT_MAX_OUTPUT_BYTES,
   DEFAULT_TIMEOUT_MS,
   isAllowedBinary,
+  MAX_EXPECTED_EXIT_CODES,
   MAX_OUTPUT_BYTES,
   MAX_TIMEOUT_MS,
   type AllowedBinary,
@@ -259,6 +260,21 @@ describe('process options', () => {
     expect(calls[0]?.options.maxBuffer).toBe(4096);
   });
 
+  it('accepts valid expectedExitCodes without changing how the process is started', async () => {
+    const plain = setup();
+    const withCodes = setup();
+
+    await plain.runner.run('/usr/sbin/ipconfig', ['getifaddr', 'en5']);
+    await withCodes.runner.run('/usr/sbin/ipconfig', ['getifaddr', 'en5'], {
+      expectedExitCodes: Array.from({ length: MAX_EXPECTED_EXIT_CODES }, (_unused, index) => index + 1),
+    });
+    await withCodes.runner.run('/usr/sbin/ipconfig', ['getifaddr', 'en5'], { expectedExitCodes: [] });
+    await withCodes.runner.run('/usr/sbin/ipconfig', ['getifaddr', 'en5'], { expectedExitCodes: [255] });
+
+    expect(withCodes.calls).toHaveLength(3);
+    for (const call of withCodes.calls) expect(call).toEqual(plain.calls[0]);
+  });
+
   it.each([
     ['timeoutMs zero (would disable the timeout)', { timeoutMs: 0 }],
     ['negative timeoutMs', { timeoutMs: -1 }],
@@ -268,6 +284,19 @@ describe('process options', () => {
     ['timeoutMs above the cap', { timeoutMs: MAX_TIMEOUT_MS + 1 }],
     ['maxOutputBytes zero', { maxOutputBytes: 0 }],
     ['maxOutputBytes above the cap', { maxOutputBytes: MAX_OUTPUT_BYTES + 1 }],
+    ['expectedExitCodes that is not an array', { expectedExitCodes: 1 as unknown as number[] }],
+    ['expectedExitCodes given as a string', { expectedExitCodes: '1' as unknown as number[] }],
+    ['expectedExitCodes containing 0', { expectedExitCodes: [0] }],
+    ['expectedExitCodes containing a negative code', { expectedExitCodes: [-1] }],
+    ['expectedExitCodes containing a code above 255', { expectedExitCodes: [256] }],
+    ['expectedExitCodes containing a fraction', { expectedExitCodes: [1.5] }],
+    ['expectedExitCodes containing NaN', { expectedExitCodes: [Number.NaN] }],
+    ['expectedExitCodes containing a numeric string', { expectedExitCodes: ['1'] as unknown as number[] }],
+    ['expectedExitCodes with a hole', { expectedExitCodes: Object.assign(new Array<number>(2), { 0: 1 }) }],
+    [
+      'expectedExitCodes longer than the cap',
+      { expectedExitCodes: Array.from({ length: MAX_EXPECTED_EXIT_CODES + 1 }, () => 1) },
+    ],
   ])('rejects %s', async (_label, options) => {
     const { runner, calls, entries } = setup();
 
@@ -343,6 +372,85 @@ describe('results and logging', () => {
       error: null,
       stderr: 'route: writing to routing socket: File exists\n',
     });
+  });
+
+  it('logs a non-zero exit listed in expectedExitCodes at debug, with the same result', async () => {
+    const reply = {
+      error: { message: 'Command failed', code: 1, killed: false, signal: null },
+      stdout: '',
+      stderr: '',
+    };
+    const plain = setup(reply);
+    const expected = setup(reply);
+
+    const baseline = await plain.runner.run('/usr/sbin/ipconfig', ['getifaddr', 'en5']);
+    const result = await expected.runner.run('/usr/sbin/ipconfig', ['getifaddr', 'en5'], {
+      expectedExitCodes: [1],
+    });
+
+    expect(result).toEqual(baseline);
+    expect(result).toMatchObject({ ok: false, exitCode: 1, failure: 'nonzero-exit', error: null });
+    expect(only(plain.entries).level).toBe('warn');
+    const entry = only(expected.entries);
+    expect(entry.level).toBe('debug');
+    expect(entry.msg).toBe('command exited with an expected non-zero code');
+    expect(entry.context).toEqual({ ...only(plain.entries).context });
+    expect(entry.context).toMatchObject({
+      component: 'exec',
+      bin: '/usr/sbin/ipconfig',
+      args: ['getifaddr', 'en5'],
+      exitCode: 1,
+      failure: 'nonzero-exit',
+    });
+  });
+
+  it('still warns about a non-zero exit code that is not in expectedExitCodes', async () => {
+    const { runner, entries } = setup({
+      error: { message: 'Command failed', code: 2, killed: false, signal: null },
+    });
+
+    const result = await runner.run('/usr/sbin/ipconfig', ['getifaddr', 'en5'], { expectedExitCodes: [1, 3] });
+
+    expect(result).toMatchObject({ ok: false, exitCode: 2, failure: 'nonzero-exit' });
+    expect(only(entries).level).toBe('warn');
+  });
+
+  it('does not let expectedExitCodes change how success, timeouts or spawn failures are logged', async () => {
+    const success = setup({ stdout: '192.0.2.10\n' });
+    await success.runner.run('/usr/sbin/ipconfig', ['getifaddr', 'en5'], { expectedExitCodes: [1] });
+    expect(only(success.entries).level).toBe('info');
+
+    const timeout = setup({ error: { message: 'Command failed', code: null, killed: true, signal: 'SIGKILL' } });
+    const timedOut = await timeout.runner.run('/usr/sbin/ipconfig', ['getifaddr', 'en5'], {
+      expectedExitCodes: [1],
+    });
+    expect(timedOut.failure).toBe('timeout');
+    expect(only(timeout.entries).level).toBe('error');
+
+    const spawn = setup({ error: { message: 'spawn ENOENT', code: 'ENOENT' } });
+    await spawn.runner.run('/usr/sbin/ipconfig', ['getifaddr', 'en5'], { expectedExitCodes: [1] });
+    expect(only(spawn.entries).level).toBe('error');
+  });
+
+  it('uses a snapshot of expectedExitCodes, not the caller-owned array', async () => {
+    const codes = [1];
+    let finish: (() => void) | undefined;
+    const memory = createMemorySink();
+    const runner = createCommandRunner({
+      logger: createLogger({ sinks: [memory.sink] }),
+      execFile: (_file, _args, _options, callback) => {
+        finish = () => {
+          callback({ message: 'Command failed', code: 1, killed: false, signal: null }, '', '');
+        };
+      },
+    });
+
+    const pending = runner.run('/usr/sbin/ipconfig', ['getifaddr', 'en5'], { expectedExitCodes: codes });
+    codes.length = 0;
+    finish?.();
+    await pending;
+
+    expect(only(memory.entries).level).toBe('debug');
   });
 
   it('reports a timeout as failure "timeout" and logs it at error', async () => {
