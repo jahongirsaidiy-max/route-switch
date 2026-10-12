@@ -9,5 +9,9 @@
   },
   "scripts": {
     "typecheck": "tsc --noEmit -p tsconfig.json"
+  },
+  "dependencies": {
+    "ipaddr.js": "2.5.0",
+    "zod": "4.6.6"
   }
 }
