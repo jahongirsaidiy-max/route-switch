@@ -1,6 +1,15 @@
-import { PATHS } from '@routeswitch/shared';
+import { PATHS, type Config, type EngineState } from '@routeswitch/shared';
 
 import { loadConfig, type ConfigFileReader } from './config-store';
+import {
+  createDomainResolver,
+  realClearTimer,
+  realSetTimer,
+  type ClearTimer,
+  type DnsResolverFactory,
+  type DomainResolverService,
+  type SetTimer,
+} from './dns';
 import { DEGRADED_ACCEPT_AFTER, createEngine } from './engine';
 import { createCommandRunner, type CommandRunner } from './exec';
 import { createJsonLinesSink, createLogger, type LineWritable, type Logger } from './logger';
@@ -18,6 +27,12 @@ import { createRouteOperations } from './route';
  * In `--once` mode the log goes to stderr as JSON lines, so stdout carries
  * nothing but the state. The log file at `PATHS.log` belongs to the daemon
  * mode.
+ *
+ * Domain rules in `--once` mode: the first pass only starts their DNS lookups
+ * (a pass never waits for DNS), so when it leaves a rule `resolving` the run
+ * waits for the lookups, at most `ONE_SHOT_DNS_WAIT_MS`, and reconciles once
+ * more. A config without an enabled domain rule never gets there: no lookup,
+ * no timer, no second pass.
  */
 
 /** Version of the helper, reported in `EngineState.helperVersion`. Kept equal to `package.json` by a test. */
@@ -33,9 +48,18 @@ export const EXIT_CODES = {
   notImplemented: 4,
   /** The interfaces could not be detected reliably; nothing was added. */
   detectionUnreliable: 5,
+  /** Nothing failed, but a domain rule was still being resolved when the one-shot wait ended; its routes are missing. */
+  resolvePending: 6,
   /** `run` itself failed, which is a bug. */
   internal: 70,
 } as const;
+
+/**
+ * How long a one-shot run waits for the DNS lookups of its domain rules
+ * before the follow-up pass. Three times the limit of a single lookup: enough
+ * for every lookup of a config with up to 24 domains to answer or time out.
+ */
+export const ONE_SHOT_DNS_WAIT_MS = 15_000;
 
 export const USAGE = `Usage: com.routeswitch.helper --once [--config <path>]
 
@@ -45,7 +69,7 @@ export const USAGE = `Usage: com.routeswitch.helper --once [--config <path>]
   --version         print the helper version
 
 Exit codes: 0 applied; 1 a rule is in error; 2 usage; 3 config could not be loaded; 4 mode not implemented;
-            5 interfaces could not be detected reliably, nothing was added.
+            5 interfaces could not be detected reliably, nothing was added; 6 a domain is still being resolved.
 `;
 
 export interface RunDeps {
@@ -58,6 +82,11 @@ export interface RunDeps {
   readonly now?: (() => Date) | undefined;
   /** Effective user id, for the "not root" warning; `null` when unknown. */
   readonly euid?: (() => number | null) | undefined;
+  /** Builds the resolver of one DNS lookup; defaults to a new `dns.promises.Resolver`. */
+  readonly createDnsResolver?: DnsResolverFactory | undefined;
+  /** Timers of the DNS lookups and of the one-shot wait; default to the real ones. */
+  readonly setTimer?: SetTimer | undefined;
+  readonly clearTimer?: ClearTimer | undefined;
 }
 
 export type ParsedArgs =
@@ -127,14 +156,57 @@ const runOnce = async (configPath: string, deps: RunDeps): Promise<number> => {
     logger.warn('not running as root; route commands will be refused by the system');
   }
 
+  const setTimer = deps.setTimer ?? realSetTimer;
+  const clearTimer = deps.clearTimer ?? realClearTimer;
+  // No `requestReconcile`: a one-shot run decides itself when the follow-up pass happens.
+  const dns = createDomainResolver({
+    logger: root,
+    now: deps.now,
+    createResolver: deps.createDnsResolver,
+    setTimer,
+    clearTimer,
+  });
+  dns.syncConfig(loaded.config);
+
+  try {
+    return await reconcileOnce(loaded.config, deps, root, { dns, setTimer, clearTimer });
+  } finally {
+    dns.stop();
+  }
+};
+
+const isResolving = (state: EngineState): boolean =>
+  state.rules.some((rule) => rule.status === 'pending' && rule.reasonCode === 'resolving');
+
+interface OneShotDns {
+  readonly dns: DomainResolverService;
+  readonly setTimer: SetTimer;
+  readonly clearTimer: ClearTimer;
+}
+
+/** Resolves with whether every lookup finished within `ONE_SHOT_DNS_WAIT_MS`. */
+const waitForLookups = ({ dns, setTimer, clearTimer }: OneShotDns): Promise<boolean> =>
+  new Promise<boolean>((resolve) => {
+    const deadline = setTimer(() => {
+      resolve(false);
+    }, ONE_SHOT_DNS_WAIT_MS);
+    void dns.whenIdle().then(() => {
+      clearTimer(deadline);
+      resolve(true);
+    });
+  });
+
+const reconcileOnce = async (config: Config, deps: RunDeps, root: Logger, oneShotDns: OneShotDns): Promise<number> => {
+  const logger = root.child({ component: 'main' });
   const runner = deps.createRunner(root);
   const engine = createEngine({
     netinfo: createNetInfo({ runner, logger: root }),
     routes: createRouteOperations({ runner, logger: root }),
     logger: root,
     helperVersion: HELPER_VERSION,
-    initialConfig: loaded.config,
+    initialConfig: config,
     now: deps.now,
+    resolveDomain: oneShotDns.dns.resolveDomain,
   });
 
   // There is no daemon loop to retry later, so an untrusted interface
@@ -147,6 +219,19 @@ const runOnce = async (configPath: string, deps: RunDeps): Promise<number> => {
     outcome = await engine.reconcile('startup');
   }
 
+  let failedCommands = outcome.summary.failed;
+  if (!outcome.retryRequested && isResolving(outcome.state)) {
+    const finished = await waitForLookups(oneShotDns);
+    if (!finished) {
+      logger.warn('DNS lookups are still running; reconciling with what has been resolved so far', {
+        waitedMs: ONE_SHOT_DNS_WAIT_MS,
+        ...oneShotDns.dns.stats(),
+      });
+    }
+    outcome = await engine.reconcile('dns-refresh');
+    failedCommands += outcome.summary.failed;
+  }
+
   deps.stdout.write(`${JSON.stringify(outcome.state, null, 2)}\n`);
 
   if (outcome.retryRequested) {
@@ -155,9 +240,13 @@ const runOnce = async (configPath: string, deps: RunDeps): Promise<number> => {
   }
 
   const failedRules = outcome.state.rules.filter((rule) => rule.status === 'error').length;
-  if (failedRules > 0 || outcome.summary.failed > 0) {
-    logger.error('one-shot run finished with errors', { failedRules, failedCommands: outcome.summary.failed });
+  if (failedRules > 0 || failedCommands > 0) {
+    logger.error('one-shot run finished with errors', { failedRules, failedCommands });
     return EXIT_CODES.ruleError;
+  }
+  if (isResolving(outcome.state)) {
+    logger.error('one-shot run finished while a domain was still being resolved; its routes were not added');
+    return EXIT_CODES.resolvePending;
   }
   return EXIT_CODES.ok;
 };

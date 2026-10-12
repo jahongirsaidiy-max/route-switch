@@ -4,7 +4,9 @@ import { EngineState, PATHS } from '@routeswitch/shared';
 import { describe, expect, it } from 'vitest';
 
 import type { ConfigFileRead, ConfigFileReader } from './config-store';
-import { EXIT_CODES, HELPER_VERSION, USAGE, parseArgs, run, type RunDeps } from './main';
+import { LOOKUP_TIMEOUT_MS } from './dns';
+import { createFakeDns, createFakeScheduler, dnsError, flush, type FakeDns, type FakeScheduler } from './dns-test-utils';
+import { EXIT_CODES, HELPER_VERSION, ONE_SHOT_DNS_WAIT_MS, USAGE, parseArgs, run, type RunDeps } from './main';
 import { createFakeCommandRunner, type FakeCommandResponse, type FakeCommandRunner } from './test-utils';
 
 const ROUTE = '/sbin/route';
@@ -55,6 +57,9 @@ const machine = (): FakeCommandRunner => {
 interface Harness {
   readonly deps: RunDeps;
   readonly runner: FakeCommandRunner;
+  /** DNS queries never reach the network: they stay open until a test answers them or sets `dns.auto`. */
+  readonly dns: FakeDns;
+  readonly scheduler: FakeScheduler;
   readonly out: string[];
   readonly err: string[];
   readonly configPaths: string[];
@@ -65,6 +70,8 @@ interface Harness {
 /** `file` is either what the reader returns or a value to serve as the JSON content of the file. */
 const harness = (file: unknown = CONFIG, extra: Partial<RunDeps> = {}): Harness => {
   const runner = machine();
+  const dns = createFakeDns();
+  const scheduler = createFakeScheduler(NOW);
   const out: string[] = [];
   const err: string[] = [];
   const configPaths: string[] = [];
@@ -82,9 +89,14 @@ const harness = (file: unknown = CONFIG, extra: Partial<RunDeps> = {}): Harness 
       readConfig,
       now: () => NOW,
       euid: () => 0,
+      createDnsResolver: dns.factory,
+      setTimer: scheduler.setTimer,
+      clearTimer: scheduler.clearTimer,
       ...extra,
     },
     runner,
+    dns,
+    scheduler,
     out,
     err,
     configPaths,
@@ -321,12 +333,16 @@ describe('run --once', () => {
         { id: ID_B, kind: 'ip', target: '203.0.113.7', iface: 'wifi', enabled: false },
       ],
     });
+    // Ethernet has no address: the domain rule waits for the interface, and nothing is resolved for it.
+    h.runner.when(IPCONFIG, ['getifaddr', 'en5'], NO_VALUE);
 
     const code = await run(['--once'], h.deps);
 
     expect(code).toBe(EXIT_CODES.ok);
     expect(h.routeArgv()).toEqual([]);
-    expect(EngineState.parse(JSON.parse(h.out[0] ?? '')).rules.map((rule) => rule.reasonCode)).toEqual(['resolving', 'rule-disabled']);
+    expect(EngineState.parse(JSON.parse(h.out[0] ?? '')).rules.map((rule) => rule.reasonCode)).toEqual(['interface-down', 'rule-disabled']);
+    expect(h.dns.created).toBe(0);
+    expect(h.scheduler.scheduled).toEqual([]);
   });
 
   it('never adds a route on a detection it cannot trust: it retries once, then exits non-zero', async () => {
@@ -410,5 +426,183 @@ describe('run --once', () => {
     expect(await run(['--once'], h.deps)).toBe(EXIT_CODES.internal);
     expect(h.err.at(-1)).toBe('Unexpected failure: no runner\n');
     expect(h.out).toEqual([]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Domain rules
+// ---------------------------------------------------------------------------
+
+const DOMAIN_CONFIG = {
+  version: 1,
+  rules: [
+    { id: ID_A, kind: 'domain', target: 'corp.local', iface: 'ethernet' },
+    { id: ID_B, kind: 'ip', target: '203.0.113.7', iface: 'wifi' },
+  ],
+};
+
+/** Lets the run get on until `ready` holds; fails instead of waiting for ever. */
+const until = async (ready: () => boolean): Promise<void> => {
+  for (let round = 0; round < 2000 && !ready(); round += 1) await flush(5);
+  if (!ready()) throw new Error('the run never got there');
+};
+
+describe('run --once: domain rules', () => {
+  it('performs no DNS activity at all for a config without domain rules', async () => {
+    const h = harness();
+
+    const code = await run(['--once'], h.deps);
+
+    expect(code).toBe(EXIT_CODES.ok);
+    expect(h.dns.created).toBe(0);
+    expect(h.dns.lookups).toEqual([]);
+    expect(h.scheduler.scheduled).toEqual([]);
+    expect(h.logs().some((entry) => entry['component'] === 'dns')).toBe(false);
+    // One pass, as before domain rules existed.
+    expect(h.logs().filter((entry) => entry['msg'] === 'reconcile finished')).toHaveLength(1);
+    const state = EngineState.parse(JSON.parse(h.out[0] ?? ''));
+    expect([state.seq, state.lastReconcileReason]).toEqual([1, 'startup']);
+  });
+
+  it.each([
+    ['a disabled domain rule', { version: 1, rules: [{ ...DOMAIN_CONFIG.rules[0], enabled: false }] }],
+    ['a config that is switched off', { ...DOMAIN_CONFIG, enabled: false }],
+  ])('resolves nothing for %s', async (_name, file) => {
+    const h = harness(file);
+
+    const code = await run(['--once'], h.deps);
+
+    expect(code).toBe(EXIT_CODES.ok);
+    expect(h.dns.created).toBe(0);
+    expect(h.scheduler.scheduled).toEqual([]);
+    expect(h.routeArgv()).toEqual([]);
+  });
+
+  it('waits for the lookup and applies the domain rule in a follow-up pass', async () => {
+    const h = harness(DOMAIN_CONFIG);
+    h.dns.auto = () => ['198.51.100.21', '198.51.100.20'];
+
+    const code = await run(['--once'], h.deps);
+
+    expect(code).toBe(EXIT_CODES.ok);
+    expect(h.dns.lookups.map((lookup) => [lookup.hostname, lookup.servers])).toEqual([['corp.local', null]]);
+    expect(h.routeArgv()).toEqual([
+      ['-n', 'add', '-host', '203.0.113.7', '192.168.1.1'],
+      ['-n', 'add', '-host', '198.51.100.20', ETH_GW],
+      ['-n', 'add', '-host', '198.51.100.21', ETH_GW],
+    ]);
+    expect(h.out).toHaveLength(1);
+    const state = EngineState.parse(JSON.parse(h.out[0] ?? ''));
+    expect([state.seq, state.lastReconcileReason]).toEqual([2, 'dns-refresh']);
+    expect(state.rules).toEqual([
+      {
+        ruleId: ID_A,
+        status: 'active',
+        reasonCode: null,
+        reason: null,
+        appliedDestinations: ['198.51.100.20', '198.51.100.21'],
+        lastResolvedAt: NOW.toISOString(),
+      },
+      { ruleId: ID_B, status: 'active', reasonCode: null, reason: null, appliedDestinations: ['203.0.113.7'], lastResolvedAt: null },
+    ]);
+    expect(h.logs().find((entry) => entry['msg'] === 'domain resolved')).toMatchObject({ component: 'dns', domain: 'corp.local', addresses: 2 });
+    // Nothing is left behind: the refresh timer of the resolver is gone.
+    expect(h.scheduler.pending()).toBe(0);
+  });
+
+  it('asks the DNS server of the rule', async () => {
+    const h = harness({ version: 1, rules: [{ ...DOMAIN_CONFIG.rules[0], dns: '198.51.100.53' }] });
+    h.dns.auto = () => ['198.51.100.20'];
+
+    expect(await run(['--once'], h.deps)).toBe(EXIT_CODES.ok);
+
+    expect(h.dns.lookups.map((lookup) => lookup.servers)).toEqual([['198.51.100.53']]);
+  });
+
+  it('exits non-zero when the lookup fails, and still applies the other rules', async () => {
+    const h = harness(DOMAIN_CONFIG);
+    h.dns.auto = () => dnsError('ESERVFAIL');
+
+    const code = await run(['--once'], h.deps);
+
+    expect(code).toBe(EXIT_CODES.ruleError);
+    expect(h.routeArgv()).toEqual([['-n', 'add', '-host', '203.0.113.7', '192.168.1.1']]);
+    const state = EngineState.parse(JSON.parse(h.out[0] ?? ''));
+    expect(state.rules.map((rule) => [rule.status, rule.reasonCode, rule.appliedDestinations])).toEqual([
+      ['error', 'resolve-failed', []],
+      ['active', null, ['203.0.113.7']],
+    ]);
+    expect(h.logs().find((entry) => entry['msg'] === 'domain lookup failed')).toMatchObject({ level: 'warn', component: 'dns' });
+    expect(h.logs().at(-1)).toMatchObject({ msg: 'one-shot run finished with errors', failedRules: 1, failedCommands: 0 });
+    // The retry the resolver had scheduled is cancelled.
+    expect(h.scheduler.pending()).toBe(0);
+  });
+
+  it('gives a DNS server that never answers the lookup timeout, then reports the rule as failed', async () => {
+    const h = harness(DOMAIN_CONFIG);
+
+    const running = run(['--once'], h.deps);
+    await until(() => h.dns.lookups.length === 1 && h.scheduler.pending() === 2);
+    expect(h.scheduler.delays()).toEqual([LOOKUP_TIMEOUT_MS, ONE_SHOT_DNS_WAIT_MS]);
+    h.scheduler.advance(LOOKUP_TIMEOUT_MS);
+
+    expect(await running).toBe(EXIT_CODES.ruleError);
+    const state = EngineState.parse(JSON.parse(h.out[0] ?? ''));
+    expect(state.rules[0]).toMatchObject({ status: 'error', reasonCode: 'resolve-failed', appliedDestinations: [] });
+    expect(h.scheduler.pending()).toBe(0);
+  });
+
+  it('stops waiting after the one-shot limit and says that a domain is still being resolved', async () => {
+    const ids = Array.from({ length: 26 }, (_unused, index) => `00000000-0000-4000-8000-${String(index + 100).padStart(12, '0')}`);
+    const h = harness({
+      version: 1,
+      rules: ids.map((id, index) => ({ id, kind: 'domain', target: `host-${String(index)}.corp.local`, iface: 'ethernet' })),
+    });
+
+    const running = run(['--once'], h.deps);
+    // The first pass is over and the run waits for the lookups.
+    await until(() => h.scheduler.scheduled.includes(ONE_SHOT_DNS_WAIT_MS));
+    // Three batches of eight answer just before their lookup timeout; the last two domains are still in flight at 15 s.
+    for (let batch = 1; batch <= 3; batch += 1) {
+      await until(() => h.dns.open().length === 8);
+      h.scheduler.advance(LOOKUP_TIMEOUT_MS - 100);
+      for (const lookup of h.dns.open()) lookup.answer(['198.51.100.20']);
+    }
+    await until(() => h.dns.open().length === 2);
+    h.scheduler.advance(300);
+
+    expect(await running).toBe(EXIT_CODES.resolvePending);
+    const state = EngineState.parse(JSON.parse(h.out[0] ?? ''));
+    expect(state.rules.filter((rule) => rule.status === 'active')).toHaveLength(24);
+    expect(state.rules.filter((rule) => rule.reasonCode === 'resolving')).toHaveLength(2);
+    expect(h.routeArgv()).toEqual([['-n', 'add', '-host', '198.51.100.20', ETH_GW]]);
+    expect(h.logs().find((entry) => entry['msg'] === 'DNS lookups are still running; reconciling with what has been resolved so far')).toMatchObject({
+      level: 'warn',
+      waitedMs: ONE_SHOT_DNS_WAIT_MS,
+      inFlight: 2,
+    });
+    expect(h.logs().at(-1)).toMatchObject({
+      level: 'error',
+      msg: 'one-shot run finished while a domain was still being resolved; its routes were not added',
+    });
+    // The two lookups are cancelled and their timers cleared.
+    expect(h.dns.open()).toEqual([]);
+    expect(h.scheduler.pending()).toBe(0);
+  });
+
+  it('does not wait for DNS when the interfaces cannot be detected reliably', async () => {
+    const h = harness(DOMAIN_CONFIG);
+    h.runner.whenMatching((bin) => (bin === NETWORKSETUP ? { failure: 'timeout' } : undefined));
+
+    const code = await run(['--once'], h.deps);
+
+    expect(code).toBe(EXIT_CODES.detectionUnreliable);
+    expect(h.routeArgv()).toEqual([]);
+    expect(h.scheduler.pending()).toBe(0);
+  });
+
+  it('documents the exit code for a domain that is still being resolved', () => {
+    expect(EXIT_CODES.resolvePending).toBe(6);
+    expect(USAGE).toContain('6 a domain is still being resolved');
   });
 });
