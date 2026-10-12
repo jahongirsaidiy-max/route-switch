@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 
 import {
   Config,
+  DEVICE_NAME,
   IfaceRole,
   LIMITS,
   Rule,
@@ -360,6 +361,24 @@ describe('Config', () => {
     it('accepts overrides for both roles', () => {
       const ifaceOverrides = { ethernet: 'en7', wifi: 'en0' };
       expect(Config.parse(config([], { ifaceOverrides })).ifaceOverrides).toEqual(ifaceOverrides);
+    });
+
+    it('accepts a device name of 16 characters and rejects a longer one', () => {
+      const longest = `en${'1'.repeat(14)}`;
+      expect(longest).toHaveLength(16);
+      expect(Config.parse(config([], { ifaceOverrides: { wifi: longest } })).ifaceOverrides).toEqual({ wifi: longest });
+      for (const device of [`${longest}1`, `en${'1'.repeat(3_000_000)}`]) {
+        expect(issuesOf(Config.safeParse(config([], { ifaceOverrides: { wifi: device } })))).toEqual([
+          'ifaceOverrides.wifi: invalid_format',
+        ]);
+      }
+    });
+
+    it('exports the device name pattern', () => {
+      expect(DEVICE_NAME.test('en0')).toBe(true);
+      expect(DEVICE_NAME.test('en5\n')).toBe(false);
+      expect(DEVICE_NAME.test('xen5')).toBe(false);
+      expect(DEVICE_NAME.flags).toBe('');
     });
 
     it.each(['utun3', 'en', 'en5; rm -rf /', 'EN5', 'lo0', ''])('rejects device %j', (device) => {

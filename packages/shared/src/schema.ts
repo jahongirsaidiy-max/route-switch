@@ -170,8 +170,12 @@ export const findOverlaps = <T extends Pick<Rule, 'kind' | 'target'>>(rules: rea
   return overlaps;
 };
 
-/** BSD device name used to pin a role to an adapter, e.g. `en5`. */
-const DEVICE_NAME = /^en\d+$/;
+/**
+ * BSD device name of an Ethernet-like adapter, e.g. `en5`: the only kind of
+ * device a role can be bound to. At most 16 characters in total, so a
+ * hostile value cannot be arbitrarily long.
+ */
+export const DEVICE_NAME = /^en\d{1,14}$/;
 
 export const Config = z
   .object({
