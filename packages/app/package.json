@@ -1,0 +1,7 @@
+{
+  "name": "@routeswitch/app",
+  "version": "0.0.0",
+  "private": true,
+  "description": "RouteSwitch Electron app",
+  "type": "module"
+}

@@ -1,0 +1,13 @@
+{
+  "name": "@routeswitch/shared",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Types, schemas and IPC protocol shared by the RouteSwitch app and helper",
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit -p tsconfig.json"
+  }
+}

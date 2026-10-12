@@ -1,0 +1,16 @@
+{
+  "name": "@routeswitch/helper",
+  "version": "0.0.0",
+  "private": true,
+  "description": "RouteSwitch root helper daemon",
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit -p tsconfig.json"
+  },
+  "dependencies": {
+    "@routeswitch/shared": "0.0.0"
+  }
+}

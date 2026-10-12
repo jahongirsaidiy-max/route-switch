@@ -105,6 +105,18 @@ packages/
 scripts/    # helper install / uninstall
 ```
 
+## Development
+
+Requires Node.js 24 or newer and npm 11.
+
+```bash
+npm install        # install dependencies for all workspaces
+npm run verify     # lint + typecheck + tests
+```
+
+The individual steps are also available as `npm run lint`,
+`npm run typecheck` and `npm test`.
+
 ## Not in the MVP
 
 - Wildcard domains (`*.example.com`) — would need a DNS proxy

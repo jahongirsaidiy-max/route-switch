@@ -110,6 +110,18 @@ packages/
 scripts/    # установка и удаление helper
 ```
 
+## Разработка
+
+Требуются Node.js 24 или новее и npm 11.
+
+```bash
+npm install        # установить зависимости всех workspace-пакетов
+npm run verify     # линтер + проверка типов + тесты
+```
+
+Отдельные шаги также доступны как `npm run lint`, `npm run typecheck` и
+`npm test`.
+
 ## Не входит в MVP
 
 - Wildcard-домены (`*.example.com`) — для них нужен DNS-прокси
