@@ -3,6 +3,7 @@ import { describe, expect, it, vi } from 'vitest';
 import { startApp, type BootstrapDeps } from './bootstrap';
 import { buildProductionCsp } from './csp';
 import { createDevelopmentRuntime } from './development';
+import { createLogger } from './logger';
 import { APP_ENTRY_URL } from './runtime';
 import { fakeBrowserWindowClass } from './test-utils';
 
@@ -98,7 +99,20 @@ function harness(options: Options = {}) {
     },
     () => order.push('construct'),
   );
+  // `report(level, msg, context)` — one call per line the app logs.
   const report = vi.fn();
+  const logger = createLogger({
+    sink: (entry) => {
+      const context: Record<string, unknown> = { ...entry };
+      for (const field of ['level', 'at', 'msg']) Reflect.deleteProperty(context, field);
+      report(entry.level, entry.msg, context);
+    },
+    now: () => 0,
+  });
+  const helperClient = {
+    start: vi.fn(() => order.push('helperClient.start')),
+    stop: vi.fn(() => order.push('helperClient.stop')),
+  };
   const readFile = vi.fn(() => Promise.resolve(new Uint8Array(new TextEncoder().encode('<!doctype html>'))));
 
   startApp({
@@ -113,7 +127,8 @@ function harness(options: Options = {}) {
     rendererRoot: '/opt/routeswitch/renderer',
     readFile,
     realpath: (filePath: string) => Promise.resolve(filePath),
-    report,
+    logger,
+    helperClient,
   } as unknown as BootstrapDeps);
 
   const emit = (event: string, ...args: unknown[]): void => {
@@ -130,6 +145,7 @@ function harness(options: Options = {}) {
     fakeSession,
     windows: fake.windows,
     report,
+    helperClient,
     readFile,
     dockHide,
     order,
@@ -219,7 +235,7 @@ describe('startApp', () => {
     const callback = vi.fn();
     listener?.({ url: 'https://evil.example/x.js' }, callback);
     expect(callback.mock.calls).toEqual([[{ cancel: true }]]);
-    expect(h.report.mock.calls).toEqual([['warn', 'Blocked a request outside the app', 'https://evil.example/x.js']]);
+    expect(h.report.mock.calls).toEqual([['warn', 'Blocked a request outside the app', { url: 'https://evil.example/x.js' }]]);
   });
 
   it('starts up in exactly this order: nothing is constructed or loaded before the proxy is in force', async () => {
@@ -236,6 +252,7 @@ describe('startApp', () => {
       'protocol.handle',
       'construct',
       'loadURL',
+      'helperClient.start',
     ]);
     expect(h.session.setProxy).toHaveBeenCalledTimes(1);
   });
@@ -251,7 +268,7 @@ describe('startApp', () => {
 
     h.releaseProxy();
     await h.ready();
-    expect(h.order.slice(-4)).toEqual(['proxySet:default', 'protocol.handle', 'construct', 'loadURL']);
+    expect(h.order.slice(-5)).toEqual(['proxySet:default', 'protocol.handle', 'construct', 'loadURL', 'helperClient.start']);
     expect(h.windows).toHaveLength(1);
     expect(h.session.setProxy).toHaveBeenCalledTimes(1);
     expect(h.report).not.toHaveBeenCalled();
@@ -291,7 +308,7 @@ describe('startApp', () => {
     }
     expect(window.destroy).toHaveBeenCalledTimes(1);
     expect(h.report.mock.calls.filter(([level]) => level === 'error')).toEqual([
-      ['error', 'A window kept leaving the app page and was closed', 'about:srcdoc'],
+      ['error', 'A window kept leaving the app page and was closed', { detail: 'about:srcdoc' }],
     ]);
     expect(h.app.exit.mock.calls).toEqual([[1]]);
     expect(window.destroy.mock.invocationCallOrder[0]).toBeLessThan(h.app.exit.mock.invocationCallOrder[0] ?? 0);
@@ -303,7 +320,7 @@ describe('startApp', () => {
     const preventDefault = vi.fn();
     h.session.sessionListeners.get('will-download')?.({ preventDefault }, { getURL: () => 'blob:app://routeswitch/1' });
     expect(preventDefault).toHaveBeenCalledTimes(1);
-    expect(h.report.mock.calls).toEqual([['warn', 'Blocked a download', 'blob:app://routeswitch/1']]);
+    expect(h.report.mock.calls).toEqual([['warn', 'Blocked a download', { url: 'blob:app://routeswitch/1' }]]);
   });
 
   it('locks down every other session the moment it is created, and each session only once', async () => {
@@ -427,9 +444,49 @@ describe('startApp', () => {
       },
     });
     await h.ready();
-    expect(h.report.mock.calls).toEqual([['error', 'Startup failed', error]]);
+    expect(h.report.mock.calls).toEqual([['error', 'Startup failed', { detail: 'Error: no session' }]]);
     expect(h.app.exit.mock.calls).toEqual([[1]]);
     expect(h.windows).toHaveLength(0);
+  });
+
+  it('starts the helper client only after the window is open, and never before the lockdown', async () => {
+    const h = harness({ holdProxy: true });
+    await h.ready();
+    expect(h.helperClient.start).not.toHaveBeenCalled();
+    h.releaseProxy();
+    await h.ready();
+    expect(h.helperClient.start).toHaveBeenCalledTimes(1);
+    expect(h.order.indexOf('helperClient.start')).toBeGreaterThan(h.order.indexOf('loadURL'));
+  });
+
+  it('does not start the helper client when startup fails or another instance is running', async () => {
+    const failed = harness({ proxyFails: true });
+    await failed.ready();
+    expect(failed.helperClient.start).not.toHaveBeenCalled();
+    const second = harness({ lock: false });
+    await second.ready();
+    expect(second.helperClient.start).not.toHaveBeenCalled();
+  });
+
+  it('stops the helper client when the app quits', async () => {
+    const h = harness();
+    await h.ready();
+    expect(h.helperClient.stop).not.toHaveBeenCalled();
+    h.emit('will-quit');
+    expect(h.helperClient.stop).toHaveBeenCalledTimes(1);
+  });
+
+  it('logs blocked requests under a budget: a page cannot fill the log', async () => {
+    const h = harness();
+    await h.ready();
+    const listener = h.session.webRequest.onBeforeRequest.mock.calls[0]?.[0];
+    for (let i = 0; i < 500; i += 1) listener?.({ url: `https://evil.example/${String(i)}` }, vi.fn());
+    const download = h.session.sessionListeners.get('will-download');
+    for (let i = 0; i < 500; i += 1) download?.({ preventDefault: vi.fn() }, { getURL: () => `blob:app://routeswitch/${String(i)}` });
+    const lines = h.report.mock.calls.map(([, msg]) => msg as string);
+    expect(lines.filter((msg) => msg === 'Blocked a request outside the app')).toHaveLength(5);
+    expect(lines.filter((msg) => msg === 'Blocked a download')).toHaveLength(5);
+    expect(lines).toHaveLength(12);
   });
 
   it('registers no IPC handlers and exposes nothing beyond the lifecycle events', async () => {
@@ -439,6 +496,7 @@ describe('startApp', () => {
       'second-instance',
       'session-created',
       'web-contents-created',
+      'will-quit',
       'window-all-closed',
     ]);
   });

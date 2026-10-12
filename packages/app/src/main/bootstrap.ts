@@ -6,7 +6,8 @@ import type { App, BrowserWindow, BrowserWindowConstructorOptions, Protocol, Ses
 
 import { buildProductionCsp } from './csp';
 import { createAppProtocolHandler, registerAppScheme } from './protocol';
-import type { Report } from './report';
+import type { HelperClient } from './helperClient';
+import type { Logger } from './logger';
 import { APP_SCHEME, resolveRuntime, type RuntimeInputs } from './runtime';
 import { lockDownSession, lockDownWebContents } from './security';
 import { createWindowFactory } from './windows';
@@ -27,11 +28,16 @@ export interface BootstrapDeps {
   readonly rendererRoot: string;
   readonly readFile: (filePath: string) => Promise<Uint8Array<ArrayBuffer>>;
   readonly realpath: (filePath: string) => Promise<string>;
-  readonly report: Report;
+  readonly logger: Logger;
+  /** Connects to the helper in the background; a missing helper is not an error. */
+  readonly helperClient: Pick<HelperClient, 'start' | 'stop'>;
 }
 
 export function startApp(deps: BootstrapDeps): void {
-  const { app, report } = deps;
+  const { app, logger } = deps;
+  // A web page can trigger these at will, so each kind has its own budget of lines.
+  const blockedRequestLog = logger.limited('blocked-request');
+  const blockedDownloadLog = logger.limited('blocked-download');
 
   if (!app.requestSingleInstanceLock()) {
     app.quit();
@@ -53,7 +59,7 @@ export function startApp(deps: BootstrapDeps): void {
   const fatal = (message: string, detail: unknown): void => {
     if (failed) return;
     failed = true;
-    report('error', message, detail);
+    logger.error(message, { detail });
     app.exit(1);
   };
 
@@ -74,10 +80,10 @@ export function startApp(deps: BootstrapDeps): void {
     const lockdown = lockDownSession(session, {
       runtime,
       onBlockedRequest: (url) => {
-        report('warn', 'Blocked a request outside the app', url);
+        blockedRequestLog.warn('Blocked a request outside the app', { url });
       },
       onBlockedDownload: (url) => {
-        report('warn', 'Blocked a download', url);
+        blockedDownloadLog.warn('Blocked a download', { url });
       },
     });
     lockdowns.set(session, lockdown);
@@ -94,10 +100,10 @@ export function startApp(deps: BootstrapDeps): void {
     runtime,
     preloadPath: deps.preloadPath,
     onLoadError: (error) => {
-      report('error', 'The app page failed to load', error);
+      logger.error('The app page failed to load', { detail: error });
     },
     onForeignDocument: (url) => {
-      report('warn', 'A window left the app page and was sent back', url);
+      logger.warn('A window left the app page and was sent back', { url });
     },
     onUnrecoverable: (url) => {
       fatal('A window kept leaving the app page and was closed', url);
@@ -126,6 +132,10 @@ export function startApp(deps: BootstrapDeps): void {
     app.quit();
   });
 
+  app.on('will-quit', () => {
+    deps.helperClient.stop();
+  });
+
   app
     .whenReady()
     .then(async () => {
@@ -146,13 +156,17 @@ export function startApp(deps: BootstrapDeps): void {
             readFile: deps.readFile,
             realpath: deps.realpath,
             onError: (message, error) => {
-              report('error', message, error);
+              logger.error(message, { code: error });
             },
           }),
         );
       }
 
       openWindow();
+
+      // In the background: the window does not wait for the helper, and the
+      // helper not being there is an ordinary state the UI shows.
+      deps.helperClient.start();
     })
     .catch((error: unknown) => {
       fatal('Startup failed', error);

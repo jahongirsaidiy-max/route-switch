@@ -1,11 +1,15 @@
 import { readFile, realpath } from 'node:fs/promises';
 import path from 'node:path';
 
+import { PATHS } from '@routeswitch/shared';
 import { app, BrowserWindow, protocol, session } from 'electron';
 
 import { startApp } from './bootstrap';
 import { createDevelopmentRuntime } from './development';
-import { createStderrReport } from './report';
+import { createHelperClient } from './helperClient';
+import { createJsonLinesSink, createLogger } from './logger';
+
+const logger = createLogger({ sink: createJsonLinesSink((line) => process.stderr.write(line)) });
 
 startApp({
   app,
@@ -21,5 +25,11 @@ startApp({
   rendererRoot: path.join(import.meta.dirname, '../renderer'),
   readFile,
   realpath,
-  report: createStderrReport((line) => process.stderr.write(line)),
+  logger,
+  // The socket path is a constant of the product: never taken from the
+  // environment, a config file or the renderer.
+  helperClient: createHelperClient({
+    socketPath: PATHS.socket,
+    logger: logger.child({ component: 'helper-client' }),
+  }),
 });
