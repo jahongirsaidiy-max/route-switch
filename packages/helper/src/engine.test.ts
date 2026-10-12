@@ -6,12 +6,14 @@ import {
   buildEngineState,
   createEngine,
   findConnectedConflict,
+  guardCoversEveryRole,
   unresolvedDomain,
   type AppliedRoute,
   type DomainResolver,
   type DomainTargets,
   type Engine,
   type EngineDeps,
+  type GuardFacts,
   type ReconcileOutcome,
   type RetryRequest,
 } from './engine';
@@ -144,7 +146,7 @@ interface FakeRoutes {
 
 const kindOf = (dst: string): 'host' | 'net' => (dst.includes('/') ? 'net' : 'host');
 
-const added = (request: RouteAddRequest, outcome: 'added' | 'replaced' = 'added'): RouteAddResult => ({
+const added = (request: RouteAddRequest, outcome: 'added' | 'replaced' | 'exists' = 'added'): RouteAddResult => ({
   ok: true,
   outcome,
   dst: request.dst,
@@ -160,6 +162,18 @@ const addFailed = (step: 'add' | 'delete' | 're-add', message = 'Network is unre
   exitCode: 1,
   stdout: '',
   stderr: `route: writing to routing socket: ${message}\n`,
+  message,
+});
+
+/** What the wrapper returns when "File exists" turned out to be something it must not delete. */
+const inspectFailed = (failure: 'connected-route' | 'existing-route-unknown', message: string): RouteAddResult => ({
+  ok: false,
+  outcome: 'failed',
+  step: 'inspect',
+  failure,
+  exitCode: 0,
+  stdout: '',
+  stderr: '',
   message,
 });
 
@@ -293,7 +307,7 @@ describe('reconcile: desired vs applied', () => {
     const outcome = await h.run('startup');
 
     expect(h.take()).toEqual([add('172.16.12.40', ETH_GW), add('172.16.0.0/12', ETH_GW), add('203.0.113.7', WIFI_GW)]);
-    expect(outcome.summary).toEqual({ added: 3, removed: 0, failed: 0, kept: 0 });
+    expect(outcome.summary).toEqual({ added: 3, removed: 0, failed: 0, kept: 0, deferred: 0 });
     expect(outcome.retryRequested).toBe(false);
     expect(outcome.state).toEqual({
       helperVersion: '1.2.3',
@@ -326,7 +340,7 @@ describe('reconcile: desired vs applied', () => {
     const outcome = await h.run('drift-check');
 
     expect(h.take()).toEqual([]);
-    expect(outcome.summary).toEqual({ added: 0, removed: 0, failed: 0, kept: 0 });
+    expect(outcome.summary).toEqual({ added: 0, removed: 0, failed: 0, kept: 0, deferred: 0 });
     expect(outcome.state.lastReconcileReason).toBe('drift-check');
     expect(ruleState(outcome, 1).status).toBe('active');
   });
@@ -369,7 +383,7 @@ describe('reconcile: desired vs applied', () => {
       add('172.16.12.40', '10.20.4.254'),
       add('172.16.0.0/12', '10.20.4.254'),
     ]);
-    expect(outcome.summary).toEqual({ added: 2, removed: 2, failed: 0, kept: 0 });
+    expect(outcome.summary).toEqual({ added: 2, removed: 2, failed: 0, kept: 0, deferred: 0 });
     expect(ruleState(outcome, 1)).toMatchObject({ status: 'active', appliedDestinations: ['172.16.12.40'] });
     expect(engineLogs(h.entries, 'warn')).toEqual([]);
   });
@@ -816,7 +830,7 @@ describe('reconcile: routeAdd results', () => {
       appliedDestinations: [],
     });
     expect(ruleState(outcome, 2).status).toBe('active');
-    expect(outcome.summary).toEqual({ added: 1, removed: 0, failed: 1, kept: 0 });
+    expect(outcome.summary).toEqual({ added: 1, removed: 0, failed: 1, kept: 0, deferred: 0 });
     h.take();
 
     h.routes.onAdd = (request) => added(request);
@@ -863,6 +877,104 @@ describe('reconcile: routeAdd results', () => {
     ]);
   });
 
+  it('reports a connected route the wrapper refused to delete as connected-network: not applied, one warn, then debug', async () => {
+    const lan = rule(1, 'subnet', '10.20.4.0/24', 'ethernet');
+    // A static-IP interface: the guard does not know the subnet, so the rule reaches the wrapper.
+    const h = setup(config([lan, HOST_B]), {
+      netinfo: createFakeNetInfo(network({ ethernet: iface('ethernet', { subnet: null, netmask: null }) })),
+    });
+    h.routes.onAdd = (request) =>
+      request.dst === '10.20.4.0/24'
+        ? inspectFailed('connected-route', 'a connected route for 10.20.4.0/24 already exists on en5 and was left in place')
+        : added(request);
+
+    const first = await h.run('startup');
+
+    expect(h.take()).toEqual([add('10.20.4.0/24', ETH_GW), add('172.16.12.41', ETH_GW)]);
+    expect(ruleState(first, 1)).toEqual({
+      ruleId: ruleId(1),
+      status: 'error',
+      reasonCode: 'connected-network',
+      reason: '10.20.4.0/24 is a network an interface is directly connected to; its route was left in place',
+      appliedDestinations: [],
+      lastResolvedAt: null,
+    });
+    expect(ruleState(first, 9).status).toBe('active');
+    expect(h.engine.getApplied().map((route) => route.dst)).toEqual(['172.16.12.41']);
+    expect(first.summary).toEqual({ added: 1, removed: 0, failed: 1, kept: 0, deferred: 0 });
+    const warnings = engineLogs(h.entries, 'warn', 'rule cannot be applied');
+    expect(warnings.map((entry) => entry.context)).toEqual([
+      {
+        component: 'engine',
+        reason: 'startup',
+        ruleId: ruleId(1),
+        target: '10.20.4.0/24',
+        iface: 'ethernet',
+        reasonCode: 'connected-network',
+        detail: '10.20.4.0/24 is a network an interface is directly connected to; its route was left in place',
+      },
+    ]);
+
+    // While it lasts: asked again (read-only for the wrapper), reported at debug, never deleted.
+    const second = await h.run();
+    expect(h.take()).toEqual([add('10.20.4.0/24', ETH_GW)]);
+    expect(ruleState(second, 1)).toMatchObject({ status: 'error', reasonCode: 'connected-network', appliedDestinations: [] });
+    expect(engineLogs(h.entries, 'warn', 'rule cannot be applied')).toHaveLength(1);
+    expect(engineLogs(h.entries, 'debug', 'rule cannot be applied')).toHaveLength(1);
+
+    // Never ours, so removing the rule deletes nothing.
+    h.engine.setConfig(config([HOST_B]));
+    await h.run('config-change');
+    expect(h.take()).toEqual([]);
+  });
+
+  it('reports an existing route the wrapper could not identify as route-failed and does not record it', async () => {
+    const h = setup(config([HOST]));
+    h.routes.onAdd = () =>
+      inspectFailed('existing-route-unknown', 'a route for 172.16.12.40 already exists and was left in place: route get failed: timeout');
+
+    const outcome = await h.run();
+
+    expect(ruleState(outcome, 1)).toMatchObject({
+      status: 'error',
+      reasonCode: 'route-failed',
+      reason:
+        'Could not add the route for 172.16.12.40: a route for 172.16.12.40 already exists and was left in place: route get failed: timeout',
+      appliedDestinations: [],
+    });
+    expect(h.engine.getApplied()).toEqual([]);
+    expect(outcome.summary.failed).toBe(1);
+
+    h.engine.setConfig(config([]));
+    await h.run('config-change');
+    expect(h.routes.calls.filter((call) => call.op === 'delete')).toEqual([]);
+  });
+
+  it('adopts a route that was already there with the right gateway: active, applied, warned about, removed with the rule', async () => {
+    const h = setup(config([HOST, NET]));
+    h.routes.onAdd = (request) => added(request, request.dst === '172.16.12.40' ? 'exists' : 'added');
+
+    const outcome = await h.run('startup');
+
+    expect(ruleState(outcome, 1)).toMatchObject({ status: 'active', reasonCode: null, appliedDestinations: ['172.16.12.40'] });
+    expect(outcome.summary).toEqual({ added: 2, removed: 0, failed: 0, kept: 0, deferred: 0 });
+    expect(h.engine.getApplied()).toContainEqual({ dst: '172.16.12.40', gateway: ETH_GW, ruleIds: [ruleId(1)] });
+    expect(engineLogs(h.entries, 'warn').map((entry) => [entry.msg, entry.context])).toEqual([
+      [
+        'existing foreign route adopted',
+        { component: 'engine', reason: 'startup', dst: '172.16.12.40', gateway: ETH_GW, ruleIds: [ruleId(1)] },
+      ],
+    ]);
+    h.take();
+
+    // Adopted means owned: nothing on the next pass, and it goes when the rule goes.
+    await h.run();
+    expect(h.take()).toEqual([]);
+    h.engine.setConfig(config([NET]));
+    await h.run('config-change');
+    expect(h.take()).toEqual([del('172.16.12.40', ETH_GW)]);
+  });
+
   it('does not warn when the replaced route was one of its own', async () => {
     const h = setup(config([HOST]));
     await h.run();
@@ -884,7 +996,7 @@ describe('reconcile: routeDelete results', () => {
     h.engine.setConfig(config([]));
     const outcome = await h.run('config-change');
 
-    expect(outcome.summary).toEqual({ added: 0, removed: 1, failed: 0, kept: 0 });
+    expect(outcome.summary).toEqual({ added: 0, removed: 1, failed: 0, kept: 0, deferred: 0 });
     expect(h.engine.getApplied()).toEqual([]);
   });
 
@@ -906,7 +1018,7 @@ describe('reconcile: routeDelete results', () => {
       appliedDestinations: ['172.16.12.40'],
       lastResolvedAt: null,
     });
-    expect(outcome.summary).toEqual({ added: 0, removed: 0, failed: 1, kept: 0 });
+    expect(outcome.summary).toEqual({ added: 0, removed: 0, failed: 1, kept: 0, deferred: 0 });
     expect(engineLogs(h.entries, 'error').map((entry) => entry.msg)).toEqual([
       'route delete failed; the route stays applied and is retried on the next reconcile',
     ]);
@@ -1106,7 +1218,7 @@ describe('reconcile: degraded interface detection', () => {
 
     expect(h.take()).toEqual([]);
     expect([first.retryRequested, second.retryRequested]).toEqual([true, true]);
-    expect(first.summary).toEqual({ added: 0, removed: 0, failed: 0, kept: 2 });
+    expect(first.summary).toEqual({ added: 0, removed: 0, failed: 0, kept: 2, deferred: 0 });
     expect(h.retries).toEqual([
       { reason: 'network-change', attempt: 1 },
       { reason: 'network-change', attempt: 2 },
@@ -1186,7 +1298,7 @@ describe('reconcile: degraded interface detection', () => {
 
     // HOST is gone from the config: deleted. NET only looks down: kept.
     expect(h.take()).toEqual([del('172.16.12.40', ETH_GW)]);
-    expect(outcome.summary).toEqual({ added: 0, removed: 1, failed: 0, kept: 1 });
+    expect(outcome.summary).toEqual({ added: 0, removed: 1, failed: 0, kept: 1, deferred: 0 });
     expect(ruleState(outcome, 2)).toMatchObject({ status: 'pending', appliedDestinations: ['172.16.0.0/12'] });
     expect(outcome.retryRequested).toBe(true);
   });
@@ -1217,7 +1329,7 @@ describe('reconcile: degraded interface detection', () => {
     const outcome = await h.run('enabled-change');
 
     expect(h.take()).toEqual([del('172.16.12.40', ETH_GW), del('172.16.0.0/12', ETH_GW), del('203.0.113.7', WIFI_GW)]);
-    expect(outcome.summary).toEqual({ added: 0, removed: 3, failed: 0, kept: 0 });
+    expect(outcome.summary).toEqual({ added: 0, removed: 3, failed: 0, kept: 0, deferred: 0 });
     expect(h.engine.getApplied()).toEqual([]);
   });
 
@@ -1472,6 +1584,153 @@ describe('reconcile: an untrusted detection never weakens the connected-subnet g
     expect(engineLogs(h.entries, 'warn', 'connected subnet unknown; connected-subnet guard skipped')).toHaveLength(1);
   });
 
+  describe('an accepted degraded pass needs every role covered (per role)', () => {
+    const NEW_LAN = rule(4, 'subnet', '192.168.1.0/24', 'ethernet');
+    const NEW_GW = rule(5, 'ip', WIFI_GW, 'ethernet');
+
+    it('adds nothing when a role did not answer and the trusted snapshot saw that role down', async () => {
+      // Clean detection while Wi-Fi is off: the snapshot knows nothing about the wifi role.
+      const h = setup(config([HOST]), { netinfo: createFakeNetInfo(network({ wifi: down('wifi') })) });
+      await h.run('startup');
+      expect(h.take()).toEqual([add('172.16.12.40', ETH_GW)]);
+
+      // Wi-Fi joins 192.168.1.0/24, but its lookups fail: nobody can tell the guard where it is.
+      h.netinfo.results = [wifiSilent()];
+      h.engine.setConfig(config([HOST, NEW_LAN, NEW_GW, HOST_B]));
+      const outcomes = [await h.run(), await h.run(), await h.run(), await h.run()];
+
+      expect(h.take()).toEqual([]);
+      expect(outcomes.map((outcome) => outcome.summary.deferred)).toEqual([3, 3, 3, 3]);
+      expect(outcomes.map((outcome) => outcome.retryRequested)).toEqual([true, true, false, false]);
+      expect(engineLogs(h.entries, 'info', 'reconcile finished').at(-1)?.context).toMatchObject({ mode: 'accepted', deferred: 3 });
+      // What was applied stays, and stays active; the new rules wait.
+      expect(outcomes[3]?.state.rules.map((entry) => [entry.status, entry.reasonCode])).toEqual([
+        ['active', null],
+        ['pending', 'interface-down'],
+        ['pending', 'interface-down'],
+        ['pending', 'interface-down'],
+      ]);
+
+      // The first clean detection settles it: the guard now knows the Wi-Fi LAN.
+      h.netinfo.results = [network()];
+      const settled = await h.run();
+      expect(h.take()).toEqual([add('172.16.12.41', ETH_GW)]);
+      expect(settled.summary.deferred).toBe(0);
+      expect(settled.state.rules.map((entry) => entry.reasonCode)).toEqual([null, 'connected-network', 'connected-network', null]);
+    });
+
+    it.each<[string, InterfaceInfo]>([
+      ['down', down('wifi')],
+      ['up without a gateway', noGateway('wifi')],
+      ['up without a known subnet', iface('wifi', { subnet: null, netmask: null })],
+    ])('adds nothing when the snapshot saw the silent role %s', async (_name, trustedWifi) => {
+      const h = setup(config([]), { netinfo: createFakeNetInfo(network({ wifi: trustedWifi })) });
+      await h.run('startup');
+
+      h.netinfo.results = [wifiSilent()];
+      h.engine.setConfig(config([HOST]));
+      for (let pass = 0; pass < 4; pass += 1) await h.run();
+
+      expect(h.routes.calls).toEqual([]);
+    });
+
+    it('still adds on the accepted pass when the silent role is fully known in the snapshot', async () => {
+      const h = setup(config([]));
+      await h.run('startup');
+
+      h.netinfo.results = [wifiSilent()];
+      h.engine.setConfig(config([HOST, NEW_LAN]));
+      const outcomes = [await h.run(), await h.run(), await h.run()];
+
+      // Held twice, then added; the LAN rule is refused by the snapshot, not added.
+      expect(h.take()).toEqual([add('172.16.12.40', ETH_GW)]);
+      expect(outcomes.map((outcome) => outcome.summary.deferred)).toEqual([1, 1, 0]);
+      expect(ruleState(outcomes[2] ?? clean(), 4)).toMatchObject({ status: 'error', reasonCode: 'connected-network' });
+    });
+
+    it('still adds on the accepted pass when the snapshot saw a role down but the degraded detection knows it in full', async () => {
+      const h = setup(config([]), { netinfo: createFakeNetInfo(network({ wifi: down('wifi') })) });
+      await h.run('startup');
+
+      // Degraded for an unrelated reason; both roles answered in full, Wi-Fi has joined its LAN.
+      h.netinfo.results = [network({ degraded: true })];
+      h.engine.setConfig(config([HOST, NEW_LAN]));
+      const outcomes = [await h.run(), await h.run(), await h.run()];
+
+      expect(h.take()).toEqual([add('172.16.12.40', ETH_GW)]);
+      expect(ruleState(outcomes[2] ?? clean(), 4)).toMatchObject({ status: 'error', reasonCode: 'connected-network' });
+    });
+
+    it('checks each role on its own: ethernet covered by the snapshot does not cover a silent wifi', async () => {
+      const h = setup(config([]), { netinfo: createFakeNetInfo(network({ wifi: down('wifi') })) });
+      await h.run('startup');
+
+      h.netinfo.results = [network({ ethernet: down('ethernet', 'address-lookup-failed'), wifi: down('wifi', 'address-lookup-failed'), degraded: true })];
+      h.engine.setConfig(config([WIFI_HOST]));
+      for (let pass = 0; pass < 4; pass += 1) await h.run();
+
+      expect(h.routes.calls).toEqual([]);
+    });
+
+    it('leaves clean passes alone: a role that is really down does not hold anything back', async () => {
+      const h = setup(config([HOST, NEW_LAN]), { netinfo: createFakeNetInfo(network({ wifi: down('wifi') })) });
+
+      const outcome = await h.run('startup');
+
+      expect(h.take()).toEqual([add('172.16.12.40', ETH_GW), add('192.168.1.0/24', ETH_GW)]);
+      expect(outcome.summary).toEqual({ added: 2, removed: 0, failed: 0, kept: 0, deferred: 0 });
+    });
+
+    it('still removes on the accepted pass what the interfaces no longer carry', async () => {
+      const h = setup(config([HOST, WIFI_HOST]));
+      await h.run('startup');
+      h.take();
+      // Wi-Fi goes; the next clean detection records it as down.
+      h.netinfo.results = [network({ wifi: down('wifi') })];
+      await h.run();
+      expect(h.take()).toEqual([del('203.0.113.7', WIFI_GW)]);
+
+      h.netinfo.results = [network({ ethernet: down('ethernet', 'address-lookup-failed'), wifi: down('wifi'), degraded: true })];
+      const outcomes = [await h.run(), await h.run(), await h.run()];
+
+      expect(outcomes.map((outcome) => outcome.summary.kept)).toEqual([1, 1, 0]);
+      expect(h.take()).toEqual([del('172.16.12.40', ETH_GW)]);
+    });
+  });
+
+  describe('guardCoversEveryRole', () => {
+    const facts = (info: InterfaceInfo): GuardFacts => ({ role: info.role, ip: info.ip, gateway: info.gateway, subnet: info.subnet });
+    const FULL = [facts(iface('ethernet')), facts(iface('wifi'))];
+    const silent = (role: InterfaceInfo['role']): InterfaceInfo => down(role, 'address-lookup-failed');
+
+    it('is satisfied by a detection that knows both roles in full, with or without a snapshot', () => {
+      expect(guardCoversEveryRole(network({ degraded: true }), null)).toBe(true);
+      expect(guardCoversEveryRole(network({ degraded: true }), [facts(down('ethernet')), facts(down('wifi'))])).toBe(true);
+    });
+
+    it('is satisfied when the snapshot knows in full every role the detection does not', () => {
+      expect(guardCoversEveryRole(network({ wifi: silent('wifi') }), FULL)).toBe(true);
+      expect(guardCoversEveryRole(network({ ethernet: silent('ethernet'), wifi: silent('wifi') }), FULL)).toBe(true);
+      expect(guardCoversEveryRole(network({ ethernet: silent('ethernet') }), [facts(iface('ethernet')), facts(down('wifi'))])).toBe(true);
+    });
+
+    it.each<[string, DetectedInterfaces, readonly GuardFacts[] | null]>([
+      ['no snapshot at all', network({ wifi: silent('wifi') }), null],
+      ['an empty snapshot', network({ wifi: silent('wifi') }), []],
+      ['a snapshot in which that role was down', network({ wifi: silent('wifi') }), [facts(iface('ethernet')), facts(down('wifi'))]],
+      ['a snapshot of the other role only', network({ wifi: silent('wifi') }), [facts(iface('ethernet'))]],
+      ['a snapshot without that role\'s subnet', network({ wifi: silent('wifi') }), [facts(iface('ethernet')), facts(iface('wifi', { subnet: null }))]],
+      ['a snapshot without that role\'s gateway', network({ wifi: silent('wifi') }), [facts(iface('ethernet')), facts(noGateway('wifi'))]],
+      ['a snapshot without that role\'s address', network({ wifi: silent('wifi') }), [facts(iface('ethernet')), facts(iface('wifi', { ip: null }))]],
+      ['ethernet unknown on both sides', network({ ethernet: silent('ethernet') }), [facts(down('ethernet')), facts(iface('wifi'))]],
+      ['a detection that lost only the subnet', network({ wifi: iface('wifi', { subnet: null }) }), [facts(iface('ethernet')), facts(down('wifi'))]],
+      ['a detection that lost only the gateway', network({ wifi: noGateway('wifi') }), [facts(iface('ethernet')), facts(down('wifi'))]],
+      ['a detection that has the facts of a role it reports as not up', network({ wifi: iface('wifi', { up: false }) }), [facts(iface('ethernet')), facts(down('wifi'))]],
+    ])('is not satisfied with %s for a role the detection does not know in full', (_name, detected, trusted) => {
+      expect(guardCoversEveryRole(detected, trusted)).toBe(false);
+    });
+  });
+
   describe('when the process has never had a trusted detection', () => {
     it('adds nothing on any degraded pass while a role did not answer, and adds on the first clean one', async () => {
       const h = setup(config([HOST, rule(2, 'subnet', '192.168.1.0/24', 'ethernet')]), {
@@ -1538,7 +1797,7 @@ describe('reconcile: a detection that throws', () => {
     const outcome = await h.run('enabled-change');
 
     expect(h.take()).toEqual([del('172.16.12.40', ETH_GW), del('172.16.0.0/12', ETH_GW), del('203.0.113.7', WIFI_GW)]);
-    expect(outcome.summary).toEqual({ added: 0, removed: 3, failed: 0, kept: 0 });
+    expect(outcome.summary).toEqual({ added: 0, removed: 3, failed: 0, kept: 0, deferred: 0 });
     expect(outcome.state.rules.map((entry) => [entry.status, entry.appliedDestinations])).toEqual(Array(3).fill(['disabled', []]));
     expect(h.engine.getApplied()).toEqual([]);
   });
@@ -1553,7 +1812,7 @@ describe('reconcile: a detection that throws', () => {
     const outcome = await h.run('config-change');
 
     expect(h.take()).toEqual([del('172.16.12.40', ETH_GW), del('172.16.0.0/12', ETH_GW)]);
-    expect(outcome.summary).toEqual({ added: 0, removed: 2, failed: 0, kept: 1 });
+    expect(outcome.summary).toEqual({ added: 0, removed: 2, failed: 0, kept: 1, deferred: 0 });
     expect(ruleState(outcome, 3)).toMatchObject({ status: 'error', reasonCode: 'internal', appliedDestinations: ['203.0.113.7'] });
     expect(ruleState(outcome, 8)).toMatchObject({ status: 'error', reasonCode: 'internal', appliedDestinations: [] });
   });
@@ -2131,10 +2390,10 @@ describe('reconcile: 500 rules', () => {
     const third = await h.run('enabled-change');
     const elapsed = performance.now() - startedAt;
 
-    expect(first.summary).toEqual({ added: 500, removed: 0, failed: 0, kept: 0 });
+    expect(first.summary).toEqual({ added: 500, removed: 0, failed: 0, kept: 0, deferred: 0 });
     expect(first.state.rules.every((entry) => entry.status === 'active' && entry.appliedDestinations.length === 1)).toBe(true);
-    expect(second.summary).toEqual({ added: 0, removed: 0, failed: 0, kept: 0 });
-    expect(third.summary).toEqual({ added: 0, removed: 500, failed: 0, kept: 0 });
+    expect(second.summary).toEqual({ added: 0, removed: 0, failed: 0, kept: 0, deferred: 0 });
+    expect(third.summary).toEqual({ added: 0, removed: 500, failed: 0, kept: 0, deferred: 0 });
     expect(h.routes.calls).toHaveLength(1000);
     expect(elapsed).toBeLessThan(2000);
   });
@@ -2160,6 +2419,25 @@ VLAN Configurations
 ===================
 `;
   const NO_VALUE: FakeCommandResponse = { exitCode: 1 };
+  /** `route add` for a destination that is already in the table: exit code 0, the error only in the text (real). */
+  const FILE_EXISTS: FakeCommandResponse = {
+    exitCode: 0,
+    stdout: 'add net 198.51.100.0: gateway 10.20.4.1: File exists\n',
+    stderr: 'route: writing to routing socket: File exists\n',
+  };
+  /** A `route -n get` block for an exact entry, in the layout macOS prints. */
+  const routeGetBlock = (entry: { address: string; mask?: string; gateway?: string; device: string; flags: string }): string =>
+    [
+      `   route to: ${entry.address}`,
+      `destination: ${entry.address}`,
+      ...(entry.mask === undefined ? [] : [`       mask: ${entry.mask}`]),
+      ...(entry.gateway === undefined ? [] : [`    gateway: ${entry.gateway}`]),
+      `  interface: ${entry.device}`,
+      `      flags: <${entry.flags}>`,
+      ' recvpipe  sendpipe  ssthresh  rtt,msec    rttvar  hopcount      mtu     expire',
+      '       0         0         0         0         0         0      1500         0 ',
+      '',
+    ].join('\n');
 
   const real = (initialConfig: Config) => {
     const runner = createFakeCommandRunner();
@@ -2328,19 +2606,111 @@ VLAN Configurations
       if (bin !== ROUTE || args[1] !== 'add') return undefined;
       attempts += 1;
       return attempts === 1
-        ? { exitCode: 1, stdout: `add host 172.16.12.40: gateway ${ETH_GW}: File exists\n`, stderr: 'route: writing to routing socket: File exists\n' }
+        ? { ...FILE_EXISTS, stdout: `add host 172.16.12.40: gateway ${ETH_GW}: File exists\n` }
         : {};
+    });
+    // The entry in the way goes through the Wi-Fi gateway.
+    r.runner.when(ROUTE, ['-n', 'get', '-host', '172.16.12.40'], {
+      stdout: routeGetBlock({ address: '172.16.12.40', gateway: WIFI_GW, device: 'en0', flags: 'UP,GATEWAY,HOST,DONE,STATIC' }),
     });
 
     const outcome = await r.run('startup');
 
     expect(r.routeArgv()).toEqual([
       ['-n', 'add', '-host', '172.16.12.40', ETH_GW],
+      ['-n', 'get', '-host', '172.16.12.40'],
       ['-n', 'delete', '-host', '172.16.12.40'],
       ['-n', 'add', '-host', '172.16.12.40', ETH_GW],
     ]);
     expect(outcome.state.rules[0]?.status).toBe('active');
     expect(engineLogs(r.entries, 'warn', 'existing foreign route replaced')).toHaveLength(1);
+  });
+
+  it('adopts a route that already goes through the right gateway without deleting anything', async () => {
+    const r = real(config([rule(1, 'subnet', '198.51.100.0/24', 'ethernet')]));
+    r.runner.when(ROUTE, ['-n', 'add', '-net', '198.51.100.0/24', ETH_GW], FILE_EXISTS);
+    r.runner.when(ROUTE, ['-n', 'get', '-net', '198.51.100.0/24'], {
+      stdout: routeGetBlock({ address: '198.51.100.0', mask: '255.255.255.0', gateway: ETH_GW, device: 'en5', flags: 'UP,GATEWAY,DONE,STATIC,PRCLONING' }),
+    });
+
+    const outcome = await r.run('startup');
+
+    expect(r.routeArgv()).toEqual([
+      ['-n', 'add', '-net', '198.51.100.0/24', ETH_GW],
+      ['-n', 'get', '-net', '198.51.100.0/24'],
+    ]);
+    expect(outcome.state.rules[0]).toMatchObject({ status: 'active', appliedDestinations: ['198.51.100.0/24'] });
+    expect(engineLogs(r.entries, 'warn', 'existing foreign route adopted')).toHaveLength(1);
+
+    // Ours from here on: switching everything off removes it.
+    r.engine.setEnabled(false);
+    await r.run('enabled-change');
+    expect(r.routeArgv()).toEqual([['-n', 'delete', '-net', '198.51.100.0/24']]);
+  });
+
+  describe('the wrapper as the second layer: a connected route is never deleted', () => {
+    const LAN_ADD = ['-n', 'add', '-net', '10.20.4.0/24', ETH_GW];
+    const LAN_GET = ['-n', 'get', '-net', '10.20.4.0/24'];
+
+    it('static IP, subnet unknown to the guard: the own LAN reaches route add, is inspected and left alone', async () => {
+      const r = real(config([rule(4, 'subnet', '10.20.4.0/24', 'ethernet'), HOST]));
+      r.runner.when(IPCONFIG, ['getoption', 'en5', 'subnet_mask'], NO_VALUE);
+      r.runner.when(ROUTE, LAN_ADD, FILE_EXISTS);
+      r.runner.when(ROUTE, LAN_GET, {
+        stdout: routeGetBlock({ address: '10.20.4.0', mask: '255.255.255.0', device: 'en5', flags: 'UP,DONE,CLONING,STATIC' }),
+      });
+
+      const first = await r.run('startup');
+      r.expireCache();
+      const second = await r.run('network-change');
+
+      // Pass 1: add, read-only lookup, nothing else for the LAN. Pass 2: the same two, never a delete.
+      expect(r.routeArgv()).toEqual([LAN_ADD, LAN_GET, ['-n', 'add', '-host', '172.16.12.40', ETH_GW], LAN_ADD, LAN_GET]);
+      for (const outcome of [first, second]) {
+        expect(outcome.state.rules[0]).toMatchObject({ status: 'error', reasonCode: 'connected-network', appliedDestinations: [] });
+        expect(outcome.state.rules[1]?.status).toBe('active');
+      }
+      const refusals = r.entries.filter((entry) => entry.context?.['component'] === 'route' && entry.context['failure'] === 'connected-route');
+      expect(refusals.map((entry) => entry.level)).toEqual(['warn', 'warn']);
+      expect(engineLogs(r.entries, 'warn', 'rule cannot be applied')).toHaveLength(1);
+    });
+
+    it('leaves the existing entry alone when the lookup cannot say what it is', async () => {
+      const r = real(config([rule(1, 'subnet', '10.20.4.0/24', 'ethernet')]));
+      r.runner.when(IPCONFIG, ['getoption', 'en5', 'subnet_mask'], NO_VALUE);
+      r.runner.when(ROUTE, LAN_ADD, FILE_EXISTS);
+      r.runner.when(ROUTE, LAN_GET, { failure: 'timeout', error: 'Timed out after 10000 ms' });
+
+      const outcome = await r.run('startup');
+
+      expect(r.routeArgv()).toEqual([LAN_ADD, LAN_GET]);
+      expect(outcome.state.rules[0]).toMatchObject({ status: 'error', reasonCode: 'route-failed', appliedDestinations: [] });
+    });
+
+    it('stale snapshot: Wi-Fi moved to another LAN during a degraded burst; a rule equal to the new LAN is not deleted', async () => {
+      const r = real(config([]));
+      await r.run('startup');
+      // Wi-Fi is now in 192.168.50.0/24, and its address lookup keeps timing out:
+      // the guard still believes the snapshot (192.168.1.0/24) and lets the rule through.
+      r.runner.when(IPCONFIG, ['getifaddr', 'en0'], { failure: 'timeout' });
+      const add = ['-n', 'add', '-net', '192.168.50.0/24', ETH_GW];
+      const get = ['-n', 'get', '-net', '192.168.50.0/24'];
+      r.runner.when(ROUTE, add, FILE_EXISTS);
+      r.runner.when(ROUTE, get, {
+        stdout: routeGetBlock({ address: '192.168.50.0', mask: '255.255.255.0', device: 'en0', flags: 'UP,DONE,CLONING,STATIC' }),
+      });
+      r.engine.setConfig(config([rule(1, 'subnet', '192.168.50.0/24', 'ethernet')]));
+
+      const outcomes = [];
+      for (let pass = 0; pass < 4; pass += 1) {
+        r.expireCache();
+        outcomes.push(await r.run('network-change'));
+      }
+
+      // Nothing on the two held passes; on each accepted pass an add and a lookup, never a delete.
+      expect(r.routeArgv()).toEqual([add, get, add, get]);
+      expect(outcomes[3]?.state.rules[0]).toMatchObject({ status: 'error', reasonCode: 'connected-network', appliedDestinations: [] });
+    });
   });
 
   it('reports a route command the system refuses (not root) as a failed rule', async () => {
@@ -2393,6 +2763,43 @@ VLAN Configurations
       expect(verdicts).toEqual(Array(6).fill(['error', 'connected-network']));
       expect(degraded.map((outcome) => outcome.retryRequested)).toEqual([true, true, false, false]);
       expect(degraded[0]?.state.interfaces.wifi.up).toBe(false);
+    });
+
+    it('QA reproduction 2: clean detection while Wi-Fi is off, Wi-Fi joins 192.168.1.0/24, getifaddr times out: nothing reaches route', async () => {
+      const r = real(config([HOST]));
+      // Wi-Fi off: "no value", which is a clean answer. The snapshot holds nulls for the wifi role.
+      r.runner.when(IPCONFIG, ['getifaddr', 'en0'], NO_VALUE);
+      const before = await r.run('startup');
+      expect(before.retryRequested).toBe(false);
+      expect(before.state.interfaces.wifi.up).toBe(false);
+      expect(r.routeArgv()).toEqual([['-n', 'add', '-host', '172.16.12.40', ETH_GW]]);
+
+      // Wi-Fi joins 192.168.1.0/24; its address lookup times out on every pass; the two rules get enabled.
+      r.runner.when(IPCONFIG, ['getifaddr', 'en0'], TIMEOUT);
+      r.engine.setConfig(
+        config([HOST, rule(2, 'subnet', '192.168.1.0/24', 'ethernet'), rule(3, 'ip', WIFI_GW, 'ethernet'), HOST_B]),
+      );
+      const degraded = [await next(r, 'config-change'), await next(r), await next(r), await next(r)];
+
+      // Held, held, accepted, accepted: an empty /sbin/route argv list on all four.
+      expect(r.routeArgv()).toEqual([]);
+      expect(degraded.map((outcome) => outcome.retryRequested)).toEqual([true, true, false, false]);
+      expect(degraded.map((outcome) => outcome.summary.deferred)).toEqual([3, 3, 3, 3]);
+      expect(engineLogs(r.entries, 'info', 'reconcile finished').slice(-2).map((entry) => entry.context?.['mode'])).toEqual(['accepted', 'accepted']);
+      for (const outcome of degraded) {
+        expect(outcome.state.rules.map((entry) => [entry.status, entry.reasonCode])).toEqual([
+          ['active', null],
+          ['pending', 'interface-down'],
+          ['pending', 'interface-down'],
+          ['pending', 'interface-down'],
+        ]);
+      }
+
+      // The lookup answers again: the guard knows the Wi-Fi LAN and only the legitimate rule is added.
+      r.runner.when(IPCONFIG, ['getifaddr', 'en0'], { stdout: '192.168.1.23\n' });
+      const settled = await next(r);
+      expect(r.routeArgv()).toEqual([['-n', 'add', '-host', '172.16.12.41', ETH_GW]]);
+      expect(settled.state.rules.map((entry) => entry.reasonCode)).toEqual([null, 'connected-network', 'connected-network', null]);
     });
 
     it("never lets the other role's gateway (192.168.1.1 through ethernet) reach route under the same sequence", async () => {

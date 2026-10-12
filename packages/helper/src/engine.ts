@@ -101,6 +101,14 @@ export interface ReconcileSummary {
   readonly failed: number;
   /** Stale routes left in place because the interface detection was degraded. */
   readonly kept: number;
+  /**
+   * Routes that are wanted but were not added in this pass because the
+   * interface detection could not be trusted (one per destination, the number
+   * the `reconcile finished` log line carries). They are not retried by
+   * `retryRequested` once the bounded attempts are used up, so a caller that
+   * sees a non-zero value should reconcile again later on its own.
+   */
+  readonly deferred: number;
 }
 
 export interface ReconcileOutcome {
@@ -237,7 +245,8 @@ interface AppliedEntry {
  * - `normal`: the detection is clean and trusted.
  * - `accepted`: the detection is degraded, but often enough in a row to be
  *   taken at face value for deletions. Routes are added only when the guard,
- *   checked against this detection and the last trusted one, clears them.
+ *   checked against this detection and the last trusted one, clears them, and
+ *   only when every role is covered by one of the two (`guardCoversEveryRole`).
  * - `hold`: the detection is degraded and not accepted yet. No route is
  *   added; a route is deleted only when the config no longer asks for it,
  *   never because of what the interfaces look like.
@@ -393,7 +402,7 @@ const DEFERRED: Verdict = {
 };
 
 /** What the connected-subnet guard needs to know about one role. */
-type GuardFacts = Pick<InterfaceInfo, 'role' | 'ip' | 'gateway' | 'subnet'>;
+export type GuardFacts = Pick<InterfaceInfo, 'role' | 'ip' | 'gateway' | 'subnet'>;
 
 const guardFacts = (detected: DetectedInterfaces): GuardFacts[] =>
   ROLES.map((role) => {
@@ -401,11 +410,23 @@ const guardFacts = (detected: DetectedInterfaces): GuardFacts[] =>
     return { role, ip, gateway, subnet };
   });
 
-/** Every guard-relevant fact of both roles is positively known. */
-const fullyKnown = (detected: DetectedInterfaces): boolean =>
+/** Address, gateway and subnet are all positively known. */
+const knowsEverything = ({ ip, gateway, subnet }: Pick<GuardFacts, 'ip' | 'gateway' | 'subnet'>): boolean =>
+  ip !== null && gateway !== null && subnet !== null;
+
+/**
+ * Whether an accepted degraded detection gives the connected-subnet guard
+ * enough to work with, decided per role: each role is either fully known in
+ * the detection itself, or the last trusted detection knew its address,
+ * gateway and subnet. A role that is unknown now and was down (or partly
+ * unknown) when last seen reliably may have joined any network since -- the
+ * guard would have nothing to compare against, so nothing is added.
+ */
+export const guardCoversEveryRole = (detected: DetectedInterfaces, trusted: readonly GuardFacts[] | null): boolean =>
   ROLES.every((role) => {
-    const { up, ip, gateway, subnet } = detected[role];
-    return up && ip !== null && gateway !== null && subnet !== null;
+    const current = detected[role];
+    if (current.up && knowsEverything(current)) return true;
+    return trusted?.some((facts) => facts.role === role && knowsEverything(facts)) ?? false;
   });
 
 const ACTIVE: Verdict = { status: 'active', reasonCode: null, reason: null };
@@ -769,11 +790,13 @@ export const createEngine = (deps: EngineDeps): Engine => {
         applied.delete(key);
         fail('internal', `Adding the route for ${route.dst} failed: ${result.thrown}`);
       } else if (result.ok) {
+        // `exists` is adopted like a route we added: it is exactly what the
+        // rule asks for, and from here on the engine keeps and removes it.
         applied.set(key, { dst: route.dst, gateway: route.gateway, ruleIds: [...route.ruleIds] });
         counters.added += 1;
         counters.changed = true;
-        if (result.outcome === 'replaced' && !appliedAtStart.has(key)) {
-          logger.warn('existing foreign route replaced', {
+        if (result.outcome !== 'added' && !appliedAtStart.has(key)) {
+          logger.warn(result.outcome === 'replaced' ? 'existing foreign route replaced' : 'existing foreign route adopted', {
             reason,
             dst: route.dst,
             gateway: route.gateway,
@@ -792,6 +815,13 @@ export const createEngine = (deps: EngineDeps): Engine => {
               ? `Destination must never be routed (${result.reason})`
               : `Gateway ${route.gateway} was refused (${result.reason})`,
           );
+        } else if (result.failure === 'connected-route') {
+          // The wrapper found the kernel's connected route in the way and left
+          // it alone: the guard here did not know that subnet (static IP, or a
+          // detection that has gone stale). Same verdict as the guard's own.
+          fail('connected-network', `${route.dst} is a network an interface is directly connected to; its route was left in place`);
+        } else if (result.failure === 'existing-route-unknown') {
+          fail('route-failed', `Could not add the route for ${route.dst}: ${result.message}`);
         } else {
           fail(
             'route-failed',
@@ -896,10 +926,9 @@ export const createEngine = (deps: EngineDeps): Engine => {
     // An untrusted detection is checked together with the last trusted one: a
     // role it reports as down or without a subnet may only have failed to answer.
     const guardInterfaces = mode === 'normal' ? current : [...current, ...(trusted ?? [])];
-    // Without any trusted detection to fall back on, an accepted degraded
-    // detection may add routes only when it knows everything the guard needs.
-    const allowAdds =
-      mode === 'normal' || (mode === 'accepted' && detected !== null && (trusted !== null || fullyKnown(detected)));
+    // An accepted degraded detection may add routes only when, for each role,
+    // either it or the last trusted detection knows everything the guard needs.
+    const allowAdds = mode === 'normal' || (mode === 'accepted' && detected !== null && guardCoversEveryRole(detected, trusted));
 
     const plan = await buildPlan(snapshot, detected, guardInterfaces);
     const counters = await applyDiff(plan, mode, allowAdds, reason);
@@ -941,11 +970,11 @@ export const createEngine = (deps: EngineDeps): Engine => {
       removed: counters.removed,
       failed: counters.failed,
       kept: counters.kept,
+      deferred: counters.deferred,
     };
     logger.info('reconcile finished', {
       reason,
       ...summary,
-      deferred: counters.deferred,
       mode,
       rules: snapshot.rules.length,
       applied: applied.size,
@@ -986,7 +1015,7 @@ export const createEngine = (deps: EngineDeps): Engine => {
         lastReconcileReason: reason,
       });
       publish(next);
-      return { state: next, retryRequested: false, summary: { added: 0, removed: 0, failed: 0, kept: applied.size } };
+      return { state: next, retryRequested: false, summary: { added: 0, removed: 0, failed: 0, kept: applied.size, deferred: 0 } };
     }
   };
 
@@ -1019,7 +1048,7 @@ export const createEngine = (deps: EngineDeps): Engine => {
     } catch {
       // The logger isolates its sinks; if it throws anyway there is nowhere left to report to.
     }
-    return { state, retryRequested: false, summary: { added: 0, removed: 0, failed: 0, kept: applied.size } };
+    return { state, retryRequested: false, summary: { added: 0, removed: 0, failed: 0, kept: applied.size, deferred: 0 } };
   };
 
   const start = (request: Pending): void => {

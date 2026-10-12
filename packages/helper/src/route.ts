@@ -27,6 +27,15 @@ import type { Logger } from './logger';
  * - The returned promise rejects only if the runner itself rejects, i.e. with
  *   `CommandRejectedError`. That cannot be triggered by a destination or a
  *   gateway (both are canonical IPv4 text by then) and would mean a bug here.
+ *
+ * What `routeAdd` may delete: when `route add` answers "File exists", the
+ * entry that is in the way is read first (`route -n get`), and it is deleted
+ * only when that output positively shows the exact entry for the destination
+ * going through an IPv4 gateway. The kernel's own on-link entry for an
+ * interface's subnet (a "connected" route) is never deleted, whatever the
+ * caller believes about the network: removing it cuts that LAN until the
+ * interface is brought up again. Anything the output does not settle is left
+ * alone as well.
  */
 
 /** `host` is a single address (`-host a.b.c.d`), `net` a subnet (`-net a.b.c.d/n`). */
@@ -64,15 +73,25 @@ export interface RouteRejected {
  * macOS 26: `route -n get` for a destination without a route prints
  * "route: writing to routing socket: not in table" and exits 0.
  */
-export type RouteFailureKind = CommandFailure | 'reported-error';
+export type RouteFailureKind = CommandFailure | 'reported-error' | 'connected-route' | 'existing-route-unknown';
 
-export type RouteStep = 'add' | 'delete' | 're-add' | 'get';
+/**
+ * `inspect` is the read-only `route -n get` that follows a "File exists"; a
+ * failure at that step means nothing was deleted and the table is unchanged.
+ * Its `failure` is one of:
+ * - `connected-route` — the entry in the way is a connected / interface route
+ *   (no `GATEWAY` flag, or a link-level gateway). It was left in place.
+ * - `existing-route-unknown` — the entry could not be identified with
+ *   certainty (the lookup failed, its output was not understood, or it
+ *   described another, wider entry). It was left in place too.
+ */
+export type RouteStep = 'add' | 'inspect' | 'delete' | 're-add' | 'get';
 
 /** A `route` command ran (or was attempted) and did not do what was asked. */
 export interface RouteFailed {
   readonly ok: false;
   readonly outcome: 'failed';
-  /** The command that failed; `delete` and `re-add` belong to the "File exists" recovery. */
+  /** The command that failed; `inspect`, `delete` and `re-add` belong to the "File exists" recovery. */
   readonly step: RouteStep;
   readonly failure: RouteFailureKind;
   readonly exitCode: number | null;
@@ -84,8 +103,12 @@ export interface RouteFailed {
 
 export interface RouteAdded {
   readonly ok: true;
-  /** `replaced`: the route already existed, was deleted and added again. */
-  readonly outcome: 'added' | 'replaced';
+  /**
+   * - `replaced`: a route through another gateway existed, was deleted and added again.
+   * - `exists`: the route was already there with exactly this gateway; nothing
+   *   was deleted or added. The caller may treat it as its own from here on.
+   */
+  readonly outcome: 'added' | 'replaced' | 'exists';
   /** Normalised destination as given to `route`: `10.1.2.3` or `10.0.0.0/8`. */
   readonly dst: string;
   readonly kind: RouteKind;
@@ -135,7 +158,10 @@ export type RouteGetResult = RouteFound | RouteNotFound | RouteRejected | RouteF
 export interface RouteOperations {
   /**
    * `/sbin/route -n add -host|-net <dst> <gateway>`. If the route already
-   * exists it is deleted and added again, once.
+   * exists, the existing entry is read with `route -n get` first: one through
+   * the same gateway is kept (`exists`), one through another IPv4 gateway is
+   * deleted and added again, once (`replaced`), and a connected route or an
+   * entry that cannot be identified is never deleted (`failed`, step `inspect`).
    */
   routeAdd(request: RouteAddRequest): Promise<RouteAddResult>;
   /** `/sbin/route -n delete -host|-net <dst>`. */
@@ -153,6 +179,9 @@ interface ValidDestination {
   /** The exact argument for `route`: bare address for a host, CIDR for a net. */
   readonly dst: string;
   readonly kind: RouteKind;
+  /** The address without the prefix: what `route -n get` prints as `route to` and `destination`. */
+  readonly address: string;
+  readonly prefix: number;
 }
 
 type Checked<T> = { readonly ok: true; readonly value: T } | RouteRejected;
@@ -191,7 +220,12 @@ const checkDestination = (value: unknown): Checked<ValidDestination> => {
   }
   return {
     ok: true,
-    value: parsed.isHost ? { dst: parsed.address, kind: 'host' } : { dst: parsed.cidr, kind: 'net' },
+    value: {
+      dst: parsed.isHost ? parsed.address : parsed.cidr,
+      kind: parsed.isHost ? 'host' : 'net',
+      address: parsed.address,
+      prefix: parsed.prefix,
+    },
   };
 };
 
@@ -243,6 +277,7 @@ const judge = (result: CommandResult, step: RouteStep): Verdict => {
   const output = `${result.stdout}\n${result.stderr}`;
   const adding = step === 'add' || step === 're-add';
   if (adding && ALREADY_EXISTS.test(output)) return 'already-exists';
+  // `get`, `inspect` and `delete` all answer "not in table" for a missing entry.
   if (!adding && NOT_IN_TABLE.test(output)) return 'not-in-table';
   return result.ok && reportedError(result) === null ? 'ok' : 'error';
 };
@@ -280,23 +315,43 @@ const parseGetLine = (line: string): readonly [key: string, value: string] | nul
   return GET_KEY.test(key) && !LINE_TERMINATOR.test(value) ? [key, value] : null;
 };
 
+interface GetFields {
+  /** Key -> value; the first occurrence of a key wins. */
+  readonly values: ReadonlyMap<string, string>;
+  /** A key appeared more than once: the block is not one coherent answer. */
+  readonly repeated: boolean;
+}
+
+const readGetFields = (stdout: string): GetFields => {
+  const values = new Map<string, string>();
+  let repeated = false;
+  for (const line of stdout.split('\n')) {
+    const parsed = parseGetLine(line);
+    if (parsed === null) continue;
+    if (values.has(parsed[0])) repeated = true;
+    else values.set(parsed[0], parsed[1]);
+  }
+  return { values, repeated };
+};
+
+/** The names inside `<UP,GATEWAY,…>`; null when the value is not such a list. */
+const parseFlagList = (value: string | undefined): readonly string[] | null => {
+  const inner = value?.match(/^<(.*)>$/)?.[1];
+  return inner === undefined ? null : inner === '' ? [] : inner.split(',');
+};
+
 /**
  * Parses the `key: value` block `route -n get` prints. Returns null when the
  * output has no usable `interface` line.
  */
 export const parseRouteGetOutput = (target: string, stdout: string): RouteInfo | null => {
-  const fields = new Map<string, string>();
-  for (const line of stdout.split('\n')) {
-    const parsed = parseGetLine(line);
-    if (parsed !== null && !fields.has(parsed[0])) fields.set(parsed[0], parsed[1]);
-  }
+  const fields = readGetFields(stdout).values;
   const iface = fields.get('interface');
   const destination = fields.get('destination');
   if (iface === undefined || !INTERFACE_NAME.test(iface) || destination === undefined || destination === '') {
     return null;
   }
   const gateway = normalizeIpv4(fields.get('gateway') ?? '');
-  const flags = (fields.get('flags') ?? '').match(/^<(.*)>$/)?.[1];
   return {
     target,
     destination,
@@ -305,7 +360,127 @@ export const parseRouteGetOutput = (target: string, stdout: string): RouteInfo |
     // caller can use, so only an IPv4 address is reported.
     gateway: gateway.ok ? gateway.value : null,
     iface,
-    flags: flags === undefined || flags === '' ? [] : flags.split(','),
+    flags: parseFlagList(fields.get('flags')) ?? [],
+  };
+};
+
+/**
+ * What `route -n get -host|-net <dst>` says about the entry that made
+ * `route add` answer "File exists".
+ *
+ * - `gateway`: positively the exact entry for the destination, going through
+ *   an IPv4 next hop. The only state in which the entry may be deleted.
+ * - `connected`: the exact entry, and it is on-link (a connected subnet, an
+ *   interface route, a neighbour entry). Never deleted.
+ * - `unknown`: anything else. Never deleted.
+ */
+export type ExistingRoute =
+  | {
+      readonly state: 'gateway';
+      readonly gateway: string;
+      readonly iface: string;
+      /** It already goes through the requested gateway and is not a reject / blackhole route. */
+      readonly sameAsRequested: boolean;
+    }
+  | { readonly state: 'connected'; readonly iface: string; readonly detail: string }
+  | { readonly state: 'unknown'; readonly detail: string };
+
+const FLAG_NAME = /^[A-Z][A-Z0-9_]{0,31}$/;
+const LINK_GATEWAY = /^link#\d{1,10}$/;
+const MAC_GATEWAY = /^[0-9a-f]{1,2}(?::[0-9a-f]{1,2}){5}$/i;
+const HEX_MASK = /^0x([0-9a-f]{8})$/i;
+const HOST_MASK_PREFIX = 32;
+
+/**
+ * The prefix length of a netmask as `route -n get` prints it: dotted quad on
+ * macOS (`255.255.255.0`); `0xffffff00` is accepted too because it cannot be
+ * misread. Null for anything else, including a mask whose bits are not
+ * contiguous.
+ */
+const maskPrefix = (mask: string): number | null => {
+  let bits: number;
+  const hex = mask.match(HEX_MASK)?.[1];
+  if (hex !== undefined) {
+    bits = Number.parseInt(hex, 16);
+  } else {
+    const dotted = normalizeIpv4(mask);
+    if (!dotted.ok) return null;
+    bits = dotted.value.split('.').reduce((sum, octet) => sum * 256 + Number(octet), 0);
+  }
+  let prefix = 0;
+  while (prefix < HOST_MASK_PREFIX && Math.floor(bits / 2 ** (HOST_MASK_PREFIX - 1 - prefix)) % 2 === 1) prefix += 1;
+  // Every bit after the leading run of ones has to be zero.
+  return bits % 2 ** (HOST_MASK_PREFIX - prefix) === 0 ? prefix : null;
+};
+
+const unknownRoute = (detail: string): ExistingRoute => ({ state: 'unknown', detail });
+
+/**
+ * Decides what the entry described by a `route -n get` block is, for the
+ * destination `route add` was asked to add.
+ *
+ * `route -n get` is a lookup: without an exact entry it answers with the best
+ * less specific one (the subnet that covers an address, or the default route).
+ * Its flags say nothing about the destination then, so the block is first
+ * matched against the destination and only an exact match is classified:
+ *
+ * - `route to` and `destination` are both the requested address, as strict
+ *   dotted IPv4 (`default` or a shortened form never matches);
+ * - for a host: no `mask` line together with the `HOST` flag, or a `mask` of
+ *   exactly /32;
+ * - for a subnet: a `mask` line that is exactly the requested prefix, and no
+ *   `HOST` flag.
+ *
+ * Exact entry without the `GATEWAY` flag, or with a link-level gateway
+ * (`link#15`, a MAC address) -> `connected`. Exact entry with `GATEWAY` and a
+ * gateway that is a usable IPv4 address -> `gateway`. Everything else --
+ * a repeated key, a missing or malformed line, a gateway that is neither --
+ * -> `unknown`.
+ */
+export const classifyExistingRoute = (
+  wanted: { readonly kind: RouteKind; readonly address: string; readonly prefix: number },
+  requestedGateway: string,
+  stdout: string,
+): ExistingRoute => {
+  const { values, repeated } = readGetFields(stdout);
+  if (repeated) return unknownRoute('route get printed a field twice');
+
+  const iface = values.get('interface');
+  if (iface === undefined || !INTERFACE_NAME.test(iface)) return unknownRoute('route get printed no usable interface');
+  const flags = parseFlagList(values.get('flags'));
+  if (flags === null || flags.length === 0 || !flags.every((flag) => FLAG_NAME.test(flag))) {
+    return unknownRoute('route get printed no usable flags');
+  }
+
+  if (values.get('route to') !== wanted.address || values.get('destination') !== wanted.address) {
+    return unknownRoute('route get answered with another entry than the destination');
+  }
+  const mask = values.get('mask');
+  const prefix = mask === undefined ? null : maskPrefix(mask);
+  if (mask !== undefined && prefix === null) return unknownRoute('route get printed a mask that is not understood');
+  const isHostEntry = flags.includes('HOST');
+  const exact =
+    wanted.kind === 'host'
+      ? prefix === null
+        ? isHostEntry
+        : prefix === HOST_MASK_PREFIX
+      : prefix === wanted.prefix && !isHostEntry;
+  if (!exact) return unknownRoute('route get answered with another entry than the destination');
+
+  if (!flags.includes('GATEWAY')) {
+    return { state: 'connected', iface, detail: 'the existing entry has no GATEWAY flag' };
+  }
+  const gateway = values.get('gateway');
+  if (gateway !== undefined && (LINK_GATEWAY.test(gateway) || MAC_GATEWAY.test(gateway))) {
+    return { state: 'connected', iface, detail: 'the existing entry has a link-level gateway' };
+  }
+  const hop = gateway === undefined ? null : normalizeHostAddress(gateway);
+  if (hop === null || !hop.ok) return unknownRoute('the existing entry has no usable IPv4 gateway');
+  return {
+    state: 'gateway',
+    gateway: hop.value,
+    iface,
+    sameAsRequested: hop.value === requestedGateway && !flags.includes('REJECT') && !flags.includes('BLACKHOLE'),
   };
 };
 
@@ -324,7 +499,13 @@ export const createRouteOperations = (deps: RouteDeps): RouteOperations => {
     });
   };
 
-  const logFailed = (op: string, failure: RouteFailed, dst: string, gateway: string | null): void => {
+  const logFailed = (
+    op: string,
+    failure: RouteFailed,
+    dst: string,
+    gateway: string | null,
+    extra: Readonly<Record<string, string>> = {},
+  ): void => {
     logger.error('route command failed', {
       op,
       dst,
@@ -333,6 +514,7 @@ export const createRouteOperations = (deps: RouteDeps): RouteOperations => {
       step: failure.step,
       failure: failure.failure,
       exitCode: failure.exitCode,
+      ...extra,
       error: failure.message,
     });
   };
@@ -343,7 +525,31 @@ export const createRouteOperations = (deps: RouteDeps): RouteOperations => {
   const runDelete = ({ dst, kind }: ValidDestination): Promise<CommandResult> =>
     runner.run(ALLOWED_BINARIES.route, ['-n', 'delete', `-${kind}`, dst]);
 
-  const add = async (destination: ValidDestination, gateway: string): Promise<RouteAdded | RouteFailed> => {
+  const runGet = ({ dst, kind }: ValidDestination): Promise<CommandResult> =>
+    runner.run(ALLOWED_BINARIES.route, ['-n', 'get', `-${kind}`, dst]);
+
+  /** Reads the entry that made `route add` answer "File exists". Changes nothing. */
+  const inspect = async (
+    destination: ValidDestination,
+    gateway: string,
+  ): Promise<{ readonly lookup: CommandResult; readonly existing: ExistingRoute }> => {
+    const lookup = await runGet(destination);
+    const verdict = judge(lookup, 'inspect');
+    if (verdict === 'ok') return { lookup, existing: classifyExistingRoute(destination, gateway, lookup.stdout) };
+    const detail =
+      verdict === 'not-in-table'
+        ? 'route add reported an existing route, but route get found none'
+        : `route get failed: ${reportedError(lookup) ?? lookup.error ?? lookup.failure ?? `exit code ${String(lookup.exitCode)}`}`;
+    return { lookup, existing: unknownRoute(detail) };
+  };
+
+  interface AddReport {
+    readonly result: RouteAdded | RouteFailed;
+    /** What the "File exists" inspection found; null when there was none. */
+    readonly existing: ExistingRoute | null;
+  }
+
+  const add = async (destination: ValidDestination, gateway: string): Promise<AddReport> => {
     const done = (outcome: RouteAdded['outcome']): RouteAdded => ({
       ok: true,
       outcome,
@@ -354,18 +560,58 @@ export const createRouteOperations = (deps: RouteDeps): RouteOperations => {
 
     const first = await runAdd(destination, gateway);
     const verdict = judge(first, 'add');
-    if (verdict === 'ok') return done('added');
-    if (verdict !== 'already-exists') return failed('add', first);
+    if (verdict === 'ok') return { result: done('added'), existing: null };
+    if (verdict !== 'already-exists') return { result: failed('add', first), existing: null };
 
-    // The route is there, possibly with another gateway: replace it, once.
+    // Something is in the way. Read it before touching it: only an entry that
+    // is positively a route through an IPv4 gateway may be deleted.
+    const { lookup, existing } = await inspect(destination, gateway);
+    if (existing.state !== 'gateway') {
+      const result: RouteFailed = {
+        ok: false,
+        outcome: 'failed',
+        step: 'inspect',
+        failure: existing.state === 'connected' ? 'connected-route' : 'existing-route-unknown',
+        exitCode: lookup.exitCode,
+        stdout: lookup.stdout,
+        stderr: lookup.stderr,
+        message:
+          existing.state === 'connected'
+            ? `a connected route for ${destination.dst} already exists on ${existing.iface} and was left in place (${existing.detail})`
+            : `a route for ${destination.dst} already exists and was left in place: ${existing.detail}`,
+      };
+      return { result, existing };
+    }
+    // Already what was asked for: no reason to take it out of the table even for a moment.
+    if (existing.sameAsRequested) return { result: done('exists'), existing };
+
+    // A route through another gateway: replace it, once.
     const removal = await runDelete(destination);
     // `not-in-table` here means it vanished in between; adding again is still right.
-    if (judge(removal, 'delete') === 'error') return failed('delete', removal);
+    if (judge(removal, 'delete') === 'error') return { result: failed('delete', removal), existing };
 
     const second = await runAdd(destination, gateway);
     const secondVerdict = judge(second, 're-add');
-    if (secondVerdict === 'ok') return done('replaced');
-    return failed('re-add', second, secondVerdict === 'already-exists' ? 'route already exists' : undefined);
+    if (secondVerdict === 'ok') return { result: done('replaced'), existing };
+    return {
+      result: failed('re-add', second, secondVerdict === 'already-exists' ? 'route already exists' : undefined),
+      existing,
+    };
+  };
+
+  /** Log fields describing the "File exists" inspection; none when the first add settled it. */
+  const inspectionFields = (existing: ExistingRoute | null): Record<string, string> => {
+    if (existing === null) return {};
+    if (existing.state === 'gateway') {
+      return {
+        existing: existing.sameAsRequested ? 'same-gateway' : 'gateway-route',
+        existingGateway: existing.gateway,
+        existingIface: existing.iface,
+      };
+    }
+    return existing.state === 'connected'
+      ? { existing: 'connected', existingIface: existing.iface }
+      : { existing: 'unknown' };
   };
 
   const routeAdd = async (request: RouteAddRequest): Promise<RouteAddResult> => {
@@ -382,17 +628,31 @@ export const createRouteOperations = (deps: RouteDeps): RouteOperations => {
       return gateway;
     }
 
-    const result = await add(destination.value, gateway.value);
+    const { result, existing } = await add(destination.value, gateway.value);
+    const inspection = inspectionFields(existing);
     if (result.ok) {
-      logger.info('route added', {
+      logger.info(result.outcome === 'exists' ? 'route already present with this gateway' : 'route added', {
         op: 'add',
         dst: result.dst,
         gateway: result.gateway,
         kind: result.kind,
         outcome: result.outcome,
+        ...inspection,
+      });
+    } else if (result.failure === 'connected-route') {
+      // Not a failed command: the wrapper refused to delete the kernel's own route.
+      logger.warn('existing connected route left in place; nothing was deleted', {
+        op: 'add',
+        dst: destination.value.dst,
+        gateway: gateway.value,
+        outcome: result.outcome,
+        step: result.step,
+        failure: result.failure,
+        ...inspection,
+        error: result.message,
       });
     } else {
-      logFailed('add', result, destination.value.dst, gateway.value);
+      logFailed('add', result, destination.value.dst, gateway.value, inspection);
     }
     return result;
   };
