@@ -263,7 +263,22 @@ const failed = (step: RouteStep, result: CommandResult, fallback?: string): Rout
 });
 
 const INTERFACE_NAME = /^[A-Za-z][A-Za-z0-9._-]{0,15}$/;
-const GET_LINE = /^\s*([a-z][a-z ]*):\s*(.*?)\s*$/;
+const GET_KEY = /^[a-z][a-z ]*$/;
+/** A value never spans lines; `split('\n')` leaves these behind when the output is malformed. */
+const LINE_TERMINATOR = /[\r\u2028\u2029]/;
+
+/**
+ * Splits one `key: value` line of `route -n get` at its first colon. Done with
+ * `indexOf` and `trim` instead of one pattern over the whole line: a lazy
+ * `\s*(.*?)\s*$` backtracks in cubic time on a line holding a stray `\r`.
+ */
+const parseGetLine = (line: string): readonly [key: string, value: string] | null => {
+  const colon = line.indexOf(':');
+  if (colon === -1) return null;
+  const key = line.slice(0, colon).trimStart();
+  const value = line.slice(colon + 1).trim();
+  return GET_KEY.test(key) && !LINE_TERMINATOR.test(value) ? [key, value] : null;
+};
 
 /**
  * Parses the `key: value` block `route -n get` prints. Returns null when the
@@ -272,9 +287,8 @@ const GET_LINE = /^\s*([a-z][a-z ]*):\s*(.*?)\s*$/;
 export const parseRouteGetOutput = (target: string, stdout: string): RouteInfo | null => {
   const fields = new Map<string, string>();
   for (const line of stdout.split('\n')) {
-    const match = line.match(GET_LINE);
-    const [, key, value] = match ?? [];
-    if (key !== undefined && value !== undefined && !fields.has(key)) fields.set(key, value);
+    const parsed = parseGetLine(line);
+    if (parsed !== null && !fields.has(parsed[0])) fields.set(parsed[0], parsed[1]);
   }
   const iface = fields.get('interface');
   const destination = fields.get('destination');

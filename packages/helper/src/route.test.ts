@@ -762,4 +762,43 @@ describe('parseRouteGetOutput', () => {
       expect(parseRouteGetOutput('1.1.1.1', output)).toBeNull();
     },
   );
+
+  it('accepts CRLF line endings and surrounding whitespace', () => {
+    const output = 'destination: default\r\n    gateway:   192.168.1.1  \r\n\t interface:\ten0 \r\n      flags: <UP,DONE>\r\n';
+
+    expect(parseRouteGetOutput('1.1.1.1', output)).toEqual({
+      target: '1.1.1.1',
+      destination: 'default',
+      mask: null,
+      gateway: '192.168.1.1',
+      iface: 'en0',
+      flags: ['UP', 'DONE'],
+    });
+  });
+
+  it('splits a line at its first colon and keeps later colons in the value', () => {
+    const output = 'destination: default\n    gateway: aa:bb:cc:dd:ee:ff\n  interface: en0\n';
+
+    expect(parseRouteGetOutput('1.1.1.1', output)).toMatchObject({ gateway: null, iface: 'en0' });
+  });
+
+  it.each([
+    ['a line terminator inside the value', 'destination: default\n  interface: en0\rx\n'],
+    ['an upper-case key', 'destination: default\n  Interface: en0\n'],
+    ['a key that does not start with a letter', 'destination: default\n  1interface: en0\n'],
+    ['a line without a colon', 'destination: default\n  interface en0\n'],
+  ])('ignores a line with %s', (_name, output) => {
+    expect(parseRouteGetOutput('1.1.1.1', output)).toBeNull();
+  });
+
+  it('parses a line with a stray carriage return after a long run of spaces in linear time', () => {
+    // The former `\s*(.*?)\s*$` pattern needed about 10 s for 4000 spaces here.
+    const hostile = `destination: default\n  interface: en0\na:${' '.repeat(200_000)}x\ry\n`.repeat(5);
+
+    const startedAt = performance.now();
+    const route = parseRouteGetOutput('1.1.1.1', hostile);
+
+    expect(performance.now() - startedAt).toBeLessThan(500);
+    expect(route).toMatchObject({ destination: 'default', iface: 'en0' });
+  });
 });

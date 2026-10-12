@@ -33,7 +33,10 @@ import { Config, DEVICE_NAME, IfaceRole, LIMITS, findDuplicateIds } from './sche
  * and also a new value in any closed enumeration (`RULE_STATUSES`,
  * `RULE_REASON_CODES`, `RECONCILE_REASONS`, `ERROR_CODES`,
  * `EVENT_LOG_LEVELS`) — an older peer validates those with the list it was
- * built with and would refuse the whole message.
+ * built with and would refuse the whole message. The same holds for a new
+ * field that can exceed `STRUCTURE_LIMITS` (a longer array, deeper nesting, a
+ * longer string): an older peer refuses the whole message before any schema
+ * runs, so such a field is a breaking change too and needs a bump.
  * Reported by `status`; the app offers to reinstall the helper on a mismatch.
  */
 export const PROTOCOL_VERSION = 1;
@@ -172,8 +175,9 @@ export type RuleStatus = z.infer<typeof RuleStatus>;
  * pending:  `interface-down`, `no-gateway`, `resolving`.
  * error:    `resolve-failed` (DNS query failed), `no-addresses` (no A records),
  *           `forbidden-destination` (a resolved address must never be routed),
- *           `connected-network` (the destination overlaps the subnet an
- *           interface is directly connected to, so no route is added),
+ *           `connected-network` (the destination equals the subnet an
+ *           interface is directly connected to, or equals or contains the
+ *           gateway or the own address of an interface, so no route is added),
  *           `route-failed` (`route add` failed), `resolver-conflict` (an
  *           `/etc/resolver` file exists that is not ours), `resolver-failed`
  *           (writing the resolver file failed), `internal`.
@@ -273,6 +277,9 @@ export const EngineState = z
      * kind or interface: when this value differs from the one the app last
      * fetched the config for, the app calls `getConfig` again and joins
      * `rules` with the config by `ruleId`.
+     * The app also calls `getConfig` on every (re)connect and forgets the
+     * revision it remembered: the helper may have restarted, and a restarted
+     * helper can reach the same number again with a different config.
      */
     configRevision: Counter,
     /** The global toggle (`Config.enabled`). */
