@@ -6,7 +6,7 @@ import { LOADING_VIEW, type EngineStateView } from '../../hooks/useEngineState';
 import { LogScreen } from '../Log';
 import { SettingsScreen } from '../Settings';
 import { RulesScreen } from './RulesScreen';
-import { RulesWindowFrame, SECTIONS, SECTION_SCREENS, type RulesSection } from './RulesWindow';
+import { focusedElement, restoreFocus, RulesWindowFrame, SECTIONS, SECTION_SCREENS, type RulesSection } from './RulesWindow';
 
 const CONNECTED: EngineStateView = { helper: 'connected', connection: { kind: 'connected', helperVersion: '0.1.0' }, state: null, error: null };
 
@@ -54,10 +54,42 @@ describe('RulesWindowFrame', () => {
 });
 
 describe('SECTION_SCREENS', () => {
+  const onAddRule = vi.fn();
+  const onEditRule = vi.fn();
+  const screenOf = (section: RulesSection) =>
+    (SECTION_SCREENS[section] as (props: { onAddRule: () => void; onEditRule: (id: string) => void }) => ReactElement)({ onAddRule, onEditRule });
+
   it('wires the rules, journal and settings screens', () => {
-    const screenOf = (section: RulesSection) => (SECTION_SCREENS[section] as () => ReactElement)().type as ComponentType;
-    expect(screenOf('rules')).toBe(RulesScreen);
-    expect(screenOf('log')).toBe(LogScreen);
-    expect(screenOf('settings')).toBe(SettingsScreen);
+    expect(screenOf('rules').type as ComponentType).toBe(RulesScreen);
+    expect(screenOf('log').type as ComponentType).toBe(LogScreen);
+    expect(screenOf('settings').type as ComponentType).toBe(SettingsScreen);
+  });
+
+  it('the rules screen gets the way into the add-rule form (its buttons are then enabled)', () => {
+    const props = screenOf('rules').props as { onAddRule: () => void; onEditRule: (id: string) => void };
+    expect(props.onAddRule).toBe(onAddRule);
+    expect(props.onEditRule).toBe(onEditRule);
+  });
+});
+
+describe('the window behind the add-rule dialog', () => {
+  it('is inert while the dialog is open, and only then', () => {
+    expect(renderMarkup(RulesWindowFrame({ section: 'rules', engine: CONNECTED, onSelect: vi.fn(), inert: true, children: null }))).toMatch(/^<div[^>]*inert=""/);
+    expect(renderMarkup(frame('rules'))).not.toContain('inert');
+  });
+
+  it('the focus returns to the button that opened the dialog, when it is still there', () => {
+    const button = { isConnected: true, focus: vi.fn() };
+    const body = {} as HTMLElement;
+    expect(focusedElement({ activeElement: button as unknown as Element, body })).toBe(button);
+    expect(focusedElement({ activeElement: body, body })).toBeNull();
+    expect(focusedElement({ activeElement: null, body })).toBeNull();
+    expect(focusedElement(undefined)).toBeNull();
+    expect(restoreFocus(button)).toBe(true);
+    expect(button.focus).toHaveBeenCalledTimes(1);
+    const gone = { isConnected: false, focus: vi.fn() };
+    expect(restoreFocus(gone)).toBe(false);
+    expect(gone.focus).not.toHaveBeenCalled();
+    expect(restoreFocus(null)).toBe(false);
   });
 });

@@ -3,12 +3,16 @@
 // chosen section beside it. The macOS title bar is the real one, so the
 // design's drawn traffic lights are not repeated. The design's "Interfeyslar"
 // and "DNS resolverlar" items have no screen in the MVP and are left out.
+// "Qoida qo'shish" and a row's "Tahrirlash" open the add-rule form as a modal
+// dialog over the window; the window behind it is `inert` until it closes, and
+// the focus then returns to the button that opened it.
 
-import { useState, type ComponentType, type ReactElement, type ReactNode } from 'react';
+import { useEffect, useRef, useState, type ComponentType, type ReactElement, type ReactNode } from 'react';
 
 import { RouteIcon, StatusDot } from '../../components';
 import { useEngineState, type EngineStateView } from '../../hooks/useEngineState';
 import { HELPER_STATUS_TEXT } from '../../text';
+import { AddRuleDialog, type RuleEditorTarget } from '../AddRule';
 import { LogScreen } from '../Log';
 import { SettingsScreen } from '../Settings';
 import { RulesScreen } from './RulesScreen';
@@ -60,9 +64,15 @@ export const SECTIONS: readonly { readonly id: RulesSection; readonly label: str
   { id: 'settings', label: 'Sozlamalar', icon: SettingsIcon },
 ];
 
+/** What a section's screen gets from the window: the way into the add-rule form. */
+export interface SectionScreenProps {
+  readonly onAddRule: () => void;
+  readonly onEditRule: (id: string) => void;
+}
+
 /** The screen of each section. */
-export const SECTION_SCREENS: Readonly<Record<RulesSection, ComponentType>> = {
-  rules: () => <RulesScreen />,
+export const SECTION_SCREENS: Readonly<Record<RulesSection, ComponentType<SectionScreenProps>>> = {
+  rules: ({ onAddRule, onEditRule }) => <RulesScreen onAddRule={onAddRule} onEditRule={onEditRule} />,
   log: () => <LogScreen />,
   settings: () => <SettingsScreen />,
 };
@@ -71,15 +81,17 @@ export interface RulesWindowFrameProps {
   readonly section: RulesSection;
   readonly engine: EngineStateView;
   readonly onSelect: (section: RulesSection) => void;
+  /** A dialog is open over the window: nothing behind it can be focused or clicked. */
+  readonly inert?: boolean;
   readonly children: ReactNode;
 }
 
 /** The sidebar and the section's screen, for given data. */
-export function RulesWindowFrame({ section, engine, onSelect, children }: RulesWindowFrameProps): ReactElement {
+export function RulesWindowFrame({ section, engine, onSelect, inert = false, children }: RulesWindowFrameProps): ReactElement {
   const helper = HELPER_STATUS_TEXT[engine.helper];
   const connection = engine.connection;
   return (
-    <div className={styles['window']}>
+    <div className={styles['window']} inert={inert || undefined}>
       <aside className={styles['sidebar']}>
         <nav aria-label="Bo'limlar" className={styles['nav']}>
           {SECTIONS.map(({ id, label, icon: Icon }) => (
@@ -110,20 +122,64 @@ export function RulesWindowFrame({ section, engine, onSelect, children }: RulesW
   );
 }
 
+/** The element that had the focus, so it can get it back; null when there is none to return to. */
+export function focusedElement(doc: Pick<Document, 'activeElement' | 'body'> | undefined): HTMLElement | null {
+  const element = doc?.activeElement ?? null;
+  return element === null || element === doc?.body ? null : (element as HTMLElement);
+}
+
+/** Gives the focus back to `element` when it is still on the page. */
+export function restoreFocus(element: Pick<HTMLElement, 'isConnected' | 'focus'> | null): boolean {
+  if (element === null || !element.isConnected) return false;
+  element.focus();
+  return true;
+}
+
 export interface RulesWindowProps {
   /** The section shown first; "Qoidalar" by default. */
   readonly initialSection?: RulesSection;
-  readonly screens?: Readonly<Record<RulesSection, ComponentType>>;
+  readonly screens?: Readonly<Record<RulesSection, ComponentType<SectionScreenProps>>>;
+  readonly editorScreen?: ComponentType<{ readonly editor: RuleEditorTarget; readonly onClose: () => void }>;
 }
 
 /** The screen of the rules window (`?view=rules`). */
-export function RulesWindow({ initialSection = 'rules', screens = SECTION_SCREENS }: RulesWindowProps): ReactElement {
+export function RulesWindow({ initialSection = 'rules', screens = SECTION_SCREENS, editorScreen: Editor = AddRuleDialog }: RulesWindowProps): ReactElement {
   const engine = useEngineState();
   const [section, setSection] = useState<RulesSection>(initialSection);
+  const [editor, setEditor] = useState<RuleEditorTarget | null>(null);
+  // The button that opened the form; it gets the focus back once the window is no longer inert.
+  const opener = useRef<HTMLElement | null>(null);
+  const [returning, setReturning] = useState(false);
+  useEffect(() => {
+    if (!returning) return;
+    restoreFocus(opener.current);
+    opener.current = null;
+    setReturning(false);
+  }, [returning]);
+
+  const open = (target: RuleEditorTarget) => {
+    opener.current = focusedElement(globalThis.document);
+    setEditor(target);
+  };
+  const close = () => {
+    setEditor(null);
+    setReturning(true);
+  };
   const Screen = screens[section];
   return (
-    <RulesWindowFrame section={section} engine={engine} onSelect={setSection}>
-      <Screen />
-    </RulesWindowFrame>
+    <>
+      <RulesWindowFrame section={section} engine={engine} onSelect={setSection} inert={editor !== null}>
+        <Screen
+          onAddRule={() => {
+            open({ mode: 'add' });
+          }}
+          onEditRule={(id) => {
+            open({ mode: 'edit', id });
+          }}
+        />
+      </RulesWindowFrame>
+      {/* Keyed by what it edits: another rule opens a fresh form. */}
+      {editor === null ? null : <Editor key={editor.mode === 'edit' ? editor.id : 'add'} editor={editor} onClose={close} />}
+    </>
   );
 }
