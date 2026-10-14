@@ -13,6 +13,7 @@
 // with `setConfig`; the helper validates and stores it.
 
 import {
+  Config as ConfigSchema,
   describeIssues,
   findStructureViolation,
   Rule,
@@ -23,6 +24,7 @@ import {
 } from '@routeswitch/shared';
 
 import type {
+  RsIfaceOverrides,
   RsConnection,
   RsInvokeChannel,
   RsInvokeChannels,
@@ -35,6 +37,7 @@ import type { HelperClient, HelperStatus } from './helperClient';
 import { createLogBuffer, type LogBuffer } from './logBuffer';
 import type { Logger } from './logger';
 import { isAllowedNavigation } from './security';
+import type { Settings } from './settings';
 
 // `RsConnection` is the renderer's copy of `HelperStatus`; this line fails to
 // compile as soon as the two drift apart.
@@ -56,6 +59,12 @@ export const INVOKE_CHANNELS = [
   'rs:import',
   'rs:export',
   'rs:getLog',
+  'rs:getSettings',
+  'rs:setOpenAtLogin',
+  'rs:setIfaceOverrides',
+  'rs:getServiceOrder',
+  'rs:copyServiceOrderCommand',
+  'rs:uninstall',
 ] as const satisfies readonly RsInvokeChannel[];
 
 /** The part of a `WebFrameMain` a call is checked against. */
@@ -92,6 +101,8 @@ export interface IpcDeps {
   readonly listRecipients: () => readonly StateRecipient[];
   /** Where the helper's `log` events are kept for the journal; a new 500-entry buffer by default. */
   readonly logBuffer?: LogBuffer;
+  /** The login item and the network service order (settings screen). */
+  readonly settings: Settings;
 }
 
 export interface IpcRegistration {
@@ -146,6 +157,8 @@ const Flag: Schema<boolean> = SetEnabledRequest.shape.enabled;
 /** One routable IPv4 address, normalised (forbidden destinations refused, ADR-001). */
 const TestTarget: Schema<string> = TestRequest.shape.target;
 const RuleArgument: Schema<Rule> = Rule;
+/** Device overrides per role: only `ethernet` / `wifi` keys, each an `en*` name. Required (no `undefined`). */
+const IfaceOverrides: Schema<RsIfaceOverrides> = ConfigSchema.shape.ifaceOverrides.unwrap();
 
 const ARGUMENTS = {
   'rs:getState': argumentsOf(),
@@ -159,6 +172,12 @@ const ARGUMENTS = {
   'rs:import': argumentsOf(),
   'rs:export': argumentsOf(),
   'rs:getLog': argumentsOf(),
+  'rs:getSettings': argumentsOf(),
+  'rs:setOpenAtLogin': argumentsOf(Flag),
+  'rs:setIfaceOverrides': argumentsOf(IfaceOverrides),
+  'rs:getServiceOrder': argumentsOf(),
+  'rs:copyServiceOrderCommand': argumentsOf(),
+  'rs:uninstall': argumentsOf(),
 } as const satisfies Readonly<Record<RsInvokeChannel, ArgsParser<readonly unknown[]>>>;
 
 type ParsedArgs<C extends RsInvokeChannel> = (typeof ARGUMENTS)[C] extends ArgsParser<infer A> ? A : never;
@@ -179,7 +198,7 @@ const isTrustedSender = (event: InvokeEvent, entryUrl: string): boolean => {
 type RuleEdit = (rules: Config['rules']) => RuleInput[] | null;
 
 export function registerIpcHandlers(deps: IpcDeps): IpcRegistration {
-  const { ipcMain, helperClient, entryUrl } = deps;
+  const { ipcMain, helperClient, entryUrl, settings } = deps;
   const logger = deps.logger.child({ component: 'ipc' });
   // Everything below can be triggered by the page at will, so each kind of
   // line has its own rate-limit budget.
@@ -208,6 +227,9 @@ export function registerIpcHandlers(deps: IpcDeps): IpcRegistration {
     queue = run.catch(() => undefined);
     return run;
   };
+
+  /** The Wi‑Fi role's device as the engine last saw it; it picks the Wi‑Fi service of the order. */
+  const wifiDevice = (): string | null => helperClient.snapshot().state?.interfaces.wifi.device ?? null;
 
   const editRule = (channel: RsInvokeChannel, ruleId: string, edit: RuleEdit) =>
     serially(async (): Promise<RsResult<RsInvokeChannels['rs:saveRule']['value']>> => {
@@ -263,6 +285,28 @@ export function registerIpcHandlers(deps: IpcDeps): IpcRegistration {
     'rs:export': () => Promise.resolve(failure('not-implemented', 'Exporting the config is not available yet (TASK-215)')),
     // From the main process's memory: no helper round trip, and it works while the helper is away.
     'rs:getLog': () => Promise.resolve({ ok: true, value: logBuffer.entries() }),
+    'rs:getSettings': () => Promise.resolve({ ok: true, value: { openAtLogin: settings.openAtLogin() } }),
+    'rs:setOpenAtLogin': ([on]) => Promise.resolve({ ok: true, value: { openAtLogin: settings.setOpenAtLogin(on) } }),
+    'rs:setIfaceOverrides': ([overrides]) =>
+      serially(async () => {
+        const current = await helperClient.request('getConfig');
+        if (!current.ok) return current;
+        const config: Config = { ...current.value.config };
+        delete config.ifaceOverrides;
+        if (Object.keys(overrides).length > 0) config.ifaceOverrides = overrides;
+        const saved = await helperClient.request('setConfig', { config });
+        if (saved.ok) changeLog.info('Interface overrides changed', { channel: 'rs:setIfaceOverrides', roles: Object.keys(overrides) });
+        return saved;
+      }),
+    // Read-only, and never the privileged command itself (GAP-04): the user runs it.
+    'rs:getServiceOrder': () => settings.serviceOrder(wifiDevice()),
+    'rs:copyServiceOrderCommand': () => settings.copyServiceOrderCommand(wifiDevice()),
+    'rs:uninstall': () =>
+      serially(async () => {
+        const result = await helperClient.request('uninstall');
+        changeLog.info('Helper uninstall requested', { channel: 'rs:uninstall', ok: result.ok });
+        return result;
+      }),
   };
 
   const register = (channel: RsInvokeChannel): void => {

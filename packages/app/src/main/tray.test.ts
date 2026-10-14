@@ -9,6 +9,7 @@ import type { HelperClient, HelperStatus, HelperSnapshot } from './helperClient'
 import { engineState, memoryLogger, RULE_ID } from './helperClient.fixtures';
 import { INVOKE_CHANNELS, STATE_CHANNEL } from './ipc';
 import { APP_ENTRY_URL } from './runtime';
+import { createSettings } from './settings';
 import {
   INITIAL_APPEARANCE,
   loadTrayImage,
@@ -284,6 +285,12 @@ function shellHarness() {
       activateApp,
       quit,
       logger,
+      settings: createSettings({
+        loginItem: { get: () => false, set: () => undefined },
+        listServiceOrder: () => Promise.reject(new Error('not used')),
+        writeClipboard: () => Promise.resolve(),
+        logger,
+      }),
       now: () => 50_000,
     },
     {

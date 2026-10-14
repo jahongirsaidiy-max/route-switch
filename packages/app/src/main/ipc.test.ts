@@ -18,6 +18,7 @@ import {
 import { INVOKE_CHANNELS, LOG_CHANNEL, registerIpcHandlers, STATE_CHANNEL, type InvokeEvent, type StateRecipient } from './ipc';
 import { createLogBuffer, type LogBuffer } from './logBuffer';
 import { APP_ENTRY_URL } from './runtime';
+import { createSettings, type Settings } from './settings';
 
 // ---------------------------------------------------------------------------
 // The preload, loaded against a stand-in for Electron's renderer side. Its
@@ -151,12 +152,22 @@ function attachHelper(socket: FakeSocket, helper: FakeHelper): void {
   };
 }
 
+/** Settings whose system side is never reached in a test that does not exercise it. */
+const unusedSettings = (logger: Parameters<typeof createSettings>[0]['logger']): Settings =>
+  createSettings({
+    loginItem: { get: () => false, set: () => undefined },
+    listServiceOrder: () => Promise.reject(new Error('not used')),
+    writeClipboard: () => Promise.resolve(),
+    logger,
+  });
+
 interface SetupOptions {
   readonly connect?: boolean;
   readonly config?: Config;
   readonly client?: Pick<HelperClient, 'request' | 'snapshot' | 'onStatus' | 'onState' | 'onLog'>;
   readonly recipients?: StateRecipient[];
   readonly logBuffer?: LogBuffer;
+  readonly settings?: Settings;
 }
 
 async function setup(options: SetupOptions = {}) {
@@ -191,6 +202,7 @@ async function setup(options: SetupOptions = {}) {
     logger,
     listRecipients: () => recipients,
     ...(options.logBuffer === undefined ? {} : { logBuffer: options.logBuffer }),
+    settings: options.settings ?? unusedSettings(logger),
   });
 
   if (options.client === undefined) {
@@ -239,10 +251,10 @@ const newRule = (extra: Partial<RuleInput> = {}): RuleInput => ({
 // ---------------------------------------------------------------------------
 
 describe('registration', () => {
-  it('handles exactly the eleven invoke channels of the renderer API', async () => {
+  it('handles exactly the seventeen invoke channels of the renderer API', async () => {
     const h = await setup({ connect: false });
     expect([...h.ipcMain.handlers.keys()].sort()).toEqual([...INVOKE_CHANNELS].sort());
-    expect(INVOKE_CHANNELS).toHaveLength(11);
+    expect(INVOKE_CHANNELS).toHaveLength(17);
   });
 
   it('dispose removes every handler and stops the state pushes; a second dispose does nothing', async () => {
@@ -253,7 +265,7 @@ describe('registration', () => {
     h.registration.dispose();
     h.registration.dispose();
     expect(h.ipcMain.handlers.size).toBe(0);
-    expect(h.ipcMain.removeHandler).toHaveBeenCalledTimes(11);
+    expect(h.ipcMain.removeHandler).toHaveBeenCalledTimes(17);
     h.sockets[0]?.emit('connect');
     for (let i = 0; i < 6; i += 1) await flush();
     expect(sent).toEqual([]);
@@ -657,6 +669,7 @@ describe('rs:state', () => {
       },
       entryUrl: APP_ENTRY_URL,
       logger,
+      settings: unusedSettings(logger),
       listRecipients: () => {
         throw new Error('no windows');
       },
@@ -776,9 +789,224 @@ describe('journal: rs:getLog and rs:log', () => {
   });
 });
 
-describe('the preload against the main process (window.rs)', () => {
-  it('exposes exactly the thirteen methods of the renderer API, each wired to a handled channel', async () => {
+const SERVICE_ORDER = [
+  'An asterisk (*) denotes that a network service is disabled.',
+  '(1) USB 10/100/1000 LAN',
+  '(Hardware Port: USB 10/100/1000 LAN, Device: en5)',
+  '',
+  '(2) Wi-Fi',
+  '(Hardware Port: Wi-Fi, Device: en0)',
+  '',
+  '(*) Thunderbolt Bridge',
+  '(Hardware Port: Thunderbolt Bridge, Device: bridge0)',
+  '',
+].join('\n');
+
+function fakeSettings(options: { order?: () => Promise<string>; setThrows?: Error } = {}) {
+  let openAtLogin = false;
+  const clipboard: string[] = [];
+  const set = vi.fn((value: boolean) => {
+    if (options.setThrows !== undefined) throw options.setThrows;
+    openAtLogin = value;
+  });
+  const listServiceOrder = vi.fn(options.order ?? (() => Promise.resolve(SERVICE_ORDER)));
+  const { logger } = memoryLogger();
+  const settings = createSettings({
+    loginItem: { get: () => openAtLogin, set },
+    listServiceOrder,
+    writeClipboard: (text) => {
+      clipboard.push(text);
+      return Promise.resolve();
+    },
+    logger,
+  });
+  return { settings, set, clipboard, listServiceOrder };
+}
+
+const WIFI_FIRST = "sudo networksetup -ordernetworkservices 'Wi-Fi' 'USB 10/100/1000 LAN' 'Thunderbolt Bridge'";
+
+describe('settings: login item', () => {
+  it('reads and sets the login item, answering the value read back', async () => {
+    const fake = fakeSettings();
+    const h = await setup({ settings: fake.settings });
+    expect(await h.call('rs:getSettings')).toEqual({ ok: true, value: { openAtLogin: false } });
+    expect(await h.call('rs:setOpenAtLogin', true)).toEqual({ ok: true, value: { openAtLogin: true } });
+    expect(fake.set).toHaveBeenCalledWith(true);
+    expect(await h.call('rs:getSettings')).toEqual({ ok: true, value: { openAtLogin: true } });
+    expect(h.sentAfterHandshake()).toEqual([]);
+  });
+
+  it.each([[[]], [['true']], [[1]], [[undefined]], [[true, true]]])('refuses %j', async (args) => {
+    const fake = fakeSettings();
+    const h = await setup({ settings: fake.settings });
+    expect(await h.call('rs:setOpenAtLogin', ...args)).toMatchObject({ ok: false, code: 'invalid-input' });
+    expect(fake.set).not.toHaveBeenCalled();
+  });
+
+  it('a failing system call answers internal and is logged', async () => {
+    const h = await setup({ settings: fakeSettings({ setThrows: new Error('no login items') }).settings });
+    expect(await h.call('rs:setOpenAtLogin', true)).toMatchObject({ ok: false, code: 'internal' });
+    expect(h.entries.some((entry) => entry.msg === 'A call failed unexpectedly' && entry['channel'] === 'rs:setOpenAtLogin')).toBe(
+      true,
+    );
+  });
+});
+
+describe('settings: interface overrides', () => {
+  it('stores the overrides with getConfig -> setConfig, keeping the rules', async () => {
     const h = await setup();
+    const rules = h.helper.config.rules;
+    const result = await h.call('rs:setIfaceOverrides', { ethernet: 'en7' });
+    expect(result.ok).toBe(true);
+    expect(h.helper.config.ifaceOverrides).toEqual({ ethernet: 'en7' });
+    expect(h.helper.config.rules).toEqual(rules);
+    expect(h.sentAfterHandshake()).toEqual(['getConfig', 'setConfig']);
+  });
+
+  it('an empty object removes every override', async () => {
+    const h = await setup({ config: { ...oneRuleConfig(), ifaceOverrides: { ethernet: 'en7', wifi: 'en0' } } });
+    expect((await h.call('rs:setIfaceOverrides', {})).ok).toBe(true);
+    expect(h.helper.config).not.toHaveProperty('ifaceOverrides');
+  });
+
+  it.each([
+    ['a device that is not en*', [{ ethernet: 'eth0' }]],
+    ['a path as a device', [{ ethernet: '../en0' }]],
+    ['an unknown role', [{ vpn: 'en1' }]],
+    ['undefined', [undefined]],
+    ['null', [null]],
+    ['a string', ['en5']],
+    ['no argument', []],
+    ['an extra argument', [{ ethernet: 'en5' }, 'x']],
+  ])('refuses %s with nothing sent', async (_name, args) => {
+    const h = await setup();
+    expect(await h.call('rs:setIfaceOverrides', ...args)).toMatchObject({ ok: false, code: 'invalid-input' });
+    expect(h.sentAfterHandshake()).toEqual([]);
+  });
+
+  it('is not-connected without a helper', async () => {
+    const h = await setup({ connect: false });
+    expect(await h.call('rs:setIfaceOverrides', { ethernet: 'en5' })).toMatchObject({ ok: false, code: 'not-connected' });
+  });
+
+  it('runs in the edit queue: overrides and rule edits made at the same time are all kept', async () => {
+    const h = await setup();
+    const handler = (channel: string): Handler => {
+      const found = h.ipcMain.handlers.get(channel);
+      if (found === undefined) throw new Error(`no handler for ${channel}`);
+      return found;
+    };
+    const calls = [
+      handler('rs:saveRule')(TRUSTED, newRule()),
+      handler('rs:setIfaceOverrides')(TRUSTED, { ethernet: 'en7' }),
+      handler('rs:saveRule')(TRUSTED, newRule({ id: OTHER_ID, target: '172.16.12.41' })),
+    ];
+    for (let i = 0; i < 40; i += 1) await flush();
+    const results = (await Promise.all(calls)) as RsResult<unknown>[];
+    expect(results.every((result) => result.ok)).toBe(true);
+    expect(h.sentAfterHandshake().filter((method) => method !== 'getConfig')).toEqual(['setConfig', 'setConfig', 'setConfig']);
+    expect(h.helper.config.ifaceOverrides).toEqual({ ethernet: 'en7' });
+    expect(h.helper.config.rules.map((rule) => rule.id)).toEqual([RULE_ID, NEW_ID, OTHER_ID]);
+  });
+});
+
+describe('settings: Wi-Fi first (shown, never run)', () => {
+  it('reads the order and builds the command with Wi-Fi first', async () => {
+    const fake = fakeSettings();
+    const h = await setup({ settings: fake.settings });
+    const result = await h.call('rs:getServiceOrder');
+    expect(result).toMatchObject({
+      ok: true,
+      value: { wifiService: 'Wi-Fi', wifiFirst: false, command: WIFI_FIRST },
+    });
+    expect(fake.clipboard).toEqual([]);
+    expect(h.sentAfterHandshake()).toEqual([]);
+  });
+
+  it("puts the service on the engine's Wi-Fi device first, whatever its port is called", async () => {
+    const order = [
+      '(1) LAN',
+      '(Hardware Port: USB 10/100/1000 LAN, Device: en5)',
+      '(2) Wi-Fi',
+      '(Hardware Port: Wi-Fi, Device: en0)',
+      '(3) Travel adapter',
+      '(Hardware Port: USB LAN, Device: en8)',
+    ].join('\n');
+    const base = engineState(1);
+    const state: EngineState = {
+      ...base,
+      interfaces: { ...base.interfaces, wifi: { device: 'en8', ip: '192.168.8.2', gateway: '192.168.8.1', up: true } },
+    };
+    const client: Pick<HelperClient, 'request' | 'snapshot' | 'onStatus' | 'onState' | 'onLog'> = {
+      request: () => Promise.reject(new Error('not used')),
+      snapshot: () => ({ status: { kind: 'connected', helperVersion: '0.1.0' }, state, config: null, configRevision: null }),
+      onStatus: () => () => undefined,
+      onState: () => () => undefined,
+      onLog: () => () => undefined,
+    };
+    const fake = fakeSettings({ order: () => Promise.resolve(order) });
+    const h = await setup({ client, settings: fake.settings });
+    expect(await h.call('rs:getServiceOrder')).toMatchObject({
+      ok: true,
+      value: { wifiService: 'Travel adapter', command: "sudo networksetup -ordernetworkservices 'Travel adapter' 'LAN' 'Wi-Fi'" },
+    });
+    expect((await h.call('rs:copyServiceOrderCommand')).ok).toBe(true);
+    expect(fake.clipboard).toEqual(["sudo networksetup -ordernetworkservices 'Travel adapter' 'LAN' 'Wi-Fi'"]);
+  });
+
+  it('copies the command it builds itself; the page sends no text', async () => {
+    const fake = fakeSettings();
+    const h = await setup({ settings: fake.settings });
+    expect((await h.call('rs:copyServiceOrderCommand')).ok).toBe(true);
+    expect(fake.clipboard).toEqual([WIFI_FIRST]);
+    expect(await h.call('rs:copyServiceOrderCommand', 'rm -rf ~')).toMatchObject({ ok: false, code: 'invalid-input' });
+    expect(fake.clipboard).toHaveLength(1);
+  });
+
+  it('an order that cannot be read is operation-failed and nothing is copied', async () => {
+    const fake = fakeSettings({ order: () => Promise.reject(new Error('ENOENT')) });
+    const h = await setup({ settings: fake.settings });
+    expect(await h.call('rs:getServiceOrder')).toMatchObject({ ok: false, code: 'operation-failed' });
+    expect(await h.call('rs:copyServiceOrderCommand')).toMatchObject({ ok: false, code: 'operation-failed' });
+    expect(fake.clipboard).toEqual([]);
+  });
+
+  it('is refused for another document', async () => {
+    const fake = fakeSettings();
+    const h = await setup({ settings: fake.settings });
+    const foreign: InvokeEvent = { senderFrame: { url: 'https://example.com/', parent: null } };
+    expect(await h.callAs(foreign, 'rs:copyServiceOrderCommand')).toMatchObject({ ok: false, code: 'forbidden' });
+    expect(await h.callAs(foreign, 'rs:uninstall')).toMatchObject({ ok: false, code: 'forbidden' });
+    expect(fake.listServiceOrder).not.toHaveBeenCalled();
+    expect(h.sentAfterHandshake()).toEqual([]);
+  });
+});
+
+describe('settings: uninstall the helper', () => {
+  it('sends uninstall and passes the success through', async () => {
+    const h = await setup();
+    h.helper.answerOnce.set('uninstall', (request) => ok(request.id, {}));
+    expect(await h.call('rs:uninstall')).toEqual({ ok: true, value: {} });
+    expect(h.sentAfterHandshake()).toEqual(['uninstall']);
+  });
+
+  it('a helper that cannot uninstall yet answers a normal error', async () => {
+    const h = await setup();
+    expect(await h.call('rs:uninstall')).toMatchObject({ ok: false, code: 'not-implemented' });
+  });
+
+  it('refuses arguments and needs a connection', async () => {
+    const h = await setup();
+    expect(await h.call('rs:uninstall', true)).toMatchObject({ ok: false, code: 'invalid-input' });
+    expect(h.sentAfterHandshake()).toEqual([]);
+    const offline = await setup({ connect: false });
+    expect(await offline.call('rs:uninstall')).toMatchObject({ ok: false, code: 'not-connected' });
+  });
+});
+
+describe('the preload against the main process (window.rs)', () => {
+  it('exposes exactly the nineteen methods of the renderer API, each wired to a handled channel', async () => {
+    const h = await setup({ settings: fakeSettings().settings });
     bridge.setInvokeTarget((channel, ...args) => {
       const handler = h.ipcMain.handlers.get(channel);
       if (handler === undefined) return Promise.reject(new Error(`No handler registered for '${channel}'`));
@@ -789,18 +1017,24 @@ describe('the preload against the main process (window.rs)', () => {
     expect(Object.keys(rs).sort()).toEqual(
       [
         'apply',
+        'copyServiceOrderCommand',
         'deleteRule',
         'exportConfig',
         'getConfig',
         'getLog',
+        'getServiceOrder',
+        'getSettings',
         'getState',
         'importConfig',
         'onLog',
         'onState',
         'saveRule',
         'setEnabled',
+        'setIfaceOverrides',
+        'setOpenAtLogin',
         'test',
         'toggleRule',
+        'uninstallHelper',
       ].sort(),
     );
 
@@ -819,6 +1053,12 @@ describe('the preload against the main process (window.rs)', () => {
     expect(await settle(rs.importConfig())).toMatchObject({ ok: false, code: 'not-implemented' });
     expect(await settle(rs.exportConfig())).toMatchObject({ ok: false, code: 'not-implemented' });
     expect(await settle(rs.getLog())).toEqual({ ok: true, value: [] });
+    expect(await settle(rs.getSettings())).toEqual({ ok: true, value: { openAtLogin: false } });
+    expect(await settle(rs.setOpenAtLogin(true))).toEqual({ ok: true, value: { openAtLogin: true } });
+    expect((await settle(rs.setIfaceOverrides({ ethernet: 'en7' }))).ok).toBe(true);
+    expect((await settle(rs.getServiceOrder())).ok).toBe(true);
+    expect((await settle(rs.copyServiceOrderCommand())).ok).toBe(true);
+    expect(await settle(rs.uninstallHelper())).toMatchObject({ ok: false, code: 'not-implemented' });
     expect(h.sentAfterHandshake().filter((method) => method !== 'getConfig')).toEqual([
       'setConfig',
       'setConfig',
@@ -826,6 +1066,8 @@ describe('the preload against the main process (window.rs)', () => {
       'setEnabled',
       'apply',
       'test',
+      'setConfig',
+      'uninstall',
     ]);
     bridge.setInvokeTarget(null);
   });

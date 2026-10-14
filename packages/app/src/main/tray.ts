@@ -12,6 +12,7 @@ import type { Menu, MenuItemConstructorOptions, NativeImage, Rectangle } from 'e
 import type { HelperClient, HelperStatus } from './helperClient';
 import { registerIpcHandlers, type IpcMainLike } from './ipc';
 import type { Logger } from './logger';
+import type { Settings } from './settings';
 import { createWindowManager, type CreateWindow, type WindowManagerDeps } from './windows';
 
 // ---------------------------------------------------------------------------
@@ -103,6 +104,8 @@ export interface ShellDeps {
   readonly activateApp: () => void;
   /** Ends the app (`app.quit()`); the helper keeps running. */
   readonly quit: () => void;
+  /** The login item and the network service order, for the settings screen's IPC calls. */
+  readonly settings: Settings;
   readonly logger: Logger;
   readonly now?: () => number;
 }
@@ -140,6 +143,7 @@ export function startShell(deps: ShellDeps, context: ShellContext): Shell {
     entryUrl: context.entryUrl,
     logger: deps.logger,
     listRecipients: windows.contents,
+    settings: deps.settings,
   });
 
   let appearance = INITIAL_APPEARANCE;

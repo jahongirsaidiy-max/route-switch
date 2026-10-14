@@ -44,6 +44,12 @@ describe('preload', () => {
     ['importConfig', [], 'rs:import'],
     ['exportConfig', [], 'rs:export'],
     ['getLog', [], 'rs:getLog'],
+    ['getSettings', [], 'rs:getSettings'],
+    ['setOpenAtLogin', [true], 'rs:setOpenAtLogin'],
+    ['setIfaceOverrides', [{ ethernet: 'en5' }], 'rs:setIfaceOverrides'],
+    ['getServiceOrder', [], 'rs:getServiceOrder'],
+    ['copyServiceOrderCommand', [], 'rs:copyServiceOrderCommand'],
+    ['uninstallHelper', [], 'rs:uninstall'],
   ] as const)('%s is a bare invoke on %s with the arguments unchanged', async (method, args, channel) => {
     const answer = { ok: true, value: method };
     electron.invoke.mockResolvedValueOnce(answer);

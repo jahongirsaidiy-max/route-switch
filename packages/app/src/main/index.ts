@@ -3,7 +3,7 @@ import { readFile, realpath } from 'node:fs/promises';
 import path from 'node:path';
 
 import { PATHS } from '@routeswitch/shared';
-import { app, BrowserWindow, ipcMain, Menu, nativeImage, protocol, screen, session, Tray } from 'electron';
+import { app, BrowserWindow, clipboard, ipcMain, Menu, nativeImage, protocol, screen, session, Tray } from 'electron';
 
 import trayActive1x from '../../resources/tray/trayActiveTemplate.png?asset';
 import trayActive2x from '../../resources/tray/trayActiveTemplate@2x.png?asset';
@@ -15,6 +15,7 @@ import { startApp } from './bootstrap';
 import { createDevelopmentRuntime } from './development';
 import { createHelperClient } from './helperClient';
 import { createJsonLinesSink, createLogger } from './logger';
+import { createSettings, listServiceOrderWithNetworksetup } from './settings';
 import { loadTrayImage, startShell } from './tray';
 
 const logger = createLogger({ sink: createJsonLinesSink((line) => process.stderr.write(line)) });
@@ -64,6 +65,17 @@ startApp({
         quit: () => {
           app.quit();
         },
+        settings: createSettings({
+          loginItem: {
+            get: () => app.getLoginItemSettings().openAtLogin,
+            set: (openAtLogin) => {
+              app.setLoginItemSettings({ openAtLogin });
+            },
+          },
+          listServiceOrder: listServiceOrderWithNetworksetup,
+          writeClipboard: (text) => clipboard.writeText(text),
+          logger,
+        }),
         logger,
       },
       context,

@@ -8,10 +8,12 @@ import type {
   EngineState,
   ErrorCode,
   EventLogLevel,
+  IfaceRole,
   RuleInput,
   SetConfigResult,
   StateResult,
   TestResult,
+  UninstallResult,
 } from '@routeswitch/shared';
 
 /**
@@ -54,6 +56,39 @@ export interface RsLogEntry {
   /** When the helper logged it (ISO 8601, UTC). */
   readonly at: string;
 }
+
+/** The app's own settings, kept by macOS rather than in the helper's config. */
+export interface RsSettings {
+  /** The app is a login item (`app.getLoginItemSettings().openAtLogin`). */
+  readonly openAtLogin: boolean;
+}
+
+/** One network service of `networksetup -listnetworkserviceorder`. */
+export interface RsNetworkService {
+  readonly name: string;
+  readonly hardwarePort: string | null;
+  readonly device: string | null;
+  /** Listed with `(*)`: switched off in System Settings. */
+  readonly enabled: boolean;
+}
+
+/**
+ * The network service order, read without root, and the command that would
+ * put Wi‑Fi first. The app never runs that command: it shows it, and copies it
+ * on request, for the user to run in Terminal.
+ */
+export interface RsServiceOrder {
+  readonly services: readonly RsNetworkService[];
+  /** The service of the Wi‑Fi adapter; null when there is none. */
+  readonly wifiService: string | null;
+  /** Wi‑Fi is already the first enabled service, i.e. the default channel. */
+  readonly wifiFirst: boolean;
+  /** `sudo networksetup -ordernetworkservices …` with every name shell-quoted; null without a Wi‑Fi service. */
+  readonly command: string | null;
+}
+
+/** Device overrides of the roles (`Config.ifaceOverrides`): a role without one is detected automatically. */
+export type RsIfaceOverrides = Partial<Record<IfaceRole, string>>;
 
 /**
  * Why a call did not produce a value.
@@ -130,6 +165,28 @@ export interface RsApi {
    * history already holds.
    */
   onLog(listener: (entry: RsLogEntry) => void): RsUnsubscribe;
+  /** The app's own settings. */
+  getSettings(): Promise<RsResult<RsSettings>>;
+  /** Adds or removes the app as a login item; the value is the setting read back afterwards. */
+  setOpenAtLogin(on: boolean): Promise<RsResult<RsSettings>>;
+  /**
+   * Replaces `Config.ifaceOverrides` (getConfig -> change -> setConfig, like a rule edit).
+   * `{}` removes every override; a device must be an `en*` name.
+   */
+  setIfaceOverrides(overrides: RsIfaceOverrides): Promise<RsResult<SetConfigResult>>;
+  /** The current network service order and the Wi‑Fi-first command. Read-only (`operation-failed` when it cannot be read). */
+  getServiceOrder(): Promise<RsResult<RsServiceOrder>>;
+  /**
+   * Puts the Wi‑Fi-first command on the clipboard. The main process builds it
+   * from a fresh read; the page passes no text. Nothing is run.
+   */
+  copyServiceOrderCommand(): Promise<RsResult<RsServiceOrder>>;
+  /**
+   * Asks the helper to remove every route and resolver file it applied, and
+   * itself (`uninstall`). On success the helper exits and the connection
+   * becomes `not-installed`. `disconnected` / `timeout` mean the outcome is unknown.
+   */
+  uninstallHelper(): Promise<RsResult<UninstallResult>>;
 }
 
 /** Channel -> arguments and value of the call behind it. Main and preload are typed against this table. */
@@ -145,6 +202,12 @@ export interface RsInvokeChannels {
   'rs:import': { readonly args: readonly []; readonly value: never };
   'rs:export': { readonly args: readonly []; readonly value: never };
   'rs:getLog': { readonly args: readonly []; readonly value: readonly RsLogEntry[] };
+  'rs:getSettings': { readonly args: readonly []; readonly value: RsSettings };
+  'rs:setOpenAtLogin': { readonly args: readonly [on: boolean]; readonly value: RsSettings };
+  'rs:setIfaceOverrides': { readonly args: readonly [overrides: RsIfaceOverrides]; readonly value: SetConfigResult };
+  'rs:getServiceOrder': { readonly args: readonly []; readonly value: RsServiceOrder };
+  'rs:copyServiceOrderCommand': { readonly args: readonly []; readonly value: RsServiceOrder };
+  'rs:uninstall': { readonly args: readonly []; readonly value: UninstallResult };
 }
 
 export type RsInvokeChannel = keyof RsInvokeChannels;

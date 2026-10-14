@@ -51,6 +51,12 @@ const api: RsApi = {
     };
   },
   getLog: () => invoke('rs:getLog'),
+  getSettings: () => invoke('rs:getSettings'),
+  setOpenAtLogin: (on) => invoke('rs:setOpenAtLogin', on),
+  setIfaceOverrides: (overrides) => invoke('rs:setIfaceOverrides', overrides),
+  getServiceOrder: () => invoke('rs:getServiceOrder'),
+  copyServiceOrderCommand: () => invoke('rs:copyServiceOrderCommand'),
+  uninstallHelper: () => invoke('rs:uninstall'),
   onLog: (listener) => {
     const forward = (_event: IpcRendererEvent, entry: RsLogEntry): void => {
       listener(entry);
