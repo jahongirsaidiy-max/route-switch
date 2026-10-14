@@ -6,6 +6,10 @@ import { createDevelopmentRuntime } from './development';
 import { createLogger } from './logger';
 import { APP_ENTRY_URL } from './runtime';
 import { fakeBrowserWindowClass } from './test-utils';
+import type { ShellContext } from './tray';
+import { POPOVER_LAYOUT } from './windows';
+
+const POPOVER_URL = `${APP_ENTRY_URL}?view=popover`;
 
 type Listener = (...args: unknown[]) => void;
 
@@ -20,6 +24,8 @@ interface Options {
   readonly proxyFails?: boolean;
   /** `setProxy` stays pending until `releaseProxy()` is called. */
   readonly holdProxy?: boolean;
+  /** `startShell` throws this. */
+  readonly shellFails?: Error;
 }
 
 function harness(options: Options = {}) {
@@ -114,6 +120,20 @@ function harness(options: Options = {}) {
     stop: vi.fn(() => order.push('helperClient.stop')),
   };
   const readFile = vi.fn(() => Promise.resolve(new Uint8Array(new TextEncoder().encode('<!doctype html>'))));
+  // Stands in for tray.ts: records its context and opens the popover at once,
+  // as a click on the tray icon would, so the window path is exercised too.
+  const shellFake = {
+    contexts: [] as ShellContext[],
+    showPopover: vi.fn(() => order.push('shell.showPopover')),
+    dispose: vi.fn(() => order.push('shell.dispose')),
+  };
+  const startShell = vi.fn((context: ShellContext) => {
+    order.push('startShell');
+    if (options.shellFails !== undefined) throw options.shellFails;
+    shellFake.contexts.push(context);
+    context.createWindow(POPOVER_LAYOUT, 'popover');
+    return { showPopover: shellFake.showPopover, dispose: shellFake.dispose };
+  });
 
   startApp({
     app,
@@ -129,6 +149,7 @@ function harness(options: Options = {}) {
     realpath: (filePath: string) => Promise.resolve(filePath),
     logger,
     helperClient,
+    startShell,
   } as unknown as BootstrapDeps);
 
   const emit = (event: string, ...args: unknown[]): void => {
@@ -146,6 +167,8 @@ function harness(options: Options = {}) {
     windows: fake.windows,
     report,
     helperClient,
+    menuBar: shellFake,
+    startShell,
     readFile,
     dockHide,
     order,
@@ -224,7 +247,7 @@ describe('startApp', () => {
       devTools: false,
       preload: '/opt/routeswitch/preload/index.cjs',
     });
-    expect(h.windows[0]?.loadURL.mock.calls).toEqual([[APP_ENTRY_URL]]);
+    expect(h.windows[0]?.loadURL.mock.calls).toEqual([[POPOVER_URL]]);
     expect(h.report).not.toHaveBeenCalled();
   });
 
@@ -250,6 +273,7 @@ describe('startApp', () => {
       'setProxy:default',
       'proxySet:default',
       'protocol.handle',
+      'startShell',
       'construct',
       'loadURL',
       'helperClient.start',
@@ -268,7 +292,14 @@ describe('startApp', () => {
 
     h.releaseProxy();
     await h.ready();
-    expect(h.order.slice(-5)).toEqual(['proxySet:default', 'protocol.handle', 'construct', 'loadURL', 'helperClient.start']);
+    expect(h.order.slice(-6)).toEqual([
+      'proxySet:default',
+      'protocol.handle',
+      'startShell',
+      'construct',
+      'loadURL',
+      'helperClient.start',
+    ]);
     expect(h.windows).toHaveLength(1);
     expect(h.session.setProxy).toHaveBeenCalledTimes(1);
     expect(h.report).not.toHaveBeenCalled();
@@ -298,7 +329,7 @@ describe('startApp', () => {
     expect(h.app.commandLine.appendSwitch).toHaveBeenCalledTimes(1);
   });
 
-  it('exits non-zero when a window had to be closed for leaving the app page', async () => {
+  it('stays alive when a window had to be closed for leaving the app page — the tray opens a new one', async () => {
     const h = harness();
     await h.ready();
     const window = h.windows[0];
@@ -308,10 +339,29 @@ describe('startApp', () => {
     }
     expect(window.destroy).toHaveBeenCalledTimes(1);
     expect(h.report.mock.calls.filter(([level]) => level === 'error')).toEqual([
-      ['error', 'A window kept leaving the app page and was closed', { detail: 'about:srcdoc' }],
+      ['error', 'A window kept leaving the app page and was closed', { url: 'about:srcdoc' }],
     ]);
-    expect(h.app.exit.mock.calls).toEqual([[1]]);
-    expect(window.destroy.mock.invocationCallOrder[0]).toBeLessThan(h.app.exit.mock.invocationCallOrder[0] ?? 0);
+    expect(h.app.exit).not.toHaveBeenCalled();
+    expect(h.app.quit).not.toHaveBeenCalled();
+    expect(h.helperClient.stop).not.toHaveBeenCalled();
+    // The factory still makes windows afterwards.
+    h.menuBar.contexts[0]?.createWindow(POPOVER_LAYOUT, 'popover');
+    expect(h.windows).toHaveLength(2);
+    expect(h.windows[1]?.loadURL.mock.calls).toEqual([[POPOVER_URL]]);
+  });
+
+  it('closes a window whose renderer ended, logs it and stays alive', async () => {
+    const h = harness();
+    await h.ready();
+    const window = h.windows[0];
+    if (window === undefined) throw new Error('expected a window');
+    window.emitContents('render-process-gone', {}, { reason: 'crashed', exitCode: 11 });
+    expect(window.destroy).toHaveBeenCalledTimes(1);
+    expect(h.report.mock.calls).toEqual([['error', 'The page of a window ended and the window was closed', { reason: 'crashed' }]]);
+    expect(h.app.exit).not.toHaveBeenCalled();
+    expect(h.app.quit).not.toHaveBeenCalled();
+    h.menuBar.contexts[0]?.createWindow(POPOVER_LAYOUT, 'popover');
+    expect(h.windows).toHaveLength(2);
   });
 
   it('cancels downloads and reports them', async () => {
@@ -368,7 +418,8 @@ describe('startApp', () => {
     await h.ready();
     expect(h.protocol.handle).not.toHaveBeenCalled();
     expect(h.session.webRequest.onHeadersReceived).toHaveBeenCalledTimes(1);
-    expect(h.windows[0]?.loadURL.mock.calls).toEqual([['http://localhost:5173/']]);
+    expect(h.windows[0]?.loadURL.mock.calls).toEqual([['http://localhost:5173/?view=popover']]);
+    expect(h.menuBar.contexts[0]?.entryUrl).toBe('http://localhost:5173/');
     expect(h.windows[0]?.options.webPreferences).toMatchObject({
       contextIsolation: true,
       nodeIntegration: false,
@@ -386,7 +437,7 @@ describe('startApp', () => {
     await h.ready();
     expect(h.protocol.handle).toHaveBeenCalledTimes(1);
     expect(h.session.webRequest.onHeadersReceived).not.toHaveBeenCalled();
-    expect(h.windows[0]?.loadURL.mock.calls).toEqual([[APP_ENTRY_URL]]);
+    expect(h.windows[0]?.loadURL.mock.calls).toEqual([[POPOVER_URL]]);
     expect(h.windows[0]?.options.webPreferences?.devTools).toBe(false);
   });
 
@@ -408,32 +459,39 @@ describe('startApp', () => {
     expect(contents.setWebRTCIPHandlingPolicy.mock.calls).toEqual([['disable_non_proxied_udp']]);
   });
 
-  it('brings the existing window forward when a second instance starts', async () => {
+  it('shows the popover when a second instance starts, without reading its command line', async () => {
     const h = harness();
+    h.emit('second-instance');
+    expect(h.menuBar.showPopover).not.toHaveBeenCalled();
     await h.ready();
-    const window = h.windows[0];
-    if (window === undefined) throw new Error('expected a window');
-
-    h.emit('second-instance');
-    expect(window.restore).not.toHaveBeenCalled();
-    expect(window.show).toHaveBeenCalledTimes(1);
-    expect(window.focus).toHaveBeenCalledTimes(1);
-
-    window.minimized = true;
-    h.emit('second-instance');
-    expect(window.restore).toHaveBeenCalledTimes(1);
-
-    window.emit('closed');
-    h.emit('second-instance');
-    expect(window.focus).toHaveBeenCalledTimes(2);
-    expect(h.windows).toHaveLength(1);
+    h.emit('second-instance', {}, ['--evil'], '/tmp');
+    expect(h.menuBar.showPopover).toHaveBeenCalledTimes(1);
+    expect(h.menuBar.showPopover.mock.calls[0]).toEqual([]);
   });
 
-  it('quits when the last window closes', async () => {
+  it('stays in the menu bar when the last window closes, and leaves the helper client alone', async () => {
     const h = harness();
     await h.ready();
     h.emit('window-all-closed');
-    expect(h.app.quit).toHaveBeenCalledTimes(1);
+    expect(h.app.quit).not.toHaveBeenCalled();
+    expect(h.app.exit).not.toHaveBeenCalled();
+    expect(h.helperClient.stop).not.toHaveBeenCalled();
+  });
+
+  it('starts the shell once, after the lockdown, with the window factory and the app page', async () => {
+    const h = harness();
+    await h.ready();
+    expect(h.startShell).toHaveBeenCalledTimes(1);
+    expect(h.menuBar.contexts[0]?.entryUrl).toBe(APP_ENTRY_URL);
+    expect(h.order.indexOf('startShell')).toBeGreaterThan(h.order.indexOf('proxySet:default'));
+  });
+
+  it('ends startup when the shell cannot start', async () => {
+    const h = harness({ shellFails: new Error('no tray') });
+    await h.ready();
+    expect(h.report.mock.calls).toEqual([['error', 'Startup failed', { detail: 'Error: no tray' }]]);
+    expect(h.app.exit.mock.calls).toEqual([[1]]);
+    expect(h.helperClient.start).not.toHaveBeenCalled();
   });
 
   it('reports a startup failure and exits non-zero', async () => {
@@ -468,12 +526,15 @@ describe('startApp', () => {
     expect(second.helperClient.start).not.toHaveBeenCalled();
   });
 
-  it('stops the helper client when the app quits', async () => {
+  it('takes the shell down and stops the helper client when the app quits', async () => {
     const h = harness();
     await h.ready();
     expect(h.helperClient.stop).not.toHaveBeenCalled();
     h.emit('will-quit');
-    expect(h.helperClient.stop).toHaveBeenCalledTimes(1);
+    expect(h.order.slice(-2)).toEqual(['shell.dispose', 'helperClient.stop']);
+    h.emit('will-quit');
+    expect(h.menuBar.dispose).toHaveBeenCalledTimes(1);
+    expect(h.helperClient.stop).toHaveBeenCalledTimes(2);
   });
 
   it('logs blocked requests under a budget: a page cannot fill the log', async () => {
@@ -489,7 +550,7 @@ describe('startApp', () => {
     expect(lines).toHaveLength(12);
   });
 
-  it('registers no IPC handlers and exposes nothing beyond the lifecycle events', async () => {
+  it('listens to nothing beyond the lifecycle events (IPC is the shell’s)', async () => {
     const h = harness();
     await h.ready();
     expect([...h.listeners.keys()].sort()).toEqual([

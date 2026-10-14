@@ -1,15 +1,30 @@
+import { readFileSync } from 'node:fs';
 import { readFile, realpath } from 'node:fs/promises';
 import path from 'node:path';
 
 import { PATHS } from '@routeswitch/shared';
-import { app, BrowserWindow, protocol, session } from 'electron';
+import { app, BrowserWindow, ipcMain, Menu, nativeImage, protocol, screen, session, Tray } from 'electron';
 
+import trayActive1x from '../../resources/tray/trayActiveTemplate.png?asset';
+import trayActive2x from '../../resources/tray/trayActiveTemplate@2x.png?asset';
+import trayError1x from '../../resources/tray/trayErrorTemplate.png?asset';
+import trayError2x from '../../resources/tray/trayErrorTemplate@2x.png?asset';
+import trayOff1x from '../../resources/tray/trayOffTemplate.png?asset';
+import trayOff2x from '../../resources/tray/trayOffTemplate@2x.png?asset';
 import { startApp } from './bootstrap';
 import { createDevelopmentRuntime } from './development';
 import { createHelperClient } from './helperClient';
 import { createJsonLinesSink, createLogger } from './logger';
+import { loadTrayImage, startShell } from './tray';
 
 const logger = createLogger({ sink: createJsonLinesSink((line) => process.stderr.write(line)) });
+
+// The socket path is a constant of the product: never taken from the
+// environment, a config file or the renderer.
+const helperClient = createHelperClient({
+  socketPath: PATHS.socket,
+  logger: logger.child({ component: 'helper-client' }),
+});
 
 startApp({
   app,
@@ -26,10 +41,32 @@ startApp({
   readFile,
   realpath,
   logger,
-  // The socket path is a constant of the product: never taken from the
-  // environment, a config file or the renderer.
-  helperClient: createHelperClient({
-    socketPath: PATHS.socket,
-    logger: logger.child({ component: 'helper-client' }),
-  }),
+  helperClient,
+  startShell: (context) => {
+    // Bundled next to the main process by electron-vite (`?asset`), so the
+    // paths hold in development and inside the packaged app alike.
+    const imageDeps = { createEmpty: () => nativeImage.createEmpty(), readFile: (file: string) => readFileSync(file) };
+    return startShell(
+      {
+        createTray: (image) => new Tray(image),
+        images: {
+          active: loadTrayImage(imageDeps, { x1: trayActive1x, x2: trayActive2x }),
+          off: loadTrayImage(imageDeps, { x1: trayOff1x, x2: trayOff2x }),
+          error: loadTrayImage(imageDeps, { x1: trayError1x, x2: trayError2x }),
+        },
+        buildMenu: (template) => Menu.buildFromTemplate(template),
+        ipcMain,
+        helperClient,
+        workAreaAt: (point) => screen.getDisplayNearestPoint(point).workArea,
+        activateApp: () => {
+          app.focus({ steal: true });
+        },
+        quit: () => {
+          app.quit();
+        },
+        logger,
+      },
+      context,
+    );
+  },
 });

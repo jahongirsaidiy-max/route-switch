@@ -10,6 +10,7 @@ import type { HelperClient } from './helperClient';
 import type { Logger } from './logger';
 import { APP_SCHEME, resolveRuntime, type RuntimeInputs } from './runtime';
 import { lockDownSession, lockDownWebContents } from './security';
+import type { Shell, ShellContext } from './tray';
 import { createWindowFactory } from './windows';
 
 export interface BootstrapDeps {
@@ -31,6 +32,11 @@ export interface BootstrapDeps {
   readonly logger: Logger;
   /** Connects to the helper in the background; a missing helper is not an error. */
   readonly helperClient: Pick<HelperClient, 'start' | 'stop'>;
+  /**
+   * Puts the app in the menu bar once it is ready: the tray icon, its windows
+   * and the IPC they use (`tray.ts`). Called once, before the helper client starts.
+   */
+  readonly startShell: (context: ShellContext) => Shell;
 }
 
 export function startApp(deps: BootstrapDeps): void {
@@ -38,6 +44,7 @@ export function startApp(deps: BootstrapDeps): void {
   // A web page can trigger these at will, so each kind has its own budget of lines.
   const blockedRequestLog = logger.limited('blocked-request');
   const blockedDownloadLog = logger.limited('blocked-download');
+  const windowLog = logger.limited('window-lost');
 
   if (!app.requestSingleInstanceLock()) {
     app.quit();
@@ -105,34 +112,31 @@ export function startApp(deps: BootstrapDeps): void {
     onForeignDocument: (url) => {
       logger.warn('A window left the app page and was sent back', { url });
     },
+    // The window is closed; the app stays in the menu bar and the tray opens a new one.
     onUnrecoverable: (url) => {
-      fatal('A window kept leaving the app page and was closed', url);
+      windowLog.error('A window kept leaving the app page and was closed', { url });
+    },
+    onRendererGone: (reason) => {
+      windowLog.error('The page of a window ended and the window was closed', { reason });
     },
   });
 
-  // The windows the tray opens (TASK-202) are created here, with `createWindow`.
-  let window: BrowserWindow | null = null;
-  const openWindow = (): void => {
-    window = createWindow({ width: 480, height: 320, title: 'RouteSwitch' });
-    window.on('closed', () => {
-      window = null;
-    });
-  };
+  let shell: Shell | null = null;
 
+  // A second launch shows the running app. Its command line is never read.
   app.on('second-instance', () => {
-    if (window === null) return;
-    if (window.isMinimized()) window.restore();
-    window.show();
-    window.focus();
+    shell?.showPopover();
   });
 
-  // Until the tray exists the window is the only way to reach the app, so
-  // closing it quits. With the tray (TASK-202) the app stays in the menu bar.
+  // A menu bar app: with its windows closed it stays in the menu bar (quitting
+  // is in the tray menu). Without a listener here Electron would quit.
   app.on('window-all-closed', () => {
-    app.quit();
+    logger.debug('All windows are closed; the app stays in the menu bar');
   });
 
   app.on('will-quit', () => {
+    shell?.dispose();
+    shell = null;
     deps.helperClient.stop();
   });
 
@@ -162,7 +166,7 @@ export function startApp(deps: BootstrapDeps): void {
         );
       }
 
-      openWindow();
+      shell = deps.startShell({ createWindow, entryUrl: runtime.entryUrl });
 
       // In the background: the window does not wait for the helper, and the
       // helper not being there is an ordinary state the UI shows.
