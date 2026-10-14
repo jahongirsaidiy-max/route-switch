@@ -22,8 +22,17 @@ import {
   type RuleInput,
 } from '@routeswitch/shared';
 
-import type { RsConnection, RsInvokeChannel, RsInvokeChannels, RsResult, RsSnapshot, RsStateChannel } from '../renderer/src/rs';
+import type {
+  RsConnection,
+  RsInvokeChannel,
+  RsInvokeChannels,
+  RsLogChannel,
+  RsResult,
+  RsSnapshot,
+  RsStateChannel,
+} from '../renderer/src/rs';
 import type { HelperClient, HelperStatus } from './helperClient';
+import { createLogBuffer, type LogBuffer } from './logBuffer';
 import type { Logger } from './logger';
 import { isAllowedNavigation } from './security';
 
@@ -32,6 +41,7 @@ import { isAllowedNavigation } from './security';
 const toConnection = (status: HelperStatus): RsConnection => status;
 
 export const STATE_CHANNEL: RsStateChannel = 'rs:state';
+export const LOG_CHANNEL: RsLogChannel = 'rs:log';
 
 /** The channels handled here, in the order of the renderer API. */
 export const INVOKE_CHANNELS = [
@@ -45,6 +55,7 @@ export const INVOKE_CHANNELS = [
   'rs:test',
   'rs:import',
   'rs:export',
+  'rs:getLog',
 ] as const satisfies readonly RsInvokeChannel[];
 
 /** The part of a `WebFrameMain` a call is checked against. */
@@ -64,7 +75,7 @@ export interface IpcMainLike {
   removeHandler(channel: string): void;
 }
 
-/** A renderer that may receive `rs:state` (the part of a `WebContents` used here). */
+/** A renderer that may receive `rs:state` and `rs:log` (the part of a `WebContents` used here). */
 export interface StateRecipient {
   isDestroyed(): boolean;
   getURL(): string;
@@ -73,12 +84,14 @@ export interface StateRecipient {
 
 export interface IpcDeps {
   readonly ipcMain: IpcMainLike;
-  readonly helperClient: Pick<HelperClient, 'request' | 'snapshot' | 'onStatus' | 'onState'>;
+  readonly helperClient: Pick<HelperClient, 'request' | 'snapshot' | 'onStatus' | 'onState' | 'onLog'>;
   /** The app's page (`Runtime.entryUrl`): the only document whose calls are answered. */
   readonly entryUrl: string;
   readonly logger: Logger;
-  /** The renderers to send `rs:state` to. Each is sent to only while it shows the app's page. */
+  /** The renderers to send `rs:state` and `rs:log` to. Each is sent to only while it shows the app's page. */
   readonly listRecipients: () => readonly StateRecipient[];
+  /** Where the helper's `log` events are kept for the journal; a new 500-entry buffer by default. */
+  readonly logBuffer?: LogBuffer;
 }
 
 export interface IpcRegistration {
@@ -145,6 +158,7 @@ const ARGUMENTS = {
   'rs:test': argumentsOf(TestTarget),
   'rs:import': argumentsOf(),
   'rs:export': argumentsOf(),
+  'rs:getLog': argumentsOf(),
 } as const satisfies Readonly<Record<RsInvokeChannel, ArgsParser<readonly unknown[]>>>;
 
 type ParsedArgs<C extends RsInvokeChannel> = (typeof ARGUMENTS)[C] extends ArgsParser<infer A> ? A : never;
@@ -175,6 +189,14 @@ export function registerIpcHandlers(deps: IpcDeps): IpcRegistration {
   const changeLog = logger.limited('ipc-change');
   const internalLog = logger.limited('ipc-internal');
   const pushLog = logger.limited('ipc-push-failed');
+  const journalLog = logger.limited('ipc-journal-failed');
+  const logBuffer =
+    deps.logBuffer ??
+    createLogBuffer({
+      onListenerError: (error) => {
+        journalLog.error('A journal listener failed', { detail: error });
+      },
+    });
 
   // Every call that changes something runs alone, in order of arrival. A rule
   // edit is read-modify-write over two requests; without this, two edits (or
@@ -239,6 +261,8 @@ export function registerIpcHandlers(deps: IpcDeps): IpcRegistration {
     // the main process. Until then the methods exist and say so.
     'rs:import': () => Promise.resolve(failure('not-implemented', 'Importing a config is not available yet (TASK-215)')),
     'rs:export': () => Promise.resolve(failure('not-implemented', 'Exporting the config is not available yet (TASK-215)')),
+    // From the main process's memory: no helper round trip, and it works while the helper is away.
+    'rs:getLog': () => Promise.resolve({ ok: true, value: logBuffer.entries() }),
   };
 
   const register = (channel: RsInvokeChannel): void => {
@@ -277,7 +301,30 @@ export function registerIpcHandlers(deps: IpcDeps): IpcRegistration {
 
   for (const channel of INVOKE_CHANNELS) register(channel);
 
-  // -- rs:state --------------------------------------------------------------
+  // -- pushes: rs:state, rs:log ----------------------------------------------
+
+  /** Sends to every window that shows the app's page; a failure is logged, never thrown into the sender. */
+  const PUSHED: Readonly<Record<RsStateChannel | RsLogChannel, string>> = {
+    'rs:state': 'the state',
+    'rs:log': 'a journal entry',
+  };
+  const broadcast = (channel: RsStateChannel | RsLogChannel, payload: unknown): void => {
+    let recipients: readonly StateRecipient[];
+    try {
+      recipients = deps.listRecipients();
+    } catch (error) {
+      pushLog.error(`Could not list the windows to send ${PUSHED[channel]} to`, { detail: error });
+      return;
+    }
+    for (const recipient of recipients) {
+      try {
+        if (recipient.isDestroyed() || !isAllowedNavigation(recipient.getURL(), entryUrl)) continue;
+        recipient.send(channel, payload);
+      } catch (error) {
+        pushLog.error(`Could not send ${PUSHED[channel]} to a window`, { detail: error });
+      }
+    }
+  };
 
   // On connect the client reports the status and then the same first state:
   // a snapshot identical to the last one sent is not sent again.
@@ -287,24 +334,20 @@ export function registerIpcHandlers(deps: IpcDeps): IpcRegistration {
     if (lastPushed !== null && lastPushed.status === status && lastPushed.state === state) return;
     lastPushed = { status, state };
     const snapshot: RsSnapshot = { connection: toConnection(status), state };
-    let recipients: readonly StateRecipient[];
-    try {
-      recipients = deps.listRecipients();
-    } catch (error) {
-      pushLog.error('Could not list the windows to send the state to', { detail: error });
-      return;
-    }
-    for (const recipient of recipients) {
-      try {
-        if (recipient.isDestroyed() || !isAllowedNavigation(recipient.getURL(), entryUrl)) continue;
-        recipient.send(STATE_CHANNEL, snapshot);
-      } catch (error) {
-        pushLog.error('Could not send the state to a window', { detail: error });
-      }
-    }
+    broadcast(STATE_CHANNEL, snapshot);
   };
 
-  const unsubscribes = [helperClient.onStatus(push), helperClient.onState(push)];
+  const unsubscribes = [
+    helperClient.onStatus(push),
+    helperClient.onState(push),
+    // Every `log` event of the helper goes into the journal, and from there to the open windows.
+    helperClient.onLog((event) => {
+      logBuffer.push(event);
+    }),
+    logBuffer.subscribe((entry) => {
+      broadcast(LOG_CHANNEL, entry);
+    }),
+  ];
 
   let disposed = false;
   return {

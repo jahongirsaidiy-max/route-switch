@@ -7,6 +7,7 @@ import type {
   Config,
   EngineState,
   ErrorCode,
+  EventLogLevel,
   RuleInput,
   SetConfigResult,
   StateResult,
@@ -42,6 +43,16 @@ export type RsConnection =
 export interface RsSnapshot {
   readonly connection: RsConnection;
   readonly state: EngineState | null;
+}
+
+/** One line of the journal: a `log` event of the helper, numbered by the main process. */
+export interface RsLogEntry {
+  /** 1 for the first entry of this app run, then +1 for each; never reused. Newer entries have higher numbers. */
+  readonly seq: number;
+  readonly level: EventLogLevel;
+  readonly msg: string;
+  /** When the helper logged it (ISO 8601, UTC). */
+  readonly at: string;
 }
 
 /**
@@ -107,6 +118,18 @@ export interface RsApi {
    * state changes. Nothing is replayed: subscribe first, then call `getState`.
    */
   onState(listener: (snapshot: RsSnapshot) => void): RsUnsubscribe;
+  /**
+   * The journal: the last 500 `log` events of the helper that the app received
+   * during this run, oldest first. Kept by the main process, so it includes
+   * events from before the window was opened.
+   */
+  getLog(): Promise<RsResult<readonly RsLogEntry[]>>;
+  /**
+   * Calls `listener` with every new journal entry. Nothing is replayed:
+   * subscribe first, then call `getLog`, and drop entries whose `seq` the
+   * history already holds.
+   */
+  onLog(listener: (entry: RsLogEntry) => void): RsUnsubscribe;
 }
 
 /** Channel -> arguments and value of the call behind it. Main and preload are typed against this table. */
@@ -121,12 +144,16 @@ export interface RsInvokeChannels {
   'rs:test': { readonly args: readonly [target: string]; readonly value: TestResult };
   'rs:import': { readonly args: readonly []; readonly value: never };
   'rs:export': { readonly args: readonly []; readonly value: never };
+  'rs:getLog': { readonly args: readonly []; readonly value: readonly RsLogEntry[] };
 }
 
 export type RsInvokeChannel = keyof RsInvokeChannels;
 
-/** The one channel the main process sends on: every new `RsSnapshot`. */
+/** The channel the main process sends every new `RsSnapshot` on. */
 export type RsStateChannel = 'rs:state';
+
+/** The channel the main process sends every new journal entry on. */
+export type RsLogChannel = 'rs:log';
 
 declare global {
   interface Window {

@@ -243,7 +243,7 @@ function shellHarness() {
   let snapshot: HelperSnapshot = { status: { kind: 'connecting' }, state: null, config: null, configRevision: null };
   const statusListeners = new Set<(status: HelperStatus) => void>();
   const stateListeners = new Set<(state: EngineState) => void>();
-  const helperClient: Pick<HelperClient, 'request' | 'snapshot' | 'onStatus' | 'onState'> = {
+  const helperClient: Pick<HelperClient, 'request' | 'snapshot' | 'onStatus' | 'onState' | 'onLog'> = {
     request: () => Promise.reject(new Error('not used')),
     snapshot: () => snapshot,
     onStatus: (listener) => {
@@ -254,6 +254,7 @@ function shellHarness() {
       stateListeners.add(listener);
       return () => stateListeners.delete(listener);
     },
+    onLog: () => () => undefined,
   };
   const setHelper = (status: HelperStatus, state: EngineState | null): void => {
     const statusChanged = status.kind !== snapshot.status.kind;

@@ -8,7 +8,16 @@
 
 import { contextBridge, ipcRenderer, type IpcRendererEvent } from 'electron';
 
-import type { RsApi, RsInvokeChannel, RsInvokeChannels, RsResult, RsSnapshot, RsStateChannel } from '../renderer/src/rs';
+import type {
+  RsApi,
+  RsInvokeChannel,
+  RsInvokeChannels,
+  RsLogChannel,
+  RsLogEntry,
+  RsResult,
+  RsSnapshot,
+  RsStateChannel,
+} from '../renderer/src/rs';
 
 const invoke = <C extends RsInvokeChannel>(
   channel: C,
@@ -18,6 +27,7 @@ const invoke = <C extends RsInvokeChannel>(
   ipcRenderer.invoke(channel, ...args) as Promise<RsResult<RsInvokeChannels[C]['value']>>;
 
 const STATE_CHANNEL: RsStateChannel = 'rs:state';
+const LOG_CHANNEL: RsLogChannel = 'rs:log';
 
 const api: RsApi = {
   getState: () => invoke('rs:getState'),
@@ -38,6 +48,16 @@ const api: RsApi = {
     ipcRenderer.on(STATE_CHANNEL, forward);
     return () => {
       ipcRenderer.removeListener(STATE_CHANNEL, forward);
+    };
+  },
+  getLog: () => invoke('rs:getLog'),
+  onLog: (listener) => {
+    const forward = (_event: IpcRendererEvent, entry: RsLogEntry): void => {
+      listener(entry);
+    };
+    ipcRenderer.on(LOG_CHANNEL, forward);
+    return () => {
+      ipcRenderer.removeListener(LOG_CHANNEL, forward);
     };
   },
 };

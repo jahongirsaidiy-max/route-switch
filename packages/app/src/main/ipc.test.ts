@@ -1,7 +1,7 @@
 import { LIMITS, type Config, type EngineState, type RuleInput } from '@routeswitch/shared';
 import { describe, expect, it, vi } from 'vitest';
 
-import type { RsApi, RsResult, RsSnapshot } from '../renderer/src/rs';
+import type { RsApi, RsLogEntry, RsResult, RsSnapshot } from '../renderer/src/rs';
 import { createHelperClient, type HelperClient } from './helperClient';
 import {
   engineState,
@@ -15,7 +15,8 @@ import {
   RULE_ID,
   statusResult,
 } from './helperClient.fixtures';
-import { INVOKE_CHANNELS, registerIpcHandlers, STATE_CHANNEL, type InvokeEvent, type StateRecipient } from './ipc';
+import { INVOKE_CHANNELS, LOG_CHANNEL, registerIpcHandlers, STATE_CHANNEL, type InvokeEvent, type StateRecipient } from './ipc';
+import { createLogBuffer, type LogBuffer } from './logBuffer';
 import { APP_ENTRY_URL } from './runtime';
 
 // ---------------------------------------------------------------------------
@@ -153,8 +154,9 @@ function attachHelper(socket: FakeSocket, helper: FakeHelper): void {
 interface SetupOptions {
   readonly connect?: boolean;
   readonly config?: Config;
-  readonly client?: Pick<HelperClient, 'request' | 'snapshot' | 'onStatus' | 'onState'>;
+  readonly client?: Pick<HelperClient, 'request' | 'snapshot' | 'onStatus' | 'onState' | 'onLog'>;
   readonly recipients?: StateRecipient[];
+  readonly logBuffer?: LogBuffer;
 }
 
 async function setup(options: SetupOptions = {}) {
@@ -188,6 +190,7 @@ async function setup(options: SetupOptions = {}) {
     entryUrl: APP_ENTRY_URL,
     logger,
     listRecipients: () => recipients,
+    ...(options.logBuffer === undefined ? {} : { logBuffer: options.logBuffer }),
   });
 
   if (options.client === undefined) {
@@ -236,10 +239,10 @@ const newRule = (extra: Partial<RuleInput> = {}): RuleInput => ({
 // ---------------------------------------------------------------------------
 
 describe('registration', () => {
-  it('handles exactly the ten invoke channels of the renderer API', async () => {
+  it('handles exactly the eleven invoke channels of the renderer API', async () => {
     const h = await setup({ connect: false });
     expect([...h.ipcMain.handlers.keys()].sort()).toEqual([...INVOKE_CHANNELS].sort());
-    expect(INVOKE_CHANNELS).toHaveLength(10);
+    expect(INVOKE_CHANNELS).toHaveLength(11);
   });
 
   it('dispose removes every handler and stops the state pushes; a second dispose does nothing', async () => {
@@ -250,7 +253,7 @@ describe('registration', () => {
     h.registration.dispose();
     h.registration.dispose();
     expect(h.ipcMain.handlers.size).toBe(0);
-    expect(h.ipcMain.removeHandler).toHaveBeenCalledTimes(10);
+    expect(h.ipcMain.removeHandler).toHaveBeenCalledTimes(11);
     h.sockets[0]?.emit('connect');
     for (let i = 0; i < 6; i += 1) await flush();
     expect(sent).toEqual([]);
@@ -456,11 +459,12 @@ describe('failures reach the renderer as values', () => {
   });
 
   it('a call that throws inside the main process answers internal and is logged', async () => {
-    const client: Pick<HelperClient, 'request' | 'snapshot' | 'onStatus' | 'onState'> = {
+    const client: Pick<HelperClient, 'request' | 'snapshot' | 'onStatus' | 'onState' | 'onLog'> = {
       request: () => Promise.reject(new Error('unexpected')),
       snapshot: () => ({ status: { kind: 'stopped' }, state: null, config: null, configRevision: null }),
       onStatus: () => () => undefined,
       onState: () => () => undefined,
+      onLog: () => () => undefined,
     };
     const h = await setup({ client });
     expect(await h.call('rs:apply')).toMatchObject({ ok: false, code: 'internal' });
@@ -505,6 +509,7 @@ describe('every argument is checked before anything reaches the helper', () => {
     ['arguments to a method that takes none', 'rs:apply', [true]],
     ['arguments to getState', 'rs:getState', [{}]],
     ['arguments to getConfig', 'rs:getConfig', ['x']],
+    ['arguments to getLog', 'rs:getLog', [500]],
   ];
 
   it.each(invalid)('%s is refused as invalid-input', async (_name, channel, args) => {
@@ -570,6 +575,14 @@ describe('only the app page is answered', () => {
     expect(result).toMatchObject({ ok: false, code: 'forbidden' });
     expect(h.sentAfterHandshake()).toEqual([]);
     expect(h.entries.some((entry) => entry.msg === 'Refused a call that did not come from the app page')).toBe(true);
+  });
+
+  it('the journal is not read for another document', async () => {
+    const h = await setup();
+    h.sockets[0]?.receive({ event: 'log', level: 'info', msg: 'secret-ish', at: '2026-01-02T03:04:05.000Z' });
+    const result = await h.callAs({ senderFrame: { url: 'https://example.com/', parent: null } }, 'rs:getLog');
+    expect(result).toMatchObject({ ok: false, code: 'forbidden' });
+    expect(JSON.stringify(result)).not.toContain('secret-ish');
   });
 
   it('the app page with a view in its query or fragment is answered', async () => {
@@ -640,6 +653,7 @@ describe('rs:state', () => {
           return () => undefined;
         },
         onState: () => () => undefined,
+        onLog: () => () => undefined,
       },
       entryUrl: APP_ENTRY_URL,
       logger,
@@ -653,8 +667,117 @@ describe('rs:state', () => {
   });
 });
 
+describe('journal: rs:getLog and rs:log', () => {
+  const AT = '2026-01-02T03:04:05.000Z';
+  const logLine = (msg: string, level: 'info' | 'warn' | 'error' = 'info') => ({ event: 'log', level, msg, at: AT });
+
+  const logRecipient = (url: string = APP_ENTRY_URL) => {
+    const entries: RsLogEntry[] = [];
+    const target: StateRecipient & { destroyed: boolean } = {
+      destroyed: false,
+      isDestroyed: () => target.destroyed,
+      getURL: () => url,
+      send: (channel, payload) => {
+        if (channel === LOG_CHANNEL) entries.push(payload as RsLogEntry);
+      },
+    };
+    return { target, entries };
+  };
+
+  it('keeps every log event of the helper, numbered, oldest first', async () => {
+    const h = await setup();
+    h.sockets[0]?.receive(logLine('Reconcile finished'));
+    h.sockets[0]?.receive(logLine('Route add failed', 'error'));
+    h.sockets[0]?.receive(logLine('Interface down', 'warn'));
+    expect(valueOf(await h.call('rs:getLog'))).toEqual([
+      { seq: 1, level: 'info', msg: 'Reconcile finished', at: AT },
+      { seq: 2, level: 'error', msg: 'Route add failed', at: AT },
+      { seq: 3, level: 'warn', msg: 'Interface down', at: AT },
+    ]);
+  });
+
+  it('answers from memory: the history stays readable while the helper is away', async () => {
+    const h = await setup();
+    h.sockets[0]?.receive(logLine('before the drop'));
+    h.sockets[0]?.emit('close');
+    await flush();
+    expect(h.client.snapshot().status.kind).not.toBe('connected');
+    expect(valueOf(await h.call('rs:getLog'))).toMatchObject([{ msg: 'before the drop' }]);
+  });
+
+  it('is empty before the first event', async () => {
+    const h = await setup({ connect: false });
+    expect(valueOf(await h.call('rs:getLog'))).toEqual([]);
+  });
+
+  it('keeps only the last 500 entries', async () => {
+    const h = await setup();
+    for (let i = 1; i <= 501; i += 1) h.sockets[0]?.receive(logLine(`line ${String(i)}`));
+    const log = valueOf(await h.call('rs:getLog')) as RsLogEntry[];
+    expect(log).toHaveLength(500);
+    expect(log[0]).toMatchObject({ seq: 2, msg: 'line 2' });
+    expect(log.at(-1)).toMatchObject({ seq: 501, msg: 'line 501' });
+  });
+
+  it('a log line the client refuses never reaches the journal', async () => {
+    const h = await setup();
+    h.sockets[0]?.receive({ event: 'log', level: 'fatal', msg: 'x', at: AT });
+    h.sockets[0]?.receive({ event: 'log', level: 'info', msg: 'x', at: 'yesterday' });
+    expect(valueOf(await h.call('rs:getLog'))).toEqual([]);
+  });
+
+  it('sends each new entry to the app windows only', async () => {
+    const app = logRecipient();
+    const foreign = logRecipient('https://example.com/');
+    const gone = logRecipient();
+    gone.target.destroyed = true;
+    const h = await setup({ recipients: [app.target, foreign.target, gone.target] });
+    h.sockets[0]?.receive(logLine('Reconcile finished'));
+    expect(app.entries).toEqual([{ seq: 1, level: 'info', msg: 'Reconcile finished', at: AT }]);
+    expect(foreign.entries).toEqual([]);
+    expect(gone.entries).toEqual([]);
+  });
+
+  it('a window that fails to receive is logged and the others still get the entry', async () => {
+    const app = logRecipient();
+    const broken: StateRecipient = {
+      isDestroyed: () => false,
+      getURL: () => APP_ENTRY_URL,
+      send: (channel) => {
+        if (channel === LOG_CHANNEL) throw new Error('Object has been destroyed');
+      },
+    };
+    const h = await setup({ recipients: [broken, app.target] });
+    h.sockets[0]?.receive(logLine('x'));
+    expect(app.entries).toHaveLength(1);
+    expect(h.entries.some((entry) => entry.level === 'error' && entry.msg === 'Could not send a journal entry to a window')).toBe(
+      true,
+    );
+  });
+
+  it('uses the buffer it is given', async () => {
+    const logBuffer = createLogBuffer({ capacity: 2, onListenerError: () => undefined });
+    logBuffer.push({ level: 'warn', msg: 'from before', at: AT });
+    const h = await setup({ logBuffer });
+    h.sockets[0]?.receive(logLine('a'));
+    h.sockets[0]?.receive(logLine('b'));
+    expect((valueOf(await h.call('rs:getLog')) as RsLogEntry[]).map((entry) => entry.msg)).toEqual(['a', 'b']);
+  });
+
+  it('dispose stops filling and sending the journal', async () => {
+    const app = logRecipient();
+    const logBuffer = createLogBuffer({ onListenerError: () => undefined });
+    const h = await setup({ recipients: [app.target], logBuffer });
+    h.registration.dispose();
+    h.sockets[0]?.receive(logLine('after dispose'));
+    expect(logBuffer.entries()).toEqual([]);
+    logBuffer.push({ level: 'info', msg: 'pushed directly', at: AT });
+    expect(app.entries).toEqual([]);
+  });
+});
+
 describe('the preload against the main process (window.rs)', () => {
-  it('exposes exactly the eleven methods of the renderer API, each wired to a handled channel', async () => {
+  it('exposes exactly the thirteen methods of the renderer API, each wired to a handled channel', async () => {
     const h = await setup();
     bridge.setInvokeTarget((channel, ...args) => {
       const handler = h.ipcMain.handlers.get(channel);
@@ -669,8 +792,10 @@ describe('the preload against the main process (window.rs)', () => {
         'deleteRule',
         'exportConfig',
         'getConfig',
+        'getLog',
         'getState',
         'importConfig',
+        'onLog',
         'onState',
         'saveRule',
         'setEnabled',
@@ -693,6 +818,7 @@ describe('the preload against the main process (window.rs)', () => {
     expect((await settle(rs.test('10.1.2.3'))).ok).toBe(true);
     expect(await settle(rs.importConfig())).toMatchObject({ ok: false, code: 'not-implemented' });
     expect(await settle(rs.exportConfig())).toMatchObject({ ok: false, code: 'not-implemented' });
+    expect(await settle(rs.getLog())).toEqual({ ok: true, value: [] });
     expect(h.sentAfterHandshake().filter((method) => method !== 'getConfig')).toEqual([
       'setConfig',
       'setConfig',

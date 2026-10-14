@@ -1,6 +1,6 @@
 import { beforeAll, describe, expect, it, vi } from 'vitest';
 
-import type { RsApi, RsSnapshot } from '../renderer/src/rs';
+import type { RsApi, RsLogEntry, RsSnapshot } from '../renderer/src/rs';
 
 const electron = vi.hoisted(() => ({
   exposed: new Map<string, unknown>(),
@@ -43,6 +43,7 @@ describe('preload', () => {
     ['test', ['10.1.2.3'], 'rs:test'],
     ['importConfig', [], 'rs:import'],
     ['exportConfig', [], 'rs:export'],
+    ['getLog', [], 'rs:getLog'],
   ] as const)('%s is a bare invoke on %s with the arguments unchanged', async (method, args, channel) => {
     const answer = { ok: true, value: method };
     electron.invoke.mockResolvedValueOnce(answer);
@@ -80,5 +81,20 @@ describe('preload', () => {
     expect(firstForward).not.toBe(secondForward);
     first();
     expect(electron.removeListener).toHaveBeenLastCalledWith('rs:state', firstForward);
+  });
+
+  it('onLog delivers the entry without the event object, and the returned function unsubscribes', () => {
+    const received: unknown[][] = [];
+    const unsubscribe = rs.onLog((...args: unknown[]) => {
+      received.push(args);
+    });
+    const [channel, forward] = electron.on.mock.lastCall ?? [];
+    expect(channel).toBe('rs:log');
+    const entry: RsLogEntry = { seq: 1, level: 'warn', msg: 'Interface down', at: '2026-01-02T03:04:05.000Z' };
+    forward?.({ sender: 'ipc-renderer-event' }, entry);
+    expect(received).toEqual([[entry]]);
+
+    unsubscribe();
+    expect(electron.removeListener).toHaveBeenCalledWith('rs:log', forward);
   });
 });

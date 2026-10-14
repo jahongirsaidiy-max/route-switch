@@ -98,7 +98,7 @@ export interface ShellDeps {
   readonly images: Readonly<Record<TrayIconKind, NativeImage>>;
   readonly buildMenu: (template: MenuItemConstructorOptions[]) => Menu;
   readonly ipcMain: IpcMainLike;
-  readonly helperClient: Pick<HelperClient, 'request' | 'snapshot' | 'onStatus' | 'onState'>;
+  readonly helperClient: Pick<HelperClient, 'request' | 'snapshot' | 'onStatus' | 'onState' | 'onLog'>;
   readonly workAreaAt: WindowManagerDeps['workAreaAt'];
   readonly activateApp: () => void;
   /** Ends the app (`app.quit()`); the helper keeps running. */
