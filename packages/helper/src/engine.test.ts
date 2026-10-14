@@ -5,6 +5,8 @@ import {
   DEGRADED_ACCEPT_AFTER,
   DNS_LOSS_GRACE,
   MAX_EXCLUDED_DNS_PER_ROLE,
+  MAX_EXCLUDED_DNS_SERVERS,
+  MAX_EXCLUDED_OTHER_DNS,
   REFUSAL_RETRY_REASONS,
   buildEngineState,
   createEngine,
@@ -3827,6 +3829,117 @@ describe('DNS servers of the interfaces', () => {
       '203.0.113.1',
       '203.0.113.99',
     ]);
+  });
+
+  it('always excludes the Wi-Fi servers it asks too, whatever the untrusted detections push out (QA verdict 3)', async () => {
+    const others = Array.from({ length: MAX_EXCLUDED_DNS_PER_ROLE + 4 }, (_unused, index) =>
+      withDns({ ethernet: ['10.20.0.10'], wifi: [`10.99.0.${String(index + 1)}`] }, DEGRADED),
+    );
+    const viaWifi = rule(6, 'domain', 'other.corp.local', 'wifi');
+
+    const { contexts } = await through(
+      [withDns({ ethernet: ['10.20.0.10'], wifi: ['10.88.0.53'] }), ...others],
+      [viaWifi],
+    );
+
+    expect(contexts.every((context) => context.dnsServers?.join() === '10.88.0.53')).toBe(true);
+    expect(contexts.every((context) => context.interfaceDnsServers.includes('10.88.0.53'))).toBe(true);
+    expect(contexts.at(-1)?.interfaceDnsServers).toEqual([
+      '10.20.0.10',
+      '10.88.0.53',
+      ...Array.from({ length: MAX_EXCLUDED_DNS_PER_ROLE }, (_unused, index) => `10.99.0.${String(index + 5)}`),
+    ]);
+  });
+
+  describe('the other DNS servers of the system (supplemental resolvers, other interfaces)', () => {
+    const withOther = (other: readonly string[] | null | undefined, extra: Partial<DetectedInterfaces> = {}): DetectedInterfaces => ({
+      ...withDns(SERVERS, extra),
+      ...(other === undefined ? {} : { otherDnsServers: other }),
+    });
+
+    it('excludes them after the servers of the roles, and never asks them', async () => {
+      const { contexts } = await through([withOther(['10.30.0.53', '10.30.0.54'])]);
+
+      expect(contexts).toEqual([
+        { dnsServers: ['10.20.0.10'], interfaceDnsServers: ['10.20.0.10', '192.168.1.1', '10.30.0.53', '10.30.0.54'] },
+      ]);
+    });
+
+    it('lets a clean detection replace them, while an untrusted one only adds, the one not reported for longest going first', async () => {
+      const { contexts } = await through([
+        withOther(['10.30.0.53']),
+        withOther(['10.30.0.54'], DEGRADED),
+        withOther(['10.30.0.53'], DEGRADED),
+        // `null`: the configuration could not be read; what was known stays.
+        withOther(null, DEGRADED),
+        withOther(['10.30.0.55']),
+      ]);
+
+      expect(contexts.map((context) => context.interfaceDnsServers.slice(2))).toEqual([
+        ['10.30.0.53'],
+        ['10.30.0.53', '10.30.0.54'],
+        ['10.30.0.54', '10.30.0.53'],
+        ['10.30.0.54', '10.30.0.53'],
+        ['10.30.0.55'],
+      ]);
+      expect(contexts.every((context) => context.dnsServers?.join() === '10.20.0.10')).toBe(true);
+    });
+
+    it('remembers at most MAX_EXCLUDED_OTHER_DNS of them', async () => {
+      const many = (from: number): string[] => Array.from({ length: 20 }, (_unused, index) => `10.40.${String(from)}.${String(index + 1)}`);
+      const { contexts } = await through([
+        withOther(Array.from({ length: MAX_EXCLUDED_OTHER_DNS + 5 }, (_unused, index) => `10.40.0.${String(index + 1)}`)),
+        withOther(many(1), DEGRADED),
+        withOther(many(2), DEGRADED),
+      ]);
+
+      expect(MAX_EXCLUDED_OTHER_DNS).toBe(32);
+      expect(contexts[0]?.interfaceDnsServers.slice(2)).toHaveLength(MAX_EXCLUDED_OTHER_DNS);
+      expect(contexts.at(-1)?.interfaceDnsServers.slice(2)).toEqual([...many(1).slice(-12), ...many(2)]);
+    });
+
+    it('forgets them with the last domain rule', async () => {
+      const { contexts, resolveDomain } = recording();
+      const netinfo = createFakeNetInfo(withOther(['10.30.0.53']), network(), withDns({ ethernet: [], wifi: [] }, DEGRADED));
+      const h = setup(config([DOMAIN_RULE]), { netinfo, deps: { resolveDomain } });
+      await h.run();
+      h.engine.setConfig(config([HOST]));
+      await h.run('config-change');
+      h.engine.setConfig(config([DOMAIN_RULE]));
+      await h.run('config-change');
+
+      expect(contexts.at(-1)?.interfaceDnsServers).toEqual([]);
+    });
+
+    it('keeps the whole list within what the DNS module reads, the servers asked first, whatever the NetInfo reports', async () => {
+      const range = (prefix: string, length: number): string[] =>
+        Array.from({ length }, (_unused, index) => `${prefix}.${String(index + 1)}`);
+      const trustedEth = range('10.1.0', 12);
+      const trustedWifi = range('10.2.0', 12);
+      const { contexts } = await through(
+        [
+          withOther(range('10.5.0', 40), {}),
+          ...Array.from({ length: 10 }, (_unused, index) =>
+            withOther(range(`10.6.${String(index)}`, 40), { degraded: true }),
+          ),
+        ].map((detection, index) =>
+          index === 0
+            ? { ...detection, dnsServers: { ethernet: trustedEth, wifi: trustedWifi } }
+            : { ...detection, dnsServers: { ethernet: range(`10.3.${String(index)}`, 12), wifi: range(`10.4.${String(index)}`, 12) } },
+        ),
+        [DOMAIN_RULE, rule(6, 'domain', 'other.corp.local', 'wifi')],
+      );
+
+      expect(MAX_EXCLUDED_DNS_SERVERS).toBe(64);
+      for (const context of contexts) {
+        expect(context.interfaceDnsServers.length).toBeLessThanOrEqual(MAX_EXCLUDED_DNS_SERVERS);
+        // What is asked is excluded, and comes before anything else.
+        for (const server of context.dnsServers ?? []) expect(context.interfaceDnsServers).toContain(server);
+      }
+      const last = contexts.at(-1)?.interfaceDnsServers ?? [];
+      expect(last).toHaveLength(MAX_EXCLUDED_DNS_SERVERS);
+      expect(last.slice(0, MAX_EXCLUDED_DNS_PER_ROLE)).toEqual(trustedEth.slice(0, MAX_EXCLUDED_DNS_PER_ROLE));
+    });
   });
 
   it('forgets everything when the last enabled domain rule goes, instead of keeping it stale', async () => {

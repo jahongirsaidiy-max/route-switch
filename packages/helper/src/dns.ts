@@ -11,7 +11,7 @@ import {
   type RuleReasonCode,
 } from '@routeswitch/shared';
 
-import type { DomainContext, DomainTargets } from './engine';
+import { MAX_EXCLUDED_DNS_SERVERS, type DomainContext, type DomainTargets } from './engine';
 import type { Logger } from './logger';
 
 /**
@@ -39,8 +39,10 @@ import type { Logger } from './logger';
  *
  * Which server is asked:
  * - a rule with `dns`: that server;
- * - a rule without: the DNS server of the interface that plays the rule's
- *   role, as the engine passes it in from the last trusted detection. With
+ * - a rule without: the DNS servers of the interface that plays the rule's
+ *   role (from `scutil --dns`: the lease's servers or those set by hand), as
+ *   the engine passes them in from the last trusted detection, in order — the
+ *   resolver falls back to the next one when a server does not answer. With
  *   two interfaces up, the system resolvers are those of the primary service
  *   only, so an internal name bound to the other role would get NXDOMAIN or
  *   the public half of a split-horizon answer;
@@ -48,7 +50,8 @@ import type { Logger } from './logger';
  *   warning per rule.
  * The query to an interface's server leaves through that interface only when
  * the server is inside its connected subnet. No route is added for it here:
- * its address came from DHCP and was checked for syntax only. A server
+ * its address came from the system's configuration (DHCP) and was checked for
+ * syntax only. A server
  * elsewhere is reached through the default route, or not at all; the failure
  * then says to set `dns` in the rule, which is the case scoped DNS handles.
  *
@@ -126,7 +129,7 @@ const MAX_BACKOFF_DOUBLINGS = 16;
 const MAX_IPV4_TEXT_LENGTH = 15;
 /** Servers one lookup is pointed at; a longer list from an interface is cut. */
 const MAX_SERVERS_PER_LOOKUP = 4;
-/** DNS-server addresses taken from the system resolver list or from the interfaces. */
+/** DNS-server addresses taken from the system resolver list, and the least read of any other list. */
 const MAX_LISTED_SERVERS = 64;
 /** A domain is shortened to this in a `reason`, so that what follows it still fits. */
 const REASON_NAME_LENGTH = 80;
@@ -404,7 +407,7 @@ const resolving = (reason: string): DomainTargets => ({
 /** Usable, distinct server addresses out of a list that came from somewhere else; at most `limit`. */
 const usableServers = (list: unknown, limit: number): string[] => {
   if (!Array.isArray(list)) return [];
-  const candidates: readonly unknown[] = list.slice(0, MAX_LISTED_SERVERS);
+  const candidates: readonly unknown[] = list.slice(0, Math.max(limit, MAX_LISTED_SERVERS));
   const servers: string[] = [];
   for (const candidate of candidates) {
     const server =
@@ -1203,7 +1206,8 @@ export const createDomainResolver = (deps: DomainResolverDeps): DomainResolverSe
   };
 
   const noteInterfaces = (context: DomainContext): void => {
-    const servers = usableServers(context.interfaceDnsServers, MAX_LISTED_SERVERS);
+    // As long as the engine makes it: a server cut off here would be routed.
+    const servers = usableServers(context.interfaceDnsServers, MAX_EXCLUDED_DNS_SERVERS);
     if (sameList(servers, interfaceDns)) return;
     interfaceDns = servers;
     excluded = null;

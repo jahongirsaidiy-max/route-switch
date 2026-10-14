@@ -24,7 +24,12 @@ import {
   type DomainResolverService,
 } from './dns';
 import { createFakeDns, createFakeScheduler, dnsError, flush, type FakeDns, type FakeScheduler } from './dns-test-utils';
-import { createEngine, MAX_EXCLUDED_DNS_PER_ROLE, type DomainContext, type DomainResolver, type Engine, type ReconcileOutcome } from './engine';
+import {
+  createEngine,
+  MAX_EXCLUDED_DNS_PER_ROLE,
+  MAX_EXCLUDED_DNS_SERVERS,
+  MAX_EXCLUDED_OTHER_DNS,
+  type DomainContext, type DomainResolver, type Engine, type ReconcileOutcome } from './engine';
 import { createLogger, createMemorySink, type LogEntry } from './logger';
 import type { DetectedInterfaces, InterfaceInfo, NetInfo } from './netinfo';
 import type { RouteAddRequest, RouteAddResult, RouteDeleteRequest, RouteDeleteResult } from './route';
@@ -2818,6 +2823,99 @@ describe('the DNS servers of the interfaces are never routed from an answer', ()
     expect(calls.filter((call) => call.startsWith('add 10.20.9.53'))).toEqual([]);
     expect(stateOf(outcome)).toMatchObject({ reasonCode: 'forbidden-destination' });
     expect(stateOf(outcome).appliedDestinations).not.toContain('10.20.9.53');
+  });
+});
+
+describe('every DNS server of the system (scutil --dns)', () => {
+  const viaEthernet = domainRule(5, 'a.corp.local');
+
+  it('asks all servers of the interface in order and never routes a server of a supplemental resolver', async () => {
+    const network = {
+      current: {
+        ...NETWORK,
+        dnsServers: { ethernet: ['10.20.0.10', '10.20.0.11'], wifi: ['192.168.1.1'] },
+        otherDnsServers: ['10.30.0.53', '10.30.0.54'],
+      } satisfies DetectedInterfaces,
+    };
+    const h = withEngine([viaEthernet], { network });
+    h.dns.auto = () => ['10.30.0.54', '10.20.0.11', '172.16.12.40'];
+
+    await h.engine.reconcile('startup');
+    await flush();
+    const outcome = await h.settle();
+
+    // Both servers, in order: the resolver falls back to the second one when the first does not answer.
+    expect(h.dns.lookups.map((lookup) => lookup.servers)).toEqual([['10.20.0.10', '10.20.0.11']]);
+    expect(h.take()).toEqual([`add 172.16.12.40 ${ETH_GW}`]);
+    expect(stateOf(outcome)).toMatchObject({
+      reasonCode: 'forbidden-destination',
+      reason: '2 resolved addresses of a.corp.local must never be routed (dns-server: 2)',
+      appliedDestinations: ['172.16.12.40'],
+    });
+  });
+});
+
+describe('the whole exclusion list is read (TASK-DELTA-06 QA verdict 1)', () => {
+  const range = (prefix: string, length: number): string[] =>
+    Array.from({ length }, (_unused, index) => `${prefix}.${String(index + 1)}`);
+
+  it('never routes the last server of the longest list the engine makes', async () => {
+    const viaEthernet = domainRule(5, 'a.corp.local');
+    const viaWifi = domainRule(6, 'b.corp.local', { iface: 'wifi' });
+    const OTHERS = range('10.5.0', MAX_EXCLUDED_OTHER_DNS);
+    const LAST = OTHERS.at(-1) ?? '';
+    // A clean detection: 8 servers per role (asked) and 32 others ...
+    const network = {
+      current: {
+        ...NETWORK,
+        dnsServers: { ethernet: range('10.1.0', MAX_EXCLUDED_DNS_PER_ROLE), wifi: range('10.2.0', MAX_EXCLUDED_DNS_PER_ROLE) },
+        otherDnsServers: OTHERS,
+      } satisfies DetectedInterfaces as DetectedInterfaces,
+    };
+    const contexts: DomainContext[] = [];
+    const h = withEngine([viaEthernet, viaWifi], {
+      network,
+      wrap: (service) => (rule, context) => {
+        contexts.push(context);
+        return service.resolveDomain(rule, context);
+      },
+    });
+    const answers = new Map<string, readonly string[]>([
+      ['a.corp.local', ['172.16.12.40']],
+      ['b.corp.local', ['172.16.12.50']],
+    ]);
+    h.dns.auto = (hostname) => answers.get(hostname);
+    await h.engine.reconcile('startup');
+    await flush();
+    await h.settle();
+    h.take();
+
+    // ... then untrusted ones that report 8 more per role and cannot read the rest: remembered on top.
+    for (let pass = 0; pass < 3; pass += 1) {
+      network.current = {
+        ...NETWORK,
+        degraded: true,
+        dnsServers: { ethernet: range('10.3.0', MAX_EXCLUDED_DNS_PER_ROLE), wifi: range('10.4.0', MAX_EXCLUDED_DNS_PER_ROLE) },
+        otherDnsServers: null,
+      };
+      await h.engine.reconcile('network-change');
+    }
+    h.take();
+    const list = contexts.at(-1)?.interfaceDnsServers ?? [];
+    expect(list).toHaveLength(MAX_EXCLUDED_DNS_SERVERS);
+    expect(list.at(-1)).toBe(LAST);
+
+    // The answer names the 64th server: it is excluded, the other address is routed.
+    answers.set('a.corp.local', [LAST, '198.51.100.7']);
+    h.scheduler.advance(REFRESH_MS);
+    await flush();
+    const outcome = await h.settle();
+
+    const calls = h.take();
+    expect(calls).toContain(`add 198.51.100.7 ${ETH_GW}`);
+    expect(calls.filter((call) => call.includes(LAST))).toEqual([]);
+    expect(stateOf(outcome)).toMatchObject({ reasonCode: 'forbidden-destination' });
+    expect(stateOf(outcome).appliedDestinations).not.toContain(LAST);
   });
 });
 

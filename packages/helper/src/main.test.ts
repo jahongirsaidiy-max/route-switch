@@ -13,6 +13,7 @@ import { createFakeCommandRunner, type FakeCommandResponse, type FakeCommandRunn
 const ROUTE = '/sbin/route';
 const NETWORKSETUP = '/usr/sbin/networksetup';
 const IPCONFIG = '/usr/sbin/ipconfig';
+const SCUTIL = '/usr/sbin/scutil';
 const ETH_GW = '10.20.4.1';
 const NOW = new Date('2026-10-12T08:30:00.000Z');
 
@@ -39,6 +40,23 @@ const CONFIG = {
 
 const NO_VALUE: FakeCommandResponse = { exitCode: 1 };
 
+/** A `scutil --dns` output with one scoped default resolver per device (in the shape scutil prints). */
+const scutilDns = (servers: Readonly<Record<string, readonly string[]>>): FakeCommandResponse => ({
+  stdout: [
+    'DNS configuration',
+    '',
+    'DNS configuration (for scoped queries)',
+    '',
+    ...Object.entries(servers).flatMap(([device, list], index) => [
+      `resolver #${String(index + 1)}`,
+      ...list.map((server, position) => `  nameserver[${String(position)}] : ${server}`),
+      `  if_index : ${String(index + 4)} (${device})`,
+      '  flags    : Scoped, Request A records',
+      '',
+    ]),
+  ].join('\n'),
+});
+
 /** A machine with Ethernet (en5) and Wi-Fi (en0) both connected; every `route` call succeeds. */
 const machine = (): FakeCommandRunner => {
   const runner = createFakeCommandRunner();
@@ -46,6 +64,8 @@ const machine = (): FakeCommandRunner => {
     if (bin === ROUTE) return {};
     if (bin === NETWORKSETUP) return { stdout: PORTS };
     if (bin === '/usr/sbin/netstat') return { stdout: 'Routing tables\n\nInternet:\nDestination        Gateway            Flags               Netif Expire\n' };
+    // No DNS server anywhere unless a test says otherwise.
+    if (bin === SCUTIL) return scutilDns({});
     if (bin !== IPCONFIG) return undefined;
     const wifi = args[1] === 'en0';
     if (args[0] === 'getifaddr') return { stdout: wifi ? '192.168.1.23\n' : '10.20.4.23\n' };
@@ -614,9 +634,8 @@ describe('run --once: domain rules', () => {
   // The DNS server of the interface, config changes, QA gaps of TASK-110
   // -------------------------------------------------------------------------
 
-  const DNS_OPTION = 'domain_name_server';
   const dnsArgv = (h: Harness): (readonly string[])[] =>
-    h.runner.calls.filter((call) => call.bin === IPCONFIG && call.args[2] === DNS_OPTION).map((call) => call.args);
+    h.runner.calls.filter((call) => call.bin === SCUTIL).map((call) => call.args);
 
   it('never looks up the DNS servers of the interfaces for a config without an enabled domain rule', async () => {
     const files: unknown[] = [
@@ -638,13 +657,13 @@ describe('run --once: domain rules', () => {
   it('looks them up for a rule that names its own server too, to keep them out of its answers (QA scenario i)', async () => {
     // One domain rule WITH `dns`, bound to Wi-Fi; the answer contains the DHCP DNS server of Ethernet.
     const h = harness({ version: 1, rules: [{ ...DOMAIN_CONFIG.rules[0], iface: 'wifi', dns: '198.51.100.53' }] });
-    h.runner.when(IPCONFIG, ['getoption', 'en5', DNS_OPTION], { stdout: '10.20.4.53\n' });
-    h.runner.when(IPCONFIG, ['getoption', 'en0', DNS_OPTION], { stdout: '192.168.1.1\n' });
+    h.runner.when(SCUTIL, ['--dns'], scutilDns({ en5: ['10.20.4.53'], en0: ['192.168.1.1'] }));
     h.dns.auto = () => ['10.20.4.53', '198.51.100.20'];
 
     const code = await run(['--once'], h.deps);
 
-    expect(dnsArgv(h).map((args) => args[1]).sort()).toEqual(['en0', 'en5']);
+    // Two passes, one cached detection: one command.
+    expect(dnsArgv(h)).toEqual([['--dns']]);
     expect(h.dns.lookups.map((lookup) => lookup.servers)).toEqual([['198.51.100.53']]);
     // The real route wrapper on the fake runner: no argv carries the address of a DNS server.
     expect(h.routeArgv()).toEqual([['-n', 'add', '-host', '198.51.100.20', '192.168.1.1']]);
@@ -657,10 +676,9 @@ describe('run --once: domain rules', () => {
     });
   });
 
-  it('does not hold explicit rules back when the DNS server of an interface cannot be looked up', async () => {
+  it('does not hold explicit rules back when the DNS servers cannot be looked up', async () => {
     const h = harness(DOMAIN_CONFIG);
-    h.runner.when(IPCONFIG, ['getoption', 'en5', DNS_OPTION], { failure: 'timeout' });
-    h.runner.when(IPCONFIG, ['getoption', 'en0', DNS_OPTION], { stdout: '192.168.1.1\n' });
+    h.runner.when(SCUTIL, ['--dns'], { failure: 'timeout' });
     h.dns.auto = () => ['198.51.100.20'];
 
     const code = await run(['--once'], h.deps);
@@ -676,18 +694,17 @@ describe('run --once: domain rules', () => {
     expect(h.logs().filter((entry) => entry['msg'] === 'no DNS server is known for the interface of the rule; the system resolvers are asked')).toHaveLength(1);
   });
 
-  it('asks the DNS server of the interface the rule is bound to, with one more command per connected role', async () => {
+  it('asks the DNS servers of the interface the rule is bound to, in order, with one more command per detection', async () => {
     const h = harness(DOMAIN_CONFIG);
-    h.runner.when(IPCONFIG, ['getoption', 'en5', DNS_OPTION], { stdout: '10.20.0.10\n' });
-    h.runner.when(IPCONFIG, ['getoption', 'en0', DNS_OPTION], { stdout: '192.168.1.1\n' });
+    h.runner.when(SCUTIL, ['--dns'], scutilDns({ en5: ['10.20.0.10', '10.20.0.11'], en0: ['192.168.1.1'] }));
     // The answer names the Wi-Fi resolver as well: it is not routed through Ethernet.
     h.dns.auto = () => ['198.51.100.20', '192.168.1.1'];
 
     const code = await run(['--once'], h.deps);
 
-    expect(h.dns.lookups.map((lookup) => [lookup.hostname, lookup.servers])).toEqual([['corp.local', ['10.20.0.10']]]);
-    // Two passes, one cached detection: each role asked once.
-    expect(dnsArgv(h).map((args) => args[1]).sort()).toEqual(['en0', 'en5']);
+    expect(h.dns.lookups.map((lookup) => [lookup.hostname, lookup.servers])).toEqual([['corp.local', ['10.20.0.10', '10.20.0.11']]]);
+    // Two passes, one cached detection: one command.
+    expect(dnsArgv(h)).toEqual([['--dns']]);
     expect(h.routeArgv()).toEqual([
       ['-n', 'add', '-host', '203.0.113.7', '192.168.1.1'],
       ['-n', 'add', '-host', '198.51.100.20', ETH_GW],
@@ -699,7 +716,7 @@ describe('run --once: domain rules', () => {
     expect(h.logs().find((entry) => entry['msg'] === 'domain resolved')).toMatchObject({
       component: 'dns',
       domain: 'corp.local',
-      servers: ['10.20.0.10'],
+      servers: ['10.20.0.10', '10.20.0.11'],
       source: 'interface',
     });
     expect(h.logs().some((entry) => entry['msg'] === 'no DNS server is known for the interface of the rule; the system resolvers are asked')).toBe(false);
@@ -761,7 +778,7 @@ describe('run --once: domain rules', () => {
   it('on a degraded detection a rule without `dns` waits for a reliable one instead of asking the system resolvers', async () => {
     const h = harness(DOMAIN_CONFIG);
     h.runner.when(IPCONFIG, ['getoption', 'en0', 'subnet_mask'], { failure: 'timeout' });
-    h.runner.when(IPCONFIG, ['getoption', 'en5', DNS_OPTION], { stdout: '10.20.0.10\n' });
+    h.runner.when(SCUTIL, ['--dns'], scutilDns({ en5: ['10.20.0.10'] }));
 
     const code = await run(['--once'], h.deps);
 

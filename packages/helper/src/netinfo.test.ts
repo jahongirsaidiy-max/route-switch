@@ -5,14 +5,22 @@ import type { CommandRunner } from './exec';
 import { createLogger, createMemorySink, type LogEntry } from './logger';
 import {
   createNetInfo,
+  dnsServersOf,
   expandNetstatDestination,
+  MAX_DNS_SERVERS_PER_ROLE,
+  MAX_OTHER_DNS_SERVERS,
   NETINFO_CACHE_TTL_MS,
   NETINFO_COMMAND_TIMEOUT_MS,
   NETSTAT_MAX_LINE_LENGTH,
   NETSTAT_MAX_LINES,
   netmaskToPrefix,
+  parseDnsConfiguration,
   parseHardwarePorts,
   parseRoutingTable,
+  SCUTIL_MAX_LINE_LENGTH,
+  SCUTIL_MAX_LINES,
+  SCUTIL_MAX_NAMESERVERS_PER_RESOLVER,
+  SCUTIL_MAX_RESOLVERS,
   toInterfaceState,
   toWireInterfaces,
   type DetectOptions,
@@ -1963,156 +1971,511 @@ describe('detectInterfaces: QA observations of TASK-101', () => {
 // DNS servers of the role interfaces (opt-in)
 // ---------------------------------------------------------------------------
 
-describe('detectInterfaces: DNS servers (opt-in)', () => {
-  const DNS = 'domain_name_server';
-  const dnsQuery = (device: string): string[] => ['getoption', device, DNS];
+// `scutil --dns` on macOS 26.3.1 (Wi-Fi en0 primary, a USB LAN adapter connected as well),
+// anonymised: the device of the adapter is the `en5` of PORTS, a supplemental resolver's domain is
+// `corp.local`, and every address is a generic one. Structure, spacing, keys and order are as
+// printed. The supplemental resolver repeats the adapter's servers, as it did on that machine.
+const SCUTIL_REAL = `DNS configuration
 
-  // `ipconfig getoption <dev> domain_name_server` on macOS 26.3.1, anonymised: one address and a
-  // newline, exit 0 -- also for a lease that carries two servers (`ipconfig getpacket` shows
-  // `domain_name_server (ip_mult): {a, b}` for it; `getoption` prints the first only). Without a lease
-  // or for an unknown device: exit 1, nothing on stdout or stderr.
-  const withDns = (servers: Readonly<Record<string, FakeCommandResponse>>) => {
-    const h = setup(PORTS, BOTH);
-    for (const [device, response] of Object.entries(servers)) h.runner.when(IPCONFIG, dnsQuery(device), response);
+resolver #1
+  search domain[0] : home
+  nameserver[0] : 192.168.1.1
+  if_index : 15 (en0)
+  flags    : Request A records
+  reach    : 0x00020002 (Reachable,Directly Reachable Address)
+
+resolver #2
+  domain   : local
+  options  : mdns
+  timeout  : 5
+  flags    : Request A records
+  reach    : 0x00000000 (Not Reachable)
+  order    : 300000
+
+resolver #3
+  domain   : 254.169.in-addr.arpa
+  options  : mdns
+  timeout  : 5
+  flags    : Request A records
+  reach    : 0x00000000 (Not Reachable)
+  order    : 300200
+
+resolver #4
+  domain   : 8.e.f.ip6.arpa
+  options  : mdns
+  timeout  : 5
+  flags    : Request A records
+  reach    : 0x00000000 (Not Reachable)
+  order    : 300400
+
+resolver #5
+  domain   : 9.e.f.ip6.arpa
+  options  : mdns
+  timeout  : 5
+  flags    : Request A records
+  reach    : 0x00000000 (Not Reachable)
+  order    : 300600
+
+resolver #6
+  domain   : a.e.f.ip6.arpa
+  options  : mdns
+  timeout  : 5
+  flags    : Request A records
+  reach    : 0x00000000 (Not Reachable)
+  order    : 300800
+
+resolver #7
+  domain   : b.e.f.ip6.arpa
+  options  : mdns
+  timeout  : 5
+  flags    : Request A records
+  reach    : 0x00000000 (Not Reachable)
+  order    : 301000
+
+resolver #8
+  domain   : corp.local
+  nameserver[0] : 10.20.0.10
+  nameserver[1] : 10.20.0.11
+  timeout  : 3
+  flags    : Request A records
+  reach    : 0x00000002 (Reachable)
+  order    : 1
+
+DNS configuration (for scoped queries)
+
+resolver #1
+  search domain[0] : home
+  nameserver[0] : 192.168.1.1
+  if_index : 15 (en0)
+  flags    : Scoped, Request A records
+  reach    : 0x00020002 (Reachable,Directly Reachable Address)
+
+resolver #2
+  nameserver[0] : 10.20.0.10
+  nameserver[1] : 10.20.0.11
+  if_index : 13 (en5)
+  flags    : Scoped, Request A records
+  reach    : 0x00000002 (Reachable)
+`;
+
+/** One resolver block; `lines` are the indented key lines, without the indentation. */
+const resolverBlock = (index: number, ...lines: string[]): string =>
+  [`resolver #${String(index)}`, ...lines.map((line) => `  ${line}`)].join('\n');
+
+/** A `scutil --dns` output from blocks: the main section, and the scoped one when given. */
+const scutilOutput = (main: readonly string[], scoped?: readonly string[]): string =>
+  [
+    'DNS configuration',
+    '',
+    ...main.flatMap((block) => [block, '']),
+    ...(scoped === undefined ? [] : ['DNS configuration (for scoped queries)', '', ...scoped.flatMap((block) => [block, ''])]),
+  ].join('\n');
+
+describe('parseDnsConfiguration', () => {
+  it('reads every resolver of a real output, with its section, domain, interface and servers', () => {
+    const resolvers = parseDnsConfiguration(SCUTIL_REAL);
+
+    expect(resolvers).toHaveLength(10);
+    expect(resolvers?.[0]).toEqual({ scoped: false, domain: null, interfaceName: 'en0', nameservers: ['192.168.1.1'] });
+    expect(resolvers?.[1]).toEqual({ scoped: false, domain: 'local', interfaceName: null, nameservers: [] });
+    expect(resolvers?.[7]).toEqual({ scoped: false, domain: 'corp.local', interfaceName: null, nameservers: ['10.20.0.10', '10.20.0.11'] });
+    expect(resolvers?.[8]).toEqual({ scoped: true, domain: null, interfaceName: 'en0', nameservers: ['192.168.1.1'] });
+    expect(resolvers?.[9]).toEqual({ scoped: true, domain: null, interfaceName: 'en5', nameservers: ['10.20.0.10', '10.20.0.11'] });
+  });
+
+  it('is not disturbed by CRLF, tabs, trailing spaces or a missing final newline', () => {
+    const messy = SCUTIL_REAL.replaceAll('\n', ' \r\n').replaceAll('  nameserver', '\tnameserver').trimEnd();
+
+    expect(parseDnsConfiguration(messy)).toEqual(parseDnsConfiguration(SCUTIL_REAL));
+  });
+
+  it('puts the servers of a block in index order and keeps IPv6 ones as printed', () => {
+    const output = scutilOutput([resolverBlock(1, 'nameserver[2] : fe80::1%en0', 'nameserver[0] : 10.20.0.11', 'nameserver[1] : 10.20.0.10')]);
+
+    expect(parseDnsConfiguration(output)?.[0]?.nameservers).toEqual(['10.20.0.11', '10.20.0.10', 'fe80::1%en0']);
+  });
+
+  it('reads "No DNS configuration available" as no resolver at all, when it is the only line (QA verdict 1)', () => {
+    expect(parseDnsConfiguration('No DNS configuration available\n')).toEqual([]);
+    expect(parseDnsConfiguration('No DNS configuration available')).toEqual([]);
+    expect(parseDnsConfiguration('\n  No DNS configuration available  \r\n\n')).toEqual([]);
+    expect(parseDnsConfiguration('DNS configuration\n\n')).toEqual([]);
+  });
+
+  it.each([
+    ['followed by a configuration', 'No DNS configuration available\nDNS configuration\n\nresolver #1\n  nameserver[0] : 10.0.0.9\n'],
+    ['followed by a configuration after a blank line', `No DNS configuration available\n\n${SCUTIL_REAL}`],
+    ['inside a section', SCUTIL_REAL.replace('resolver #2\n', 'No DNS configuration available\n\nresolver #2\n')],
+    ['after a configuration', `${SCUTIL_REAL}\nNo DNS configuration available\n`],
+    ['twice', 'No DNS configuration available\nNo DNS configuration available\n'],
+  ])('refuses "No DNS configuration available" %s as ambiguous (QA verdict 1)', (_name, output) => {
+    expect(parseDnsConfiguration(output)).toBeNull();
+  });
+
+  it.each([
+    ['empty output', ''],
+    ['no section title first', `${resolverBlock(1, 'nameserver[0] : 10.20.0.10')}\n`],
+    ['an unknown line between blocks', SCUTIL_REAL.replace('DNS configuration (for scoped queries)', 'DNS configuration (for other queries)')],
+    ['a key line outside a block', 'DNS configuration\n\n  nameserver[0] : 10.20.0.10\n'],
+    ['a key line without a colon', scutilOutput([resolverBlock(1, 'nameserver[0] 10.20.0.10')])],
+    ['a resolver line without a number', scutilOutput(['resolver #x'])],
+    ['two domains in one block', scutilOutput([resolverBlock(1, 'domain : a.corp.local', 'domain : b.corp.local')])],
+    ['an empty domain', scutilOutput([resolverBlock(1, 'domain :')])],
+    ['two interfaces in one block', scutilOutput([resolverBlock(1, 'if_index : 15 (en0)', 'if_index : 13 (en5)')])],
+    ['an interface without a name', scutilOutput([resolverBlock(1, 'if_index : 15')])],
+    ['an interface without an index', scutilOutput([resolverBlock(1, 'if_index : (en0)')])],
+    ['an interface with extra text', scutilOutput([resolverBlock(1, 'if_index : 15 (en0) (en5)')])],
+    ['an interface with nested brackets', scutilOutput([resolverBlock(1, 'if_index : 15 ((en0))')])],
+    ['a server index given twice', scutilOutput([resolverBlock(1, 'nameserver[0] : 10.20.0.10', 'nameserver[0] : 10.20.0.11')])],
+    ['a server index that is not a number', scutilOutput([resolverBlock(1, 'nameserver[a] : 10.20.0.10')])],
+    ['a server index with a leading zero', scutilOutput([resolverBlock(1, 'nameserver[01] : 10.20.0.10')])],
+    ['a server index beyond the bound', scutilOutput([resolverBlock(1, `nameserver[${String(SCUTIL_MAX_NAMESERVERS_PER_RESOLVER)}] : 10.20.0.10`)])],
+    ['a server without a value', scutilOutput([resolverBlock(1, 'nameserver[0] :')])],
+    ['a line over the length bound', scutilOutput([resolverBlock(1, `search domain[0] : ${'a'.repeat(SCUTIL_MAX_LINE_LENGTH)}`)])],
+    ['more lines than the bound', `DNS configuration\n${'\n'.repeat(SCUTIL_MAX_LINES)}`],
+    ['more resolvers than the bound', scutilOutput(Array.from({ length: SCUTIL_MAX_RESOLVERS + 1 }, (_unused, index) => resolverBlock(index + 1)))],
+  ])('refuses %s as a whole', (_name, output) => {
+    expect(parseDnsConfiguration(output)).toBeNull();
+  });
+
+  it('accepts exactly the bounds', () => {
+    const servers = Array.from(
+      { length: SCUTIL_MAX_NAMESERVERS_PER_RESOLVER },
+      (_unused, index) => `nameserver[${String(index)}] : 10.20.0.${String(index + 1)}`,
+    );
+    expect(parseDnsConfiguration(scutilOutput([resolverBlock(1, ...servers)]))?.[0]?.nameservers).toHaveLength(
+      SCUTIL_MAX_NAMESERVERS_PER_RESOLVER,
+    );
+    const blocks = Array.from({ length: SCUTIL_MAX_RESOLVERS }, (_unused, index) => resolverBlock(index + 1));
+    expect(parseDnsConfiguration(scutilOutput(blocks))).toHaveLength(SCUTIL_MAX_RESOLVERS);
+    expect(parseDnsConfiguration(scutilOutput([resolverBlock(1, `search domain[0] : ${'a'.repeat(SCUTIL_MAX_LINE_LENGTH - 21)}`)]))).toHaveLength(1);
+  });
+});
+
+describe('dnsServersOf', () => {
+  const parsed = (output: string) => parseDnsConfiguration(output) ?? [];
+
+  it('gives a role the default servers of its device, scoped ones first, and every other server to `other`', () => {
+    const output = scutilOutput(
+      [
+        resolverBlock(1, 'nameserver[0] : 192.168.1.1', 'nameserver[1] : 192.168.1.2', 'if_index : 15 (en0)'),
+        resolverBlock(2, 'domain : corp.local', 'nameserver[0] : 10.30.0.53', 'if_index : 13 (en5)'),
+        resolverBlock(3, 'nameserver[0] : 10.40.0.53', 'if_index : 20 (utun3)'),
+        resolverBlock(4, 'nameserver[0] : 10.20.0.12', 'if_index : 13 (en5)'),
+      ],
+      [
+        resolverBlock(1, 'nameserver[0] : 10.20.0.10', 'nameserver[1] : 10.20.0.11', 'if_index : 13 (en5)'),
+        resolverBlock(2, 'nameserver[0] : 192.168.1.2', 'if_index : 15 (en0)'),
+      ],
+    );
+
+    expect(dnsServersOf(parsed(output), { ethernet: 'en5', wifi: 'en0' })).toEqual({
+      ethernet: ['10.20.0.10', '10.20.0.11', '10.20.0.12'],
+      wifi: ['192.168.1.2', '192.168.1.1'],
+      other: ['10.30.0.53', '10.40.0.53'],
+      ignored: [],
+    });
+  });
+
+  it('gives a role without an address nothing, and its servers to `other`', () => {
+    expect(dnsServersOf(parsed(SCUTIL_REAL), { ethernet: null, wifi: 'en0' })).toEqual({
+      ethernet: [],
+      wifi: ['192.168.1.1'],
+      other: ['10.20.0.10', '10.20.0.11'],
+      ignored: [],
+    });
+  });
+
+  it('skips IPv6 servers silently and lists every other unusable value once', () => {
+    const output = scutilOutput([
+      resolverBlock(
+        1,
+        'nameserver[0] : 127.0.0.1',
+        'nameserver[1] : fe80::1%en5',
+        'nameserver[2] : 010.20.0.10',
+        'nameserver[3] : 10.20.0.10',
+        'if_index : 13 (en5)',
+      ),
+      resolverBlock(2, 'domain : corp.local', 'nameserver[0] : 127.0.0.1', 'nameserver[1] : -interface'),
+    ]);
+
+    expect(dnsServersOf(parsed(output), { ethernet: 'en5', wifi: null })).toEqual({
+      ethernet: ['10.20.0.10'],
+      wifi: [],
+      other: [],
+      ignored: ['127.0.0.1', '010.20.0.10', '-interface'],
+    });
+  });
+
+  it('counts an IPv4-mapped IPv6 server as its IPv4 address', () => {
+    const output = scutilOutput([
+      resolverBlock(1, 'nameserver[0] : ::FFFF:10.20.0.10', 'nameserver[1] : ::ffff:127.0.0.1', 'if_index : 13 (en5)'),
+      resolverBlock(2, 'domain : corp.local', 'nameserver[0] : ::ffff:10.30.0.53', 'nameserver[1] : ::ffff:0a1e:0035'),
+    ]);
+
+    expect(dnsServersOf(parsed(output), { ethernet: 'en5', wifi: null })).toEqual({
+      ethernet: ['10.20.0.10'],
+      wifi: [],
+      other: ['10.30.0.53'],
+      ignored: ['::ffff:127.0.0.1'],
+    });
+  });
+
+  it('refuses a report whose lists would exceed their bounds', () => {
+    const block = (prefix: string, count: number, extra: string[] = []): string =>
+      resolverBlock(
+        1,
+        ...Array.from({ length: count }, (_unused, index) => `nameserver[${String(index)}] : ${prefix}.${String(index + 1)}`),
+        ...extra,
+      );
+    const role = (count: number): string => scutilOutput([block('10.20.0', count, ['if_index : 13 (en5)'])]);
+    const others = (count: number): string =>
+      scutilOutput(
+        Array.from({ length: Math.ceil(count / 8) }, (_unused, index) =>
+          block(`10.30.${String(index)}`, Math.min(8, count - index * 8), ['domain : corp.local']),
+        ),
+      );
+
+    expect(dnsServersOf(parsed(role(MAX_DNS_SERVERS_PER_ROLE)), { ethernet: 'en5', wifi: null })?.ethernet).toHaveLength(MAX_DNS_SERVERS_PER_ROLE);
+    expect(dnsServersOf(parsed(role(MAX_DNS_SERVERS_PER_ROLE + 1)), { ethernet: 'en5', wifi: null })).toBeNull();
+    expect(dnsServersOf(parsed(others(MAX_OTHER_DNS_SERVERS)), { ethernet: null, wifi: null })?.other).toHaveLength(MAX_OTHER_DNS_SERVERS);
+    expect(dnsServersOf(parsed(others(MAX_OTHER_DNS_SERVERS + 1)), { ethernet: null, wifi: null })).toBeNull();
+  });
+});
+
+describe('detectInterfaces: DNS servers (opt-in)', () => {
+  const SCUTIL = '/usr/sbin/scutil';
+  const DNS_ARGS = ['--dns'];
+
+  const withDns = (response: FakeCommandResponse = { stdout: SCUTIL_REAL }, ifaces: Readonly<Record<string, FakeIface>> = BOTH) => {
+    const h = setup(PORTS, ifaces);
+    h.runner.when(SCUTIL, DNS_ARGS, response);
     return h;
   };
-  const dnsCalls = (runner: FakeCommandRunner): string[] => argvOf(runner).filter((argv) => argv.endsWith(DNS));
+  const dnsCalls = (runner: FakeCommandRunner): string[] => argvOf(runner).filter((argv) => argv.startsWith('scutil'));
 
   it('does not ask for them, and does not report them, unless told to', async () => {
-    const { netinfo, runner } = withDns({ en5: value('10.20.0.10'), en0: value('192.168.1.1') });
+    const { netinfo, runner } = withDns();
 
     const result = await netinfo.detectInterfaces();
 
     expect(dnsCalls(runner)).toEqual([]);
     expect(runner.calls).toHaveLength(9);
     expect('dnsServers' in result).toBe(false);
+    expect('otherDnsServers' in result).toBe(false);
     expect(await netinfo.detectInterfaces({ dns: false })).toBe(result);
     expect(await netinfo.detectInterfaces({ dns: 'yes' } as unknown as DetectOptions)).toBe(result);
     expect(dnsCalls(runner)).toEqual([]);
   });
 
-  it('reports the DNS server of each role with one more command per role that has an address', async () => {
-    const { netinfo, runner, entries } = withDns({ en5: value('10.20.0.10'), en0: value('192.168.1.1') });
+  it('reports every server of each role from one scutil --dns per detection (a real output)', async () => {
+    const { netinfo, runner, entries } = withDns();
 
     const result = await netinfo.detectInterfaces({ dns: true });
 
-    expect(result.dnsServers).toEqual({ ethernet: ['10.20.0.10'], wifi: ['192.168.1.1'] });
+    // Both servers of the adapter: the second is the failover the lease's first-server-only query never saw.
+    expect(result.dnsServers).toEqual({ ethernet: ['10.20.0.10', '10.20.0.11'], wifi: ['192.168.1.1'] });
+    // The supplemental resolver repeats the adapter's servers: nothing else is left.
+    expect(result.otherDnsServers).toEqual([]);
     expect(result.degraded).toBe(false);
-    expect(dnsCalls(runner).sort()).toEqual(['ipconfig getoption en0 domain_name_server', 'ipconfig getoption en5 domain_name_server']);
-    // 1 networksetup + 4 addresses + 2 x (router, mask) + 2 DNS.
-    expect(runner.calls).toHaveLength(9 + 2);
+    expect(dnsCalls(runner)).toEqual(['scutil --dns']);
+    expect(runner.calls.find((call) => call.bin === SCUTIL)?.options).toEqual({ timeoutMs: NETINFO_COMMAND_TIMEOUT_MS });
+    // 1 networksetup + 4 addresses + 2 x (router, mask) + 1 scutil, however many roles have an address.
+    expect(runner.calls).toHaveLength(9 + 1);
+    expect(argvOf(runner).some((argv) => argv.includes('domain_name_server'))).toBe(false);
     expect(Object.isFrozen(result.dnsServers)).toBe(true);
     expect(Object.isFrozen(result.dnsServers?.ethernet)).toBe(true);
-    expect(summaries(entries)[0]?.context).toMatchObject({ dnsServers: { ethernet: ['10.20.0.10'], wifi: ['192.168.1.1'] } });
+    expect(Object.isFrozen(result.otherDnsServers)).toBe(true);
+    expect(summaries(entries)[0]?.context).toMatchObject({
+      dnsServers: { ethernet: ['10.20.0.10', '10.20.0.11'], wifi: ['192.168.1.1'] },
+      otherDnsServers: [],
+    });
+    expect(warnings(entries)).toEqual([]);
     // Everything else is what a detection without DNS reports.
     const plain = setup(PORTS, BOTH);
-    expect({ ...result, dnsServers: undefined }).toEqual(await plain.netinfo.detectInterfaces());
+    expect({ ...result, dnsServers: undefined, otherDnsServers: undefined }).toEqual({
+      ...(await plain.netinfo.detectInterfaces()),
+      dnsServers: undefined,
+      otherDnsServers: undefined,
+    });
   });
 
-  it('asks nothing for a role without an address', async () => {
-    const h = setup(PORTS, { en0: WIFI });
-    h.runner.when(IPCONFIG, dnsQuery('en0'), value('192.168.1.1'));
+  it('reports servers set by hand: they are in the scoped resolver of the device like leased ones', async () => {
+    // A manual server list replaces the lease's in the system's configuration; scutil prints the result.
+    const manual = scutilOutput(
+      [resolverBlock(1, 'nameserver[0] : 192.168.1.1', 'if_index : 15 (en0)')],
+      [
+        resolverBlock(1, 'nameserver[0] : 192.168.1.1', 'if_index : 15 (en0)'),
+        resolverBlock(2, 'nameserver[0] : 10.20.0.53', 'nameserver[1] : 10.20.0.54', 'if_index : 13 (en5)'),
+      ],
+    );
+    const { netinfo } = withDns({ stdout: manual });
+
+    expect((await netinfo.detectInterfaces({ dns: true })).dnsServers?.ethernet).toEqual(['10.20.0.53', '10.20.0.54']);
+  });
+
+  it('reports the servers of supplemental resolvers and of other interfaces as the other ones', async () => {
+    const output = SCUTIL_REAL.replace('nameserver[0] : 10.20.0.10\n  nameserver[1] : 10.20.0.11\n  timeout', 'nameserver[0] : 10.30.0.53\n  timeout').replace(
+      'DNS configuration (for scoped queries)',
+      `${resolverBlock(9, 'nameserver[0] : 10.40.0.53', 'if_index : 20 (utun3)')}\n\nDNS configuration (for scoped queries)`,
+    );
+    const { netinfo } = withDns({ stdout: output });
+
+    const result = await netinfo.detectInterfaces({ dns: true });
+
+    expect(result.dnsServers).toEqual({ ethernet: ['10.20.0.10', '10.20.0.11'], wifi: ['192.168.1.1'] });
+    expect(result.otherDnsServers).toEqual(['10.30.0.53', '10.40.0.53']);
+  });
+
+  it('runs scutil once also when no role has an address, and gives such a role nothing', async () => {
+    const { netinfo, runner } = withDns({ stdout: SCUTIL_REAL }, { en0: WIFI });
+
+    const result = await netinfo.detectInterfaces({ dns: true });
+
+    expect(result.dnsServers).toEqual({ ethernet: [], wifi: ['192.168.1.1'] });
+    expect(result.otherDnsServers).toEqual(['10.20.0.10', '10.20.0.11']);
+    expect(dnsCalls(runner)).toEqual(['scutil --dns']);
+
+    const none = withDns({ stdout: SCUTIL_REAL }, {});
+    expect(await none.netinfo.detectInterfaces({ dns: true })).toMatchObject({
+      dnsServers: { ethernet: [], wifi: [] },
+      otherDnsServers: ['192.168.1.1', '10.20.0.10', '10.20.0.11'],
+    });
+    expect(dnsCalls(none.runner)).toEqual(['scutil --dns']);
+  });
+
+  it('runs nothing for the DNS servers when the hardware ports cannot be listed', async () => {
+    const h = setup(PORTS, BOTH);
+    h.runner.when(NETWORKSETUP, LIST_PORTS, { failure: 'timeout' });
+    h.runner.when(SCUTIL, DNS_ARGS, { stdout: SCUTIL_REAL });
 
     const result = await h.netinfo.detectInterfaces({ dns: true });
 
-    expect(result.dnsServers).toEqual({ ethernet: [], wifi: ['192.168.1.1'] });
-    expect(dnsCalls(h.runner)).toEqual(['ipconfig getoption en0 domain_name_server']);
-    expect(result.degraded).toBe(false);
+    expect(result.degraded).toBe(true);
+    expect(result.dnsServers).toBeUndefined();
+    expect(dnsCalls(h.runner)).toEqual([]);
   });
 
-  it('treats "no value" as an interface without a DNS server, which is ordinary', async () => {
-    const { netinfo, entries } = withDns({ en5: NO_VALUE, en0: value('192.168.1.1') });
+  it('treats an empty configuration as no server, which is ordinary', async () => {
+    const { netinfo, entries } = withDns({ stdout: 'No DNS configuration available\n' });
 
     const result = await netinfo.detectInterfaces({ dns: true });
 
-    expect(result.dnsServers).toEqual({ ethernet: [], wifi: ['192.168.1.1'] });
+    expect(result.dnsServers).toEqual({ ethernet: [], wifi: [] });
+    expect(result.otherDnsServers).toEqual([]);
     expect(result.degraded).toBe(false);
-    expect(result.ethernet.routable).toBe(true);
     expect(warnings(entries)).toEqual([]);
   });
 
-  it.each([
-    ['loopback', '127.0.0.1', 'loopback'],
-    ['the unspecified address', '0.0.0.0', 'default-route'],
-    ['link-local', '169.254.1.1', 'link-local'],
-    ['multicast', '224.0.0.251', 'multicast'],
-    ['broadcast', '255.255.255.255', 'broadcast'],
-    ['IPv6', 'fe80::1', 'invalid-ipv4'],
-    ['a host name', 'ns.corp.local', 'invalid-ipv4'],
-    ['an octal form', '010.20.0.10', 'invalid-ipv4'],
-    ['a braced list', '{10.20.0.10, 10.20.0.11}', 'invalid-ipv4'],
-    ['an argument-like value', '-interface', 'invalid-ipv4'],
-  ])('ignores a DNS server that is %s, without calling the detection degraded', async (_name, text, reason) => {
-    const { netinfo, entries } = withDns({ en5: value(text), en0: value('192.168.1.1') });
+  it('ignores servers that are not usable addresses, warns once for a set, and does not call the detection degraded', async () => {
+    const output = scutilOutput(
+      [resolverBlock(1, 'nameserver[0] : 127.0.0.1', 'if_index : 15 (en0)')],
+      [
+        resolverBlock(1, 'nameserver[0] : 127.0.0.1', 'nameserver[1] : 192.168.1.1', 'if_index : 15 (en0)'),
+        resolverBlock(2, 'nameserver[0] : fe80::1%en5', 'nameserver[1] : 10.20.0.10', 'if_index : 13 (en5)'),
+      ],
+    );
+    const { netinfo, entries } = withDns({ stdout: output });
 
     const result = await netinfo.detectInterfaces({ dns: true });
+    netinfo.invalidate();
+    await netinfo.detectInterfaces({ dns: true });
 
-    expect(result.dnsServers).toEqual({ ethernet: [], wifi: ['192.168.1.1'] });
+    expect(result.dnsServers).toEqual({ ethernet: ['10.20.0.10'], wifi: ['192.168.1.1'] });
     expect(result.degraded).toBe(false);
-    expect(warnings(entries).map((entry) => [entry.msg, entry.context?.['reason']])).toEqual([
-      ['ipconfig returned an unusable DNS server; it is ignored', reason],
+    const ignored = entries.filter((entry) => entry.msg === 'DNS servers that are not usable addresses are ignored');
+    expect(ignored.map((entry) => [entry.level, entry.context?.['values']])).toEqual([
+      ['warn', ['127.0.0.1']],
+      ['debug', ['127.0.0.1']],
     ]);
   });
 
   it.each([
     ...FAILURES,
-    ['several lines', { stdout: '10.20.0.10\n10.20.0.11\n' }] as const,
-    ['an empty success', { stdout: '\n' }] as const,
-    ['a usage error', USAGE] as const,
-  ])('reports "not known" for the role, and nothing worse, when the DNS query fails with %s', async (_name, response) => {
-    const { netinfo, entries } = withDns({ en5: response, en0: value('192.168.1.1') });
+    ['an ambiguous output', { stdout: SCUTIL_REAL.replace('if_index : 13 (en5)', 'if_index : 13') }] as const,
+    ['an output that is not the DNS configuration', { stdout: 'usage: scutil --dns\n' }] as const,
+    ['an empty success', { stdout: '' }] as const,
+    [
+      'more servers for a role than the bound',
+      {
+        stdout: scutilOutput([
+          resolverBlock(
+            1,
+            ...Array.from({ length: MAX_DNS_SERVERS_PER_ROLE + 1 }, (_unused, index) => `nameserver[${String(index)}] : 10.20.0.${String(index + 1)}`),
+            'if_index : 13 (en5)',
+          ),
+        ]),
+      },
+    ] as const,
+  ])('reports "not known", and nothing worse, when the DNS configuration gives %s', async (_name, response) => {
+    const { netinfo, entries } = withDns(response);
 
     const result = await netinfo.detectInterfaces({ dns: true });
 
     // `null` is not "no server": the caller keeps what it knew.
-    expect(result.dnsServers).toEqual({ ethernet: null, wifi: ['192.168.1.1'] });
+    expect(result.dnsServers).toEqual({ ethernet: null, wifi: null });
+    expect(result.otherDnsServers).toBeNull();
     // No route decision depends on a DNS server, so the detection is as trustworthy as without the lookup.
     expect(result.degraded).toBe(false);
     expect(result.ethernet).toMatchObject({ routable: true, gateway: '10.20.4.1', subnet: '10.20.4.0/22' });
     expect(warnings(entries).length).toBeGreaterThan(0);
     const plain = setup(PORTS, BOTH);
-    expect({ ...result, dnsServers: undefined }).toEqual(await plain.netinfo.detectInterfaces());
+    expect({ ...result, dnsServers: undefined, otherDnsServers: undefined }).toEqual({
+      ...(await plain.netinfo.detectInterfaces()),
+      dnsServers: undefined,
+      otherDnsServers: undefined,
+    });
   });
 
   it('still calls the detection degraded for what does decide about routes, whatever the DNS lookup did', async () => {
-    const { netinfo, runner } = withDns({ en5: value('10.20.0.10'), en0: value('192.168.1.1') });
+    const { netinfo, runner } = withDns();
     runner.when(IPCONFIG, ['getoption', 'en5', 'subnet_mask'], { failure: 'timeout', signal: 'SIGKILL', error: 'Timed out after 5000 ms' });
 
     const result = await netinfo.detectInterfaces({ dns: true });
 
     expect(result.degraded).toBe(true);
-    expect(result.dnsServers).toEqual({ ethernet: ['10.20.0.10'], wifi: ['192.168.1.1'] });
+    expect(result.dnsServers).toEqual({ ethernet: ['10.20.0.10', '10.20.0.11'], wifi: ['192.168.1.1'] });
   });
 
   it('never answers a call that wants the DNS servers from a detection that did not look them up, or the other way round', async () => {
-    const { netinfo, runner } = withDns({ en5: value('10.20.0.10'), en0: value('192.168.1.1') });
+    const { netinfo, runner } = withDns();
 
     const plain = await netinfo.detectInterfaces();
     const withServers = await netinfo.detectInterfaces({ dns: true });
-    expect(runner.calls).toHaveLength(9 + 11);
+    expect(runner.calls).toHaveLength(9 + 10);
     expect(plain.dnsServers).toBeUndefined();
     expect(withServers.dnsServers).toBeDefined();
 
     expect(await netinfo.detectInterfaces({ dns: true })).toBe(withServers);
-    expect(runner.calls).toHaveLength(9 + 11);
+    expect(runner.calls).toHaveLength(9 + 10);
 
     // One result is kept at a time; the plain call detects again and gets no DNS servers.
     expect((await netinfo.detectInterfaces()).dnsServers).toBeUndefined();
-    expect(runner.calls).toHaveLength(9 + 11 + 9);
+    expect(runner.calls).toHaveLength(9 + 10 + 9);
   });
 
-  it('follows a lease whose DNS server changed once the cache is gone', async () => {
-    const { netinfo, runner } = withDns({ en5: value('10.20.0.10'), en0: value('192.168.1.1') });
+  it('follows a configuration whose servers changed once the cache is gone', async () => {
+    const { netinfo, runner } = withDns();
     await netinfo.detectInterfaces({ dns: true });
 
-    runner.when(IPCONFIG, dnsQuery('en5'), value('10.30.0.10'));
+    runner.when(SCUTIL, DNS_ARGS, { stdout: SCUTIL_REAL.replaceAll('10.20.0.1', '10.30.0.1') });
     netinfo.invalidate();
 
-    expect((await netinfo.detectInterfaces({ dns: true })).dnsServers?.ethernet).toEqual(['10.30.0.10']);
+    expect((await netinfo.detectInterfaces({ dns: true })).dnsServers?.ethernet).toEqual(['10.30.0.10', '10.30.0.11']);
+  });
+
+  it('follows an override: the servers are those of the device that plays the role', async () => {
+    const { netinfo } = withDns({ stdout: SCUTIL_REAL }, { ...BOTH, en7: { ip: '10.50.0.5', router: '10.50.0.1', mask: '255.255.255.0' } });
+
+    const result = await netinfo.detectInterfaces({ dns: true, overrides: { ethernet: 'en7' } });
+
+    expect(result.ethernet.device).toBe('en7');
+    expect(result.dnsServers).toEqual({ ethernet: [], wifi: ['192.168.1.1'] });
+    expect(result.otherDnsServers).toEqual(['10.20.0.10', '10.20.0.11']);
   });
 
   it('never puts the DNS servers on the wire', async () => {
-    const { netinfo } = withDns({ en5: value('10.20.0.10'), en0: value('192.168.1.1') });
+    const { netinfo } = withDns();
 
     const wire = toWireInterfaces(await netinfo.detectInterfaces({ dns: true }));
 

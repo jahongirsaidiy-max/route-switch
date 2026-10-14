@@ -105,7 +105,13 @@ export interface DomainContext {
    *   DNS servers).
    */
   readonly dnsServers: readonly string[] | null | undefined;
-  /** The DNS servers of every role's interface, as far as ever seen. A resolver never returns them as destinations. */
+  /**
+   * Every DNS server the detections have reported, as far as remembered: those
+   * of both roles' interfaces and the other ones of the system's DNS
+   * configuration (supplemental resolvers, other interfaces). A resolver never
+   * returns them as destinations. At most `MAX_EXCLUDED_DNS_SERVERS`, the
+   * servers of `dnsServers` first.
+   */
   readonly interfaceDnsServers: readonly string[];
 }
 
@@ -248,6 +254,17 @@ export const DNS_LOSS_GRACE = 2;
  * of these, whatever the cap.
  */
 export const MAX_EXCLUDED_DNS_PER_ROLE = 8;
+/**
+ * The other DNS servers of the system (`DetectedInterfaces.otherDnsServers`)
+ * remembered for the exclusion, by the same rules as those of a role.
+ */
+export const MAX_EXCLUDED_OTHER_DNS = 32;
+/**
+ * Bound of `DomainContext.interfaceDnsServers`: per role the asked servers
+ * and the remembered ones, then the other ones. It is the length the DNS
+ * module reads of that list, so nothing is cut there.
+ */
+export const MAX_EXCLUDED_DNS_SERVERS = 2 * (2 * MAX_EXCLUDED_DNS_PER_ROLE) + MAX_EXCLUDED_OTHER_DNS;
 
 /**
  * A rule whose route the wrapper refused because a connected route is in the
@@ -549,6 +566,8 @@ export const createEngine = (deps: EngineDeps): Engine => {
    * in `trustedDns` are excluded besides this list (`excludedServers`).
    */
   let excludedDns: Record<IfaceRole, readonly string[]> = { ethernet: [], wifi: [] };
+  /** The same for the DNS servers of the system that belong to no role; never asked. */
+  let excludedOtherDns: readonly string[] = [];
   /** Clean detections in a row that reported no DNS server for a role that had one. */
   let dnsLossStreak: Record<IfaceRole, number> = { ethernet: 0, wifi: 0 };
   /** The detection whose DNS servers were taken in last; a cached result is not counted twice. */
@@ -648,7 +667,7 @@ export const createEngine = (deps: EngineDeps): Engine => {
    * list, never out of the exclusion.
    */
   const excludedServers = (): string[] => [
-    ...new Set(ROLES.flatMap((role) => [...(trustedDns[role] ?? []), ...excludedDns[role]])),
+    ...new Set([...ROLES.flatMap((role) => [...(trustedDns[role] ?? []), ...excludedDns[role]]), ...excludedOtherDns]),
   ];
 
   const safeResolve = async (rule: Rule): Promise<DomainTargets> => {
@@ -1055,6 +1074,7 @@ export const createEngine = (deps: EngineDeps): Engine => {
       // No domain rule, no lookups: what was known would only go stale.
       trustedDns = {};
       excludedDns = { ethernet: [], wifi: [] };
+      excludedOtherDns = [];
       dnsLossStreak = { ethernet: 0, wifi: 0 };
       lastDnsDetection = null;
       unknownDns = undefined;
@@ -1065,17 +1085,27 @@ export const createEngine = (deps: EngineDeps): Engine => {
     const reported = detected?.dnsServers;
     if (detected === null || reported === undefined || detected === lastDnsDetection) return;
     lastDnsDetection = detected;
+    // A value reported again moves to the end: the one not seen for longest goes first.
+    const remember = (known: readonly string[], servers: readonly string[], cap: number): string[] => {
+      const fresh = new Set(servers);
+      return [...known.filter((server) => !fresh.has(server)), ...fresh].slice(-cap);
+    };
+    const other = detected.otherDnsServers;
+    if (other !== undefined && other !== null) {
+      excludedOtherDns =
+        mode === 'normal'
+          ? other.slice(0, MAX_EXCLUDED_OTHER_DNS)
+          : remember(excludedOtherDns, other.slice(0, MAX_EXCLUDED_OTHER_DNS), MAX_EXCLUDED_OTHER_DNS);
+    }
     const nextTrusted = { ...trustedDns };
     const nextExcluded = { ...excludedDns };
     for (const role of ROLES) {
-      const servers = reported[role];
-      if (servers === null) continue;
+      const reportedServers = reported[role];
+      if (reportedServers === null) continue;
+      // Bounded whatever the `NetInfo`: the exclusion list must fit `MAX_EXCLUDED_DNS_SERVERS`.
+      const servers = reportedServers.slice(0, MAX_EXCLUDED_DNS_PER_ROLE);
       if (mode !== 'normal') {
-        // A value reported again moves to the end: the one not seen for longest goes first.
-        const fresh = new Set(servers);
-        nextExcluded[role] = [...excludedDns[role].filter((server) => !fresh.has(server)), ...fresh].slice(
-          -MAX_EXCLUDED_DNS_PER_ROLE,
-        );
+        nextExcluded[role] = remember(excludedDns[role], servers, MAX_EXCLUDED_DNS_PER_ROLE);
         continue;
       }
       if (servers.length === 0 && (trustedDns[role]?.length ?? 0) > 0) {
@@ -1084,7 +1114,7 @@ export const createEngine = (deps: EngineDeps): Engine => {
       }
       dnsLossStreak[role] = 0;
       nextTrusted[role] = servers;
-      nextExcluded[role] = servers.slice(0, MAX_EXCLUDED_DNS_PER_ROLE);
+      nextExcluded[role] = servers;
     }
     trustedDns = nextTrusted;
     excludedDns = nextExcluded;

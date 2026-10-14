@@ -17,8 +17,9 @@ import type { Logger } from './logger';
 /**
  * Answers "which device plays each interface role right now, and can routes go
  * through it?". Read-only: it runs `networksetup -listallhardwareports`,
- * `ipconfig getifaddr|getoption` and, only when the DHCP lease has no router or
- * no subnet mask for a role, `netstat -rn -f inet` (once per detection).
+ * `ipconfig getifaddr|getoption`, only when the DHCP lease has no router or
+ * no subnet mask for a role `netstat -rn -f inet` (once per detection), and
+ * only when the caller asks for DNS servers `scutil --dns` (once per detection).
  *
  * How a role gets its device:
  * - `wifi` — the hardware port named `Wi-Fi` (compared without regard to
@@ -102,6 +103,36 @@ const CLASS_A_MAX = 127;
 const CLASS_B_MAX = 191;
 const CLASS_C_MAX = 223;
 
+/** The DNS configuration of the system resolver: every resolver, its servers and its interface. */
+const SCUTIL_DNS_ARGS: readonly string[] = ['--dns'];
+/** Title of a section of `scutil --dns`; the scoped one is `DNS configuration (for scoped queries)`. */
+const SCUTIL_SECTION_TITLE = 'DNS configuration';
+const SCUTIL_SCOPED_SECTION_TITLE = 'DNS configuration (for scoped queries)';
+/** What `scutil --dns` prints when the system has no DNS configuration at all. */
+const SCUTIL_NO_CONFIGURATION = 'No DNS configuration available';
+const SCUTIL_RESOLVER_PREFIX = 'resolver #';
+const SCUTIL_DOMAIN_KEY = 'domain';
+const SCUTIL_IF_INDEX_KEY = 'if_index';
+const SCUTIL_NAMESERVER_PREFIX = 'nameserver[';
+const SCUTIL_INDEX_MAX_DIGITS = 10;
+/** Prefix of an IPv4-mapped IPv6 address, compared in lower case. */
+const IPV4_MAPPED_PREFIX = '::ffff:';
+/**
+ * Bounds on one `scutil --dns` output. A real one has a few dozen lines and
+ * resolvers with one to three servers; output beyond these is not trusted at
+ * all (the result is "not known"), because dropping part of it would drop DNS
+ * servers from the list of addresses that are never routed.
+ */
+export const SCUTIL_MAX_LINES = 4096;
+export const SCUTIL_MAX_LINE_LENGTH = 512;
+export const SCUTIL_MAX_RESOLVERS = 128;
+/** `nameserver[n]` with `n` below this. */
+export const SCUTIL_MAX_NAMESERVERS_PER_RESOLVER = 16;
+/** DNS servers reported for one role, in the order they are asked. */
+export const MAX_DNS_SERVERS_PER_ROLE = 8;
+/** DNS servers reported besides those of the two roles. */
+export const MAX_OTHER_DNS_SERVERS = 32;
+
 /**
  * Why a role cannot be used for routing; `null` on a usable role.
  * - `hardware-ports-unavailable` — `networksetup` failed or listed no port.
@@ -177,21 +208,32 @@ export interface DetectedInterfaces {
   readonly degraded: boolean;
   /**
    * Only when the detection was asked for it (`DetectOptions.dns`): the DNS
-   * server each role's interface got from its DHCP lease, as usable IPv4
-   * addresses. Empty: the role has no address, or its lease has no such
-   * server. `null`: the lookup failed, so nothing is known about the role.
+   * servers of each role's interface, as usable IPv4 addresses, in the order
+   * the system asks them (the first answers, the next ones are the failover).
+   * They come from `scutil --dns`: the resolvers scoped to the role's device
+   * (`if_index : <n> (<device>)`) that are not for one domain only — so a
+   * second server of the lease and servers set by hand in the network
+   * settings are included. At most `MAX_DNS_SERVERS_PER_ROLE`.
+   * Empty: the role has no address, or no resolver of its device has a
+   * server. `null`: the DNS configuration could not be read or was not
+   * understood, so nothing is known.
    * Internal like `subnet`: it is not part of the wire `InterfaceState`.
    *
    * A failed lookup does not make the detection `degraded`: these servers are
-   * not used to decide about any route, only about whom to ask for a name,
-   * and rules that name their destination must not wait for them.
-   *
-   * `ipconfig getoption <dev> domain_name_server` prints the first server of
-   * the lease only (observed on macOS 26: a lease with two servers gives one
-   * line), so each list has at most one entry. Servers set by hand in the
-   * network settings are not in the lease and are not seen here.
+   * not used to decide about any route, only about whom to ask for a name
+   * and which answers never to route, and rules that name their destination
+   * must not wait for them.
    */
   readonly dnsServers?: Readonly<Record<IfaceRole, readonly string[] | null>>;
+  /**
+   * Present exactly when `dnsServers` is: every other DNS server of the
+   * system's DNS configuration — the resolvers for one domain only
+   * (supplemental: a VPN, `/etc/resolver/<domain>`), those of interfaces that
+   * play no role, and the default ones not scoped to a role's device. Never
+   * asked by the helper; only kept out of answers. At most
+   * `MAX_OTHER_DNS_SERVERS`; `null` exactly when the roles' lists are.
+   */
+  readonly otherDnsServers?: readonly string[] | null;
 }
 
 /** Role -> device, as in `Config.ifaceOverrides`. */
@@ -209,9 +251,9 @@ export interface DetectOptions {
    */
   readonly force?: boolean | undefined;
   /**
-   * Also look up the DNS server of each role's interface (one more `ipconfig`
-   * per role that has an address). Off by default, so a caller that has no use
-   * for it runs exactly the commands it ran before.
+   * Also report the DNS servers of the system (one `scutil --dns` per
+   * detection). Off by default, so a caller that has no use for them runs
+   * exactly the commands it ran before.
    */
   readonly dns?: boolean | undefined;
 }
@@ -457,6 +499,218 @@ export const parseRoutingTable = (stdout: string): RoutingTable | null => {
   return sawHeader ? { defaults, connected } : null;
 };
 
+/** One `resolver #<n>` block of `scutil --dns`. Nothing in it is validated beyond its shape. */
+export interface DnsResolverEntry {
+  /** The block is in the `DNS configuration (for scoped queries)` section. */
+  readonly scoped: boolean;
+  /** `domain` of a resolver for one domain only (supplemental); `null` for a default resolver. */
+  readonly domain: string | null;
+  /** Interface name of `if_index : <n> (<name>)` as printed (`en0`, `utun3`); `null` without the line. */
+  readonly interfaceName: string | null;
+  /** The `nameserver[<n>]` values as printed, in index order; IPv6 ones too. */
+  readonly nameservers: readonly string[];
+}
+
+interface ResolverDraft {
+  readonly scoped: boolean;
+  domain: string | null;
+  interfaceName: string | null;
+  sawIfIndex: boolean;
+  readonly nameservers: Map<number, string>;
+}
+
+/** `<digits> (<name>)` of an `if_index` line; `null` for anything else. */
+const parseIfIndex = (value: string): string | null => {
+  const cells = splitCells(value);
+  const [index, wrapped] = cells;
+  if (cells.length !== 2 || index === undefined || wrapped === undefined) return null;
+  if (parseDecimal(index, SCUTIL_INDEX_MAX_DIGITS) === null) return null;
+  if (wrapped.length < 3 || !wrapped.startsWith('(') || !wrapped.endsWith(')')) return null;
+  const name = wrapped.slice(1, -1);
+  return name.includes('(') || name.includes(')') ? null : name;
+};
+
+/**
+ * Parses `scutil --dns`:
+ *
+ *     DNS configuration
+ *
+ *     resolver #1
+ *       search domain[0] : corp.local
+ *       nameserver[0] : 10.20.0.10
+ *       nameserver[1] : 10.20.0.11
+ *       if_index : 15 (en0)
+ *       flags    : Request A records
+ *
+ *     resolver #2
+ *       domain   : corp.local
+ *       nameserver[0] : 10.30.0.53
+ *
+ *     DNS configuration (for scoped queries)
+ *
+ *     resolver #1
+ *       nameserver[0] : 10.20.0.10
+ *       if_index : 15 (en0)
+ *       flags    : Scoped, Request A records
+ *
+ * Lines are split at the first colon and trimmed, never pattern-matched.
+ * Keys other than `domain`, `if_index` and `nameserver[<n>]` are skipped.
+ * `No DNS configuration available` as the only non-blank line is an empty
+ * list; next to anything else it is ambiguous.
+ *
+ * Returns `null` when the output is ambiguous, rather than a part of it:
+ * no section title first; a line outside a resolver block that is neither a
+ * section title nor `resolver #<n>`; a key line without a colon; a `domain`
+ * or `if_index` given twice in one block; an `if_index` value that is not
+ * `<n> (<name>)`; a `nameserver[<n>]` index that is not a plain decimal below
+ * `SCUTIL_MAX_NAMESERVERS_PER_RESOLVER` or that repeats; more than
+ * `SCUTIL_MAX_RESOLVERS` blocks, `SCUTIL_MAX_LINES` lines or a line over
+ * `SCUTIL_MAX_LINE_LENGTH` characters.
+ */
+export const parseDnsConfiguration = (stdout: string): DnsResolverEntry[] | null => {
+  const lines = stdout.split('\n');
+  if (lines.length > SCUTIL_MAX_LINES) return null;
+  const resolvers: DnsResolverEntry[] = [];
+  let section: { readonly scoped: boolean } | null = null;
+  let current: ResolverDraft | null = null;
+  /** `No DNS configuration available` was read: it must stay the only non-blank line. */
+  let noConfiguration = false;
+
+  const finish = (): boolean => {
+    if (current !== null) {
+      if (resolvers.length >= SCUTIL_MAX_RESOLVERS) return false;
+      resolvers.push({
+        scoped: current.scoped,
+        domain: current.domain,
+        interfaceName: current.interfaceName,
+        nameservers: [...current.nameservers].sort(([a], [b]) => a - b).map(([, server]) => server),
+      });
+    }
+    current = null;
+    return true;
+  };
+
+  for (const raw of lines) {
+    if (raw.length > SCUTIL_MAX_LINE_LENGTH) return null;
+    const line = raw.trim();
+    if (line === '') {
+      if (!finish()) return null;
+      continue;
+    }
+    // Anything else next to "no configuration" is ambiguous: which of the two is true?
+    if (noConfiguration) return null;
+    if (line === SCUTIL_NO_CONFIGURATION) {
+      if (section !== null) return null;
+      noConfiguration = true;
+      continue;
+    }
+    const indented = raw.startsWith(' ') || raw.startsWith('\t');
+
+    if (!indented) {
+      if (!finish()) return null;
+      if (line === SCUTIL_SECTION_TITLE || line === SCUTIL_SCOPED_SECTION_TITLE) {
+        section = { scoped: line === SCUTIL_SCOPED_SECTION_TITLE };
+        continue;
+      }
+      if (section === null || !line.startsWith(SCUTIL_RESOLVER_PREFIX)) return null;
+      if (parseDecimal(line.slice(SCUTIL_RESOLVER_PREFIX.length), SCUTIL_INDEX_MAX_DIGITS) === null) return null;
+      current = { scoped: section.scoped, domain: null, interfaceName: null, sawIfIndex: false, nameservers: new Map() };
+      continue;
+    }
+
+    const block: ResolverDraft | null = current;
+    if (block === null) return null;
+    const colon = line.indexOf(':');
+    if (colon <= 0) return null;
+    const key = line.slice(0, colon).trim();
+    const value = line.slice(colon + 1).trim();
+
+    if (key === SCUTIL_DOMAIN_KEY) {
+      if (block.domain !== null || value === '') return null;
+      block.domain = value;
+    } else if (key === SCUTIL_IF_INDEX_KEY) {
+      const name = block.sawIfIndex ? null : parseIfIndex(value);
+      if (name === null) return null;
+      block.sawIfIndex = true;
+      block.interfaceName = name;
+    } else if (key.startsWith(SCUTIL_NAMESERVER_PREFIX) && key.endsWith(']')) {
+      const index = parseDecimal(key.slice(SCUTIL_NAMESERVER_PREFIX.length, -1), SCUTIL_INDEX_MAX_DIGITS);
+      if (index === null || index >= SCUTIL_MAX_NAMESERVERS_PER_RESOLVER || block.nameservers.has(index)) return null;
+      if (value === '') return null;
+      block.nameservers.set(index, value);
+    }
+  }
+  if (!finish()) return null;
+  if (noConfiguration) return [];
+  return section === null ? null : resolvers;
+};
+
+/** The DNS servers of a detection, by role and the rest; see `DetectedInterfaces.dnsServers`. */
+export interface DnsServerReport {
+  readonly ethernet: readonly string[];
+  readonly wifi: readonly string[];
+  readonly other: readonly string[];
+  /** Values that are not usable IPv4 server addresses, as printed; IPv6 values are not listed. */
+  readonly ignored: readonly string[];
+}
+
+/**
+ * Splits the servers of a parsed DNS configuration by the devices of the
+ * roles (`null` for a role without an address). A role gets the servers of
+ * the default resolvers of its device, scoped ones first, in index order; a
+ * supplemental resolver (with `domain`) is never a role's. Every other usable
+ * server is in `other`. A value is usable when it is an IPv4 address that may
+ * be a destination (`normalizeHostAddress`): a loopback server (a local DNS
+ * proxy) could never be routed anyway. IPv6 values are skipped, except an
+ * IPv4-mapped one (`::ffff:a.b.c.d`), which is that IPv4 address.
+ *
+ * `null` when a list would exceed its bound: a part of them cannot be dropped
+ * without dropping it from the addresses that are never routed.
+ */
+export const dnsServersOf = (
+  resolvers: readonly DnsResolverEntry[],
+  devices: Readonly<Record<IfaceRole, string | null>>,
+): DnsServerReport | null => {
+  const ignored: string[] = [];
+  const usable = (text: string): string | null => {
+    // An IPv4-mapped IPv6 server (`::ffff:a.b.c.d`) is that IPv4 server; any other IPv6 one is skipped.
+    const value = text.toLowerCase().startsWith(IPV4_MAPPED_PREFIX) ? text.slice(IPV4_MAPPED_PREFIX.length) : text;
+    if (value.includes(':')) return null;
+    const server = normalizeHostAddress(value);
+    if (server.ok) return server.value;
+    if (!ignored.includes(text) && ignored.length < MAX_OTHER_DNS_SERVERS) ignored.push(text);
+    return null;
+  };
+  const ordered = [...resolvers.filter((entry) => entry.scoped), ...resolvers.filter((entry) => !entry.scoped)];
+  const forRole = (device: string | null): string[] | null => {
+    const servers: string[] = [];
+    if (device === null) return servers;
+    for (const entry of ordered) {
+      if (entry.domain !== null || entry.interfaceName !== device) continue;
+      for (const value of entry.nameservers) {
+        const server = usable(value);
+        if (server === null || servers.includes(server)) continue;
+        if (servers.length >= MAX_DNS_SERVERS_PER_ROLE) return null;
+        servers.push(server);
+      }
+    }
+    return servers;
+  };
+  const ethernet = forRole(devices.ethernet);
+  const wifi = forRole(devices.wifi);
+  if (ethernet === null || wifi === null) return null;
+  const other: string[] = [];
+  for (const entry of resolvers) {
+    for (const value of entry.nameservers) {
+      const server = usable(value);
+      if (server === null || ethernet.includes(server) || wifi.includes(server) || other.includes(server)) continue;
+      if (other.length >= MAX_OTHER_DNS_SERVERS) return null;
+      other.push(server);
+    }
+  }
+  return { ethernet, wifi, other, ignored };
+};
+
 /** The wire form of one role: what `EngineState.interfaces` carries. */
 export const toInterfaceState = (info: InterfaceInfo): InterfaceState => ({
   device: info.device,
@@ -526,7 +780,7 @@ const overridesKey = (overrides: unknown): string =>
     }),
   );
 
-type IpconfigQuery = 'address' | 'router' | 'subnet_mask' | 'domain_name_server';
+type IpconfigQuery = 'address' | 'router' | 'subnet_mask';
 
 /** Where a role's gateway or subnet came from; `null` when there is none. Logged, not returned. */
 type ValueSource = 'dhcp' | 'routing-table' | null;
@@ -545,11 +799,6 @@ interface RoleSources {
 const NO_SOURCES: RoleSources = { gateway: null, subnet: null };
 
 /** A detection result plus what is only logged about it. */
-/** The DNS servers of one role; `null` when the lookup failed. */
-type DnsLookup = readonly string[] | null;
-
-const NO_DNS: DnsLookup = [];
-
 interface Detection {
   readonly result: DetectedInterfaces;
   readonly sources: { readonly ethernet: RoleSources; readonly wifi: RoleSources };
@@ -616,6 +865,7 @@ const freezeResult = (result: DetectedInterfaces): DetectedInterfaces => {
     if (result.dnsServers.wifi !== null) Object.freeze(result.dnsServers.wifi);
     Object.freeze(result.dnsServers);
   }
+  if (result.otherDnsServers !== undefined && result.otherDnsServers !== null) Object.freeze(result.otherDnsServers);
   return Object.freeze(result);
 };
 
@@ -628,6 +878,7 @@ export const createNetInfo = (deps: NetInfoDeps): NetInfo => {
   let cache: { key: string; at: number; value: DetectedInterfaces } | null = null;
   let inFlight: { key: string; generation: number; promise: Promise<DetectedInterfaces> } | null = null;
   let lastSummary: string | null = null;
+  let lastIgnoredDns: string | null = null;
 
   /** Runs a command; a refused call (a bug here, not a system condition) is logged and reported as `null`. */
   const run = async (
@@ -718,22 +969,39 @@ export const createNetInfo = (deps: NetInfoDeps): NetInfo => {
   };
 
   /**
-   * The DNS server of the device's DHCP lease. No value is ordinary (a static
-   * address, a lease without the option). A value that is not a routable IPv4
-   * address is not used: the query worked, there is just no server to ask. A
-   * query that failed gives `null`.
+   * The system's DNS configuration, split by the devices of the roles. `null`
+   * when it could not be read or was not understood: then nothing is known
+   * about any server, which is not the same as "no server".
    */
-  const lookupDnsServers = async (device: string): Promise<DnsLookup> => {
-    const lookup = await ipconfig(device, 'domain_name_server');
-    if (lookup.value === null) return lookup.failed ? null : NO_DNS;
-    const server = normalizeHostAddress(lookup.value);
-    if (server.ok) return [server.value];
-    logger.warn('ipconfig returned an unusable DNS server; it is ignored', {
-      device,
-      value: describeInput(lookup.value),
-      reason: server.error.code,
-    });
-    return NO_DNS;
+  const lookupDnsServers = async (devices: Readonly<Record<IfaceRole, string | null>>): Promise<DnsServerReport | null> => {
+    const result = await run(ALLOWED_BINARIES.scutil, SCUTIL_DNS_ARGS);
+    if (result === null) return null;
+    if (!result.ok) {
+      logger.warn('could not read the DNS configuration', { failure: result.failure, exitCode: result.exitCode });
+      return null;
+    }
+    const resolvers = parseDnsConfiguration(result.stdout);
+    if (resolvers === null) {
+      logger.warn('unexpected output from scutil --dns', { outputLength: result.stdout.length });
+      return null;
+    }
+    const report = dnsServersOf(resolvers, devices);
+    if (report === null) {
+      logger.warn('the DNS configuration lists more DNS servers than can be used', {
+        perRole: MAX_DNS_SERVERS_PER_ROLE,
+        other: MAX_OTHER_DNS_SERVERS,
+      });
+      return null;
+    }
+    // A local DNS proxy (127.0.0.1) is an ordinary setup: said once, not on every detection.
+    const ignored = JSON.stringify(report.ignored);
+    if (report.ignored.length > 0) {
+      logger.log(ignored === lastIgnoredDns ? 'debug' : 'warn', 'DNS servers that are not usable addresses are ignored', {
+        values: report.ignored.map(describeInput),
+      });
+    }
+    lastIgnoredDns = ignored;
+    return report;
   };
 
   /** `null` when the table could not be read or does not look like one. */
@@ -853,23 +1121,18 @@ export const createNetInfo = (deps: NetInfoDeps): NetInfo => {
     choice: RoleChoice,
     addresses: ReadonlyMap<string, Lookup>,
     routingTable: () => Promise<RoutingTable | null>,
-    wantDns: boolean,
-  ): Promise<{ info: InterfaceInfo; degraded: boolean; sources: RoleSources; dnsServers: DnsLookup }> => {
+  ): Promise<{ info: InterfaceInfo; degraded: boolean; sources: RoleSources }> => {
     if (choice.reason !== null || choice.device === null) {
-      return { info: down(role, choice, choice.reason ?? 'no-device'), degraded: false, sources: NO_SOURCES, dnsServers: [] };
+      return { info: down(role, choice, choice.reason ?? 'no-device'), degraded: false, sources: NO_SOURCES };
     }
     const { device } = choice;
     const address = addresses.get(device) ?? FAILED;
     if (address.value === null) {
       const reason = address.failed ? 'address-lookup-failed' : 'no-address';
-      return { info: down(role, choice, reason), degraded: address.failed, sources: NO_SOURCES, dnsServers: [] };
+      return { info: down(role, choice, reason), degraded: address.failed, sources: NO_SOURCES };
     }
     const ip = address.value;
-    const [leaseGateway, leaseSubnet, dns] = await Promise.all([
-      lookupGateway(device),
-      lookupSubnet(device, ip),
-      wantDns ? lookupDnsServers(device) : NO_DNS,
-    ]);
+    const [leaseGateway, leaseSubnet] = await Promise.all([lookupGateway(device), lookupSubnet(device, ip)]);
     // The routing table is consulted only for what the lease does not have. A
     // lease query that failed is not "no value": it stays failed.
     const gatewayMissing = leaseGateway.value === null && !leaseGateway.failed;
@@ -897,7 +1160,6 @@ export const createNetInfo = (deps: NetInfoDeps): NetInfo => {
         overridden: choice.overridden,
       },
       degraded: gateway.failed || subnet.failed,
-      dnsServers: dns,
       sources: {
         gateway: sourceOf(gateway.value !== null, gatewayMissing),
         subnet: sourceOf(subnet.subnet !== null, subnetMissing),
@@ -964,9 +1226,15 @@ export const createNetInfo = (deps: NetInfoDeps): NetInfo => {
     let tableLoad: Promise<RoutingTable | null> | null = null;
     const routingTable = (): Promise<RoutingTable | null> => (tableLoad ??= loadRoutingTable());
 
-    const [ethernet, wifi] = await Promise.all([
-      describeRole('ethernet', ethernetChoice, addresses, routingTable, wantDns),
-      describeRole('wifi', wifiChoice, addresses, routingTable, wantDns),
+    // A role's servers are those of its device once it has an address, as `up` means on the wire.
+    const dnsDevice = (choice: RoleChoice): string | null =>
+      choice.reason === null && choice.device !== null && (addresses.get(choice.device)?.value ?? null) !== null
+        ? choice.device
+        : null;
+    const [ethernet, wifi, dns] = await Promise.all([
+      describeRole('ethernet', ethernetChoice, addresses, routingTable),
+      describeRole('wifi', wifiChoice, addresses, routingTable),
+      wantDns ? lookupDnsServers({ ethernet: dnsDevice(ethernetChoice), wifi: dnsDevice(wifiChoice) }) : null,
     ]);
 
     return {
@@ -979,7 +1247,12 @@ export const createNetInfo = (deps: NetInfoDeps): NetInfo => {
           ip: addresses.get(port.device)?.value ?? null,
         })),
         degraded: ethernet.degraded || wifi.degraded || [...addresses.values()].some((lookup) => lookup.failed),
-        ...(wantDns ? { dnsServers: { ethernet: ethernet.dnsServers, wifi: wifi.dnsServers } } : {}),
+        ...(wantDns
+          ? {
+              dnsServers: { ethernet: dns?.ethernet ?? null, wifi: dns?.wifi ?? null },
+              otherDnsServers: dns?.other ?? null,
+            }
+          : {}),
       },
       sources: { ethernet: ethernet.sources, wifi: wifi.sources },
     };
@@ -1006,7 +1279,7 @@ export const createNetInfo = (deps: NetInfoDeps): NetInfo => {
       wifi: summaryOf(result.wifi, sources.wifi),
       adapters: result.adapters.length,
       degraded: result.degraded,
-      ...(result.dnsServers === undefined ? {} : { dnsServers: result.dnsServers }),
+      ...(result.dnsServers === undefined ? {} : { dnsServers: result.dnsServers, otherDnsServers: result.otherDnsServers }),
     };
     const summary = JSON.stringify(context);
     logger.log(summary === lastSummary ? 'debug' : 'info', 'interfaces detected', { ...context, durationMs });
