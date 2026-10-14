@@ -7,13 +7,19 @@ import {
   COMMAND_ENV,
   CommandRejectedError,
   createCommandRunner,
+  createProcessSpawner,
   DEFAULT_MAX_OUTPUT_BYTES,
   DEFAULT_TIMEOUT_MS,
   isAllowedBinary,
   MAX_EXPECTED_EXIT_CODES,
   MAX_OUTPUT_BYTES,
+  MAX_STREAM_LINE_LENGTH,
   MAX_TIMEOUT_MS,
   type AllowedBinary,
+  type ChildProcessLike,
+  type ProcessExit,
+  type ProcessSpawnOptions,
+  type SpawnFn,
   type ExecFileFailure,
   type ExecFileFn,
   type ExecFileSpawnOptions,
@@ -701,5 +707,228 @@ describe('createFakeCommandRunner', () => {
 
     expect(fake.calls).toHaveLength(0);
     await expect(fake.run('/usr/sbin/netstat', ['-rn'])).rejects.toThrow('No fake response');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Long-running processes (TASK-112) — a fake `spawn`, no process is started
+// ---------------------------------------------------------------------------
+
+interface FakeChild extends ChildProcessLike {
+  readonly kills: string[];
+  out(chunk: string): void;
+  err(chunk: string): void;
+  exit(code: number | null, signal?: string | null): void;
+  fail(error: Error): void;
+  readonly encodings: string[];
+}
+
+const createFakeChild = (): FakeChild => {
+  const listeners: Record<string, ((...args: never[]) => void)[]> = {};
+  const add = (event: string, listener: (...args: never[]) => void): void => {
+    (listeners[event] ??= []).push(listener);
+  };
+  const emit = (event: string, ...args: unknown[]): void => {
+    for (const listener of listeners[event] ?? []) (listener as (...values: unknown[]) => void)(...args);
+  };
+  const encodings: string[] = [];
+  const stream = (name: string) => ({
+    setEncoding: (encoding: 'utf8') => {
+      encodings.push(`${name}:${encoding}`);
+    },
+    on: (_event: 'data', listener: (chunk: string) => void) => {
+      add(`${name}:data`, listener);
+    },
+  });
+  const kills: string[] = [];
+  return {
+    pid: 4242,
+    stdout: stream('stdout'),
+    stderr: stream('stderr'),
+    on: (event: string, listener: (...args: never[]) => void) => {
+      add(event, listener);
+    },
+    kill: (signal) => {
+      kills.push(signal);
+      return true;
+    },
+    kills,
+    encodings,
+    out: (chunk) => {
+      emit('stdout:data', chunk);
+    },
+    err: (chunk) => {
+      emit('stderr:data', chunk);
+    },
+    exit: (code, signal = null) => {
+      emit('exit', code, signal);
+    },
+    fail: (error) => {
+      emit('error', error);
+    },
+  };
+};
+
+const spawnSetup = (makeChild: () => FakeChild = createFakeChild) => {
+  const calls: { file: string; args: readonly string[]; options: ProcessSpawnOptions }[] = [];
+  const children: FakeChild[] = [];
+  const spawn: SpawnFn = (file, args, options) => {
+    calls.push({ file, args, options });
+    const child = makeChild();
+    children.push(child);
+    return child;
+  };
+  const memory = createMemorySink();
+  const spawner = createProcessSpawner({ logger: createLogger({ sinks: [memory.sink] }), spawn });
+  const lines: string[] = [];
+  const exits: ProcessExit[] = [];
+  const handlers = { onLine: (line: string) => void lines.push(line), onExit: (exit: ProcessExit) => void exits.push(exit) };
+  return { spawner, calls, children, entries: memory.entries, lines, exits, handlers };
+};
+
+describe('createProcessSpawner', () => {
+  it('starts the allowlisted binary without a shell, with the fixed environment and stdin closed', () => {
+    const h = spawnSetup();
+    h.spawner.spawn('/sbin/route', ['-n', 'monitor'], h.handlers);
+    expect(h.calls).toEqual([
+      {
+        file: '/sbin/route',
+        args: ['-n', 'monitor'],
+        options: { env: COMMAND_ENV, cwd: '/', shell: false, windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] },
+      },
+    ]);
+    expect(h.children[0]?.encodings).toEqual(['stdout:utf8', 'stderr:utf8']);
+    const started = h.entries.find((entry) => entry.msg === 'long-running command started');
+    expect(started?.context).toMatchObject({ component: 'exec', bin: '/sbin/route', args: ['-n', 'monitor'], pid: 4242 });
+  });
+
+  it.each([
+    ['route', ['-n', 'monitor']],
+    ['/sbin/../sbin/route', ['-n', 'monitor']],
+    ['/bin/sh', ['-c', 'route -n monitor']],
+    ['/sbin/route', ['-n', 'mon\0itor']],
+    ['/sbin/route', '-n monitor'],
+  ])('refuses %s %j before anything is started', (bin, args) => {
+    const h = spawnSetup();
+    expect(() => h.spawner.spawn(bin as AllowedBinary, args as unknown as readonly string[], h.handlers)).toThrow(CommandRejectedError);
+    expect(h.calls).toEqual([]);
+    expect(h.exits).toEqual([]);
+    expect(h.entries.find((entry) => entry.msg === 'command rejected')?.level).toBe('error');
+  });
+
+  it('hands over complete lines only, across chunk boundaries', () => {
+    const h = spawnSetup();
+    h.spawner.spawn('/sbin/route', ['-n', 'monitor'], h.handlers);
+    const child = h.children[0];
+    child?.out('RTM_IFI');
+    child?.out('NFO: iface status change\nsecond line\r\nthi');
+    expect(h.lines).toEqual(['RTM_IFINFO: iface status change', 'second line\r']);
+    child?.out('rd\n\n');
+    expect(h.lines).toEqual(['RTM_IFINFO: iface status change', 'second line\r', 'third', '']);
+  });
+
+  it('drops an over-long line up to its newline, once warned, and goes on with the next one', () => {
+    const h = spawnSetup();
+    h.spawner.spawn('/sbin/route', ['-n', 'monitor'], h.handlers);
+    const child = h.children[0];
+    child?.out('x'.repeat(MAX_STREAM_LINE_LENGTH));
+    child?.out('y');
+    child?.out('z'.repeat(100));
+    child?.out('\nnext\n');
+    child?.out(`${'w'.repeat(MAX_STREAM_LINE_LENGTH + 1)}\nafter\n`);
+    expect(h.lines).toEqual(['next', 'after']);
+    expect(h.entries.filter((entry) => entry.msg === 'over-long output line of a long-running command dropped')).toHaveLength(1);
+    // A line of exactly the limit is kept.
+    child?.out(`${'v'.repeat(MAX_STREAM_LINE_LENGTH)}\n`);
+    expect(h.lines.at(-1)).toHaveLength(MAX_STREAM_LINE_LENGTH);
+  });
+
+  it('bounds the buffer of a stream without newlines: warns at once, delivers nothing, then the next whole line', () => {
+    const h = spawnSetup();
+    h.spawner.spawn('/sbin/route', ['-n', 'monitor'], h.handlers);
+    const child = h.children[0];
+    const warnings = (): number =>
+      h.entries.filter((entry) => entry.msg === 'over-long output line of a long-running command dropped').length;
+    child?.out('a'.repeat(MAX_STREAM_LINE_LENGTH));
+    expect(warnings()).toBe(0);
+    child?.out('b');
+    // Over the limit and still no newline: warned right away.
+    expect(warnings()).toBe(1);
+    for (let index = 0; index < 50; index += 1) child?.out('c'.repeat(MAX_STREAM_LINE_LENGTH));
+    expect(h.lines).toEqual([]);
+    expect(warnings()).toBe(1);
+    child?.out('tail of the long line\nRTM_IFINFO: iface status change\n');
+    expect(h.lines).toEqual(['RTM_IFINFO: iface status change']);
+  });
+
+  it('logs a SIGTERM that could not be sent', () => {
+    const h = spawnSetup(() => ({ ...createFakeChild(), kill: () => false }));
+    h.spawner.spawn('/sbin/route', ['-n', 'monitor'], h.handlers).stop();
+    expect(h.entries.find((entry) => entry.msg === 'SIGTERM could not be sent to a long-running command')?.level).toBe('warn');
+  });
+
+  it('reports the exit once, with code, signal and the end of stderr, and logs it with the argv', () => {
+    const h = spawnSetup();
+    h.spawner.spawn('/sbin/route', ['-n', 'monitor'], h.handlers);
+    const child = h.children[0];
+    child?.err('route: socket: Operation not permitted\n');
+    child?.fail(new Error('EPIPE'));
+    child?.exit(1);
+    child?.out('late line\n');
+    expect(h.exits).toEqual([{ exitCode: null, signal: null, error: 'EPIPE', stopped: false }]);
+    expect(h.lines).toEqual([]);
+    const failed = h.entries.find((entry) => entry.msg === 'long-running command failed');
+    expect(failed?.level).toBe('error');
+    expect(failed?.context).toMatchObject({ bin: '/sbin/route', args: ['-n', 'monitor'], stderr: 'route: socket: Operation not permitted\n' });
+  });
+
+  it('logs an unexpected exit at warn', () => {
+    const h = spawnSetup();
+    h.spawner.spawn('/sbin/route', ['-n', 'monitor'], h.handlers);
+    h.children[0]?.exit(null, 'SIGKILL');
+    expect(h.exits).toEqual([{ exitCode: null, signal: 'SIGKILL', error: null, stopped: false }]);
+    expect(h.entries.find((entry) => entry.msg === 'long-running command exited')?.level).toBe('warn');
+  });
+
+  it('stops with SIGTERM once and reports the exit as stopped', () => {
+    const h = spawnSetup();
+    const running = h.spawner.spawn('/sbin/route', ['-n', 'monitor'], h.handlers);
+    running.stop();
+    running.stop();
+    expect(h.children[0]?.kills).toEqual(['SIGTERM']);
+    h.children[0]?.exit(null, 'SIGTERM');
+    expect(h.exits).toEqual([{ exitCode: null, signal: 'SIGTERM', error: null, stopped: true }]);
+    expect(h.entries.find((entry) => entry.msg === 'long-running command stopped')?.level).toBe('info');
+    running.stop();
+    expect(h.children[0]?.kills).toEqual(['SIGTERM']);
+  });
+
+  it('reports a spawn that throws as an exit, synchronously, and stop() is then harmless', () => {
+    const h = spawnSetup(() => {
+      throw new Error('spawn EACCES');
+    });
+    const running = h.spawner.spawn('/sbin/route', ['-n', 'monitor'], h.handlers);
+    expect(h.exits).toEqual([{ exitCode: null, signal: null, error: 'spawn EACCES', stopped: false }]);
+    expect(() => {
+      running.stop();
+    }).not.toThrow();
+  });
+
+  it('isolates handler throws', () => {
+    const h = spawnSetup();
+    h.spawner.spawn('/sbin/route', ['-n', 'monitor'], {
+      onLine: () => {
+        throw new Error('bad line handler');
+      },
+      onExit: () => {
+        throw new Error('bad exit handler');
+      },
+    });
+    expect(() => {
+      h.children[0]?.out('a\nb\n');
+      h.children[0]?.exit(0);
+    }).not.toThrow();
+    expect(h.entries.filter((entry) => entry.msg === 'line handler of a long-running command threw')).toHaveLength(2);
+    expect(h.entries.filter((entry) => entry.msg === 'exit handler of a long-running command threw')).toHaveLength(1);
   });
 });

@@ -1,4 +1,4 @@
-import { execFile } from 'node:child_process';
+import { execFile, spawn } from 'node:child_process';
 
 import type { Logger } from './logger';
 
@@ -427,6 +427,210 @@ export const createCommandRunner = (deps: CommandRunnerDeps): CommandRunner => {
       };
       logResult(result, limits.expectedExitCodes);
       return result;
+    },
+  };
+};
+
+
+// ---------------------------------------------------------------------------
+// Long-running processes
+// ---------------------------------------------------------------------------
+
+/** Longest stdout line handed to `onLine`; the rest of a longer line is dropped up to its newline. */
+export const MAX_STREAM_LINE_LENGTH = 8192;
+
+/** Options every long-running child gets; nothing about them depends on the caller. */
+export interface ProcessSpawnOptions {
+  readonly env: Readonly<Record<string, string>>;
+  readonly cwd: string;
+  readonly shell: false;
+  readonly windowsHide: true;
+  readonly stdio: readonly ['ignore', 'pipe', 'pipe'];
+}
+
+/** The part of a readable child stream the spawner uses. */
+export interface ChildStreamLike {
+  setEncoding(encoding: 'utf8'): unknown;
+  on(event: 'data', listener: (chunk: string) => void): unknown;
+}
+
+/** The part of a `ChildProcess` the spawner uses; tests pass a fake. */
+export interface ChildProcessLike {
+  readonly pid?: number | undefined;
+  readonly stdout: ChildStreamLike | null;
+  readonly stderr: ChildStreamLike | null;
+  on(event: 'exit', listener: (code: number | null, signal: string | null) => void): unknown;
+  on(event: 'error', listener: (error: Error) => void): unknown;
+  kill(signal: 'SIGTERM'): boolean;
+}
+
+/** The slice of `spawn` the spawner uses; injectable so tests start no process. */
+export type SpawnFn = (file: string, args: readonly string[], options: ProcessSpawnOptions) => ChildProcessLike;
+
+const nodeSpawn: SpawnFn = (file, args, options) =>
+  spawn(file, [...args], { ...options, env: { ...options.env }, stdio: [...options.stdio] });
+
+/** How a long-running child ended. */
+export interface ProcessExit {
+  readonly exitCode: number | null;
+  readonly signal: string | null;
+  /** Set when the process could not be started or failed while running. */
+  readonly error: string | null;
+  /** True when it ended after `stop()`. */
+  readonly stopped: boolean;
+}
+
+export interface ProcessHandlers {
+  /** Every complete stdout line, without its newline. A throw is logged and the next line still arrives. */
+  readonly onLine: (line: string) => void;
+  /**
+   * Called exactly once: when the process exits, fails, or could not be
+   * started (then synchronously, from `spawn`). After `stop()` it still comes,
+   * with `stopped: true`. No `onLine` follows it.
+   */
+  readonly onExit: (exit: ProcessExit) => void;
+}
+
+export interface RunningProcess {
+  /** Sends SIGTERM once; `onExit` follows with `stopped: true`. Safe to call more than once. */
+  stop(): void;
+}
+
+/**
+ * Starts commands that keep running (`route -n monitor`) under the same rules
+ * as `CommandRunner`: allowlisted absolute path, string argv without NUL, no
+ * shell, the fixed `COMMAND_ENV` / `COMMAND_CWD`, stdin closed. Every start
+ * and every end is logged with the binary and the arguments.
+ */
+export interface ProcessSpawner {
+  /** Rejects a refused call with `CommandRejectedError` (thrown synchronously, nothing started). */
+  spawn(bin: AllowedBinary, args: readonly string[], handlers: ProcessHandlers): RunningProcess;
+}
+
+export interface ProcessSpawnerDeps {
+  readonly logger: Logger;
+  /** Defaults to Node's own `spawn`. */
+  readonly spawn?: SpawnFn;
+}
+
+export const createProcessSpawner = (deps: ProcessSpawnerDeps): ProcessSpawner => {
+  const logger = deps.logger.child({ component: 'exec' });
+  const spawnImpl = deps.spawn ?? nodeSpawn;
+
+  return {
+    spawn: (bin, args, handlers) => {
+      let argv: readonly string[];
+      try {
+        assertAllowedBinary(bin);
+        const snapshot: unknown = Array.isArray(args) ? Object.freeze([...(args as unknown[])]) : args;
+        assertSafeArgs(snapshot);
+        argv = snapshot;
+      } catch (error) {
+        logger.error('command rejected', {
+          bin: typeof bin === 'string' ? bin : typeof bin,
+          reason: error instanceof CommandRejectedError ? error.reason : 'unknown',
+          error: describeThrown(error),
+        });
+        throw error;
+      }
+
+      let ended = false;
+      let stopRequested = false;
+      let stderrTail = '';
+      let partial = '';
+      /** True while the rest of an over-long line is being skipped. */
+      let skipping = false;
+      let overlongReported = false;
+
+      const end = (exitCode: number | null, signal: string | null, error: string | null): void => {
+        if (ended) return;
+        ended = true;
+        const context = { bin, args: argv, exitCode, signal, error, stderr: stderrTail };
+        if (stopRequested) logger.info('long-running command stopped', context);
+        else if (error !== null) logger.error('long-running command failed', context);
+        else logger.warn('long-running command exited', context);
+        try {
+          handlers.onExit({ exitCode, signal, error, stopped: stopRequested });
+        } catch (thrown) {
+          logger.error('exit handler of a long-running command threw', { bin, error: describeThrown(thrown) });
+        }
+      };
+
+      const deliver = (line: string): void => {
+        try {
+          handlers.onLine(line);
+        } catch (thrown) {
+          logger.error('line handler of a long-running command threw', { bin, error: describeThrown(thrown) });
+        }
+      };
+
+      const dropOverlong = (): void => {
+        partial = '';
+        if (overlongReported) return;
+        overlongReported = true;
+        logger.warn('over-long output line of a long-running command dropped', { bin, limit: MAX_STREAM_LINE_LENGTH });
+      };
+
+      // Lines are cut at '\n' only; the buffer never holds more than one line of at most the limit.
+      const onStdout = (chunk: string): void => {
+        if (ended) return;
+        const pieces = chunk.split('\n');
+        const last = pieces.pop() ?? '';
+        for (const piece of pieces) {
+          if (skipping) skipping = false;
+          else if (partial.length + piece.length > MAX_STREAM_LINE_LENGTH) dropOverlong();
+          else deliver(partial + piece);
+          partial = '';
+        }
+        if (skipping) return;
+        if (partial.length + last.length > MAX_STREAM_LINE_LENGTH) {
+          dropOverlong();
+          skipping = true;
+          return;
+        }
+        partial += last;
+      };
+
+      let child: ChildProcessLike;
+      try {
+        child = spawnImpl(bin, argv, {
+          env: COMMAND_ENV,
+          cwd: COMMAND_CWD,
+          shell: false,
+          windowsHide: true,
+          stdio: ['ignore', 'pipe', 'pipe'],
+        });
+      } catch (error) {
+        end(null, null, describeThrown(error));
+        return { stop: () => undefined };
+      }
+
+      child.stdout?.setEncoding('utf8');
+      child.stdout?.on('data', onStdout);
+      child.stderr?.setEncoding('utf8');
+      child.stderr?.on('data', (chunk: string) => {
+        stderrTail = (stderrTail + chunk).slice(-STDERR_LOG_LIMIT);
+      });
+      child.on('error', (error: Error) => {
+        end(null, null, describeThrown(error));
+      });
+      child.on('exit', (code: number | null, signal: string | null) => {
+        end(code, signal, null);
+      });
+      logger.info('long-running command started', { bin, args: argv, pid: child.pid ?? null });
+
+      return {
+        stop: () => {
+          if (ended || stopRequested) return;
+          stopRequested = true;
+          try {
+            // `false`: no signal was delivered (the process may be gone already, or may linger).
+            if (!child.kill('SIGTERM')) logger.warn('SIGTERM could not be sent to a long-running command', { bin, pid: child.pid ?? null });
+          } catch (error) {
+            logger.error('could not stop a long-running command', { bin, error: describeThrown(error) });
+          }
+        },
+      };
     },
   };
 };

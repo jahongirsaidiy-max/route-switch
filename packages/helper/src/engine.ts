@@ -49,8 +49,11 @@ import type { RouteAddResult, RouteDeleteResult, RouteOperations } from './route
  * - `/etc/resolver` files: synchronised between `applyDiff` and the state
  *   computation in `runPass`, reporting per-rule problems the way
  *   `recordIssue` does.
- * - network monitor: calls `netinfo.invalidate()` and then
- *   `reconcile('network-change')`; `scheduleRetry` is the timer hook.
+ * - network monitor (`monitor.ts`): calls `netinfo.invalidate()` and then
+ *   `reconcile('network-change')`; `scheduleRetry` is the timer hook. Its
+ *   drift check reads the table itself and reports routes that are gone with
+ *   `forgetApplied`; `isReconciling` and `getRetryNeeds` tell it when to hold
+ *   back and when a periodic pass is worth running.
  * - `state.json`: `onApplied` receives the applied routes whenever the set
  *   changed, `getApplied()` reads them and `restoreApplied()` seeds them after
  *   a restart.
@@ -130,6 +133,33 @@ export const unresolvedDomain: (rule: Rule) => DomainTargets = () => ({
 export interface ReconcileOptions {
   /** Bypass the interface cache for this pass (the "apply" button). */
   readonly force?: boolean | undefined;
+  /**
+   * Run again, in this pass, the route commands a periodic pass would skip:
+   * adds refused because of a connected route (`REFUSAL_RETRY_REASONS`) and
+   * commands that are backed off after failing again and again
+   * (`FAILURE_BACKOFF_AFTER`). The monitor sets it every few drift checks, so
+   * that nothing stays refused for good on a network where nothing happens.
+   */
+  readonly retryRefused?: boolean | undefined;
+}
+
+/** What is waiting for a later pass; see `Engine.getRetryNeeds`. */
+export interface RetryNeeds {
+  /** `summary.deferred` of the last pass: routes not added because the detection could not be trusted. */
+  readonly deferred: number;
+  /** Wanted routes whose add was refused because a connected route is in the way. */
+  readonly refused: number;
+  /** Routes whose last add or delete failed (and that are still wanted, or still applied). */
+  readonly failing: number;
+}
+
+/** A route the drift check found missing from the table, or no longer through our gateway. */
+export interface DriftedRoute {
+  readonly dst: string;
+  /** The gateway it was applied with; an entry applied with another gateway is not forgotten. */
+  readonly gateway: string;
+  /** What the table shows instead, for the log (`missing`, `other-gateway`, ...). */
+  readonly found: string;
 }
 
 export interface ReconcileSummary {
@@ -221,7 +251,9 @@ export interface Engine {
    * Brings the routing table in line with the config. Never rejects. A call
    * made while a pass is running is merged with every other such call into
    * one follow-up pass, which runs with the latest reason; each caller gets
-   * the outcome of a pass that started after its call.
+   * the outcome of a pass that started after its call. A merged event reason
+   * (`REFUSAL_RETRY_REASONS`) or `retryRefused` keeps the follow-up urgent:
+   * it runs as if `retryRefused` were set.
    */
   reconcile(reason: ReconcileReason, options?: ReconcileOptions): Promise<ReconcileOutcome>;
   /** The state computed last; before the first reconcile, a state with nothing applied. */
@@ -238,6 +270,19 @@ export interface Engine {
   /** Registers a listener for every computed state; returns the function that removes it. */
   subscribe(listener: StateListener): () => void;
   getApplied(): readonly AppliedRoute[];
+  /**
+   * Forgets applied routes the routing table no longer has as we added them
+   * (deleted by someone, replaced through another gateway, taken over by a
+   * connected route). Nothing is deleted: the next reconcile adds them again
+   * through `routeAdd`, whose checks decide what may be replaced. An entry is
+   * forgotten only while it is still applied with the given gateway. Returns
+   * how many were forgotten. Call it between passes (`isReconciling()` false).
+   */
+  forgetApplied(routes: readonly DriftedRoute[]): number;
+  /** True while a pass runs (or one is queued behind it). */
+  isReconciling(): boolean;
+  /** What a periodic pass could make progress on; the monitor reads it every drift check. */
+  getRetryNeeds(): RetryNeeds;
   /**
    * Seeds `applied` with routes a previous process left behind, so the next
    * reconcile removes or adopts them. Every entry is validated again.
@@ -284,7 +329,9 @@ export const MAX_EXCLUDED_DNS_SERVERS = 2 * (2 * MAX_EXCLUDED_DNS_PER_ROLE) + MA
  * way stays refused until something that could change that happens. Its
  * `route add` is attempted again only in a pass with one of these reasons, or
  * when the detected interface facts differ from those at the refusal; the
- * periodic reasons (`drift-check`, `dns-refresh`) do not re-run the command.
+ * periodic reasons (`drift-check`, `dns-refresh`) do not re-run the command,
+ * unless the pass runs with `ReconcileOptions.retryRefused` (the monitor's
+ * periodic retry, so a refusal does not last for good on a quiet network).
  */
 export const REFUSAL_RETRY_REASONS: ReadonlySet<ReconcileReason> = new Set<ReconcileReason>([
   'startup',
@@ -293,6 +340,18 @@ export const REFUSAL_RETRY_REASONS: ReadonlySet<ReconcileReason> = new Set<Recon
   'network-change',
   'manual',
 ]);
+/**
+ * A route command (an add, or the delete of a route of ours, each with its
+ * `route get` check) that failed this many passes in a row is no longer run
+ * in every periodic pass (`drift-check`, `dns-refresh`) but after a growing
+ * delay: `FAILURE_BACKOFF_BASE_MS` doubling up to `FAILURE_BACKOFF_MAX_MS`.
+ * Passes with a reason of `REFUSAL_RETRY_REASONS`, and those run with
+ * `retryRefused`, always try. A lookup that never works would otherwise run,
+ * and log an error, in every pass forever.
+ */
+export const FAILURE_BACKOFF_AFTER = 3;
+export const FAILURE_BACKOFF_BASE_MS = 60_000;
+export const FAILURE_BACKOFF_MAX_MS = 15 * 60_000;
 const MAX_RESTORED_ROUTES = 500 * PROTOCOL_LIMITS.maxAppliedDestinationsPerRule;
 const MAX_RULE_IDS_PER_ROUTE = 500;
 
@@ -605,6 +664,12 @@ export const createEngine = (deps: EngineDeps): Engine => {
    * and that is still wanted. See `REFUSAL_RETRY_REASONS`.
    */
   const refusedAdds = new Map<string, string>();
+  /** Route key -> consecutive failures of its add or delete, and when a periodic pass may try again. */
+  const failing = new Map<string, { count: number; nextAt: number; issue: Issue }>();
+  /** `summary.deferred` of the last pass. */
+  let lastDeferred = 0;
+  /** `applied` changed outside a pass (`forgetApplied`): the next pass reports it to `onApplied`. */
+  let appliedDirty = false;
 
   const appliedSnapshot = (): AppliedRoute[] =>
     [...applied.values()].map(({ dst, gateway, ruleIds }) => ({ dst, gateway, ruleIds: [...ruleIds] }));
@@ -960,7 +1025,43 @@ export const createEngine = (deps: EngineDeps): Engine => {
     reason: ReconcileReason,
     /** The guard-relevant interface facts of this pass, as one comparable string. */
     facts: string,
+    retryRefused: boolean,
   ): Promise<Counters> => {
+    const nowMs = now().getTime();
+    const urgent = retryRefused || REFUSAL_RETRY_REASONS.has(reason);
+    /** False while a command that keeps failing is backed off and this is a periodic pass. */
+    const mayTry = (key: string): boolean => {
+      const entry = failing.get(key);
+      return entry === undefined || entry.count < FAILURE_BACKOFF_AFTER || urgent || nowMs >= entry.nextAt;
+    };
+    const noteFailure = (key: string, dst: string, issue: Issue): void => {
+      const count = (failing.get(key)?.count ?? 0) + 1;
+      const delay =
+        count < FAILURE_BACKOFF_AFTER
+          ? 0
+          : Math.min(FAILURE_BACKOFF_BASE_MS * 2 ** Math.min(count - FAILURE_BACKOFF_AFTER, 16), FAILURE_BACKOFF_MAX_MS);
+      failing.set(key, { count, nextAt: nowMs + delay, issue });
+      if (count === FAILURE_BACKOFF_AFTER) {
+        logger.warn('route command keeps failing; periodic passes retry it less often from now on', {
+          reason,
+          dst,
+          failures: count,
+          retryInMs: delay,
+        });
+      }
+    };
+    const backedOff = (key: string, dst: string): Issue | null => {
+      if (mayTry(key)) return null;
+      const entry = failing.get(key);
+      if (entry === undefined) return null;
+      logger.debug('route command backed off after repeated failures', {
+        reason,
+        dst,
+        failures: entry.count,
+        retryInMs: Math.max(0, entry.nextAt - nowMs),
+      });
+      return entry.issue;
+    };
     const holding = mode === 'hold' || mode === 'failed';
     const counters: Counters = { added: 0, removed: 0, failed: 0, kept: 0, deferred: 0, changed: false };
     const appliedAtStart = new Set(applied.keys());
@@ -987,10 +1088,18 @@ export const createEngine = (deps: EngineDeps): Engine => {
     // Deletes first: a route whose gateway changed has to go before it is added again.
     for (const [key, entry] of stale) {
       if (held.has(key)) continue;
+      const waiting = backedOff(key, entry.dst);
+      if (waiting !== null) {
+        stuck.set(key, waiting);
+        continue;
+      }
       const result = await safeDelete(entry);
+      if (!('thrown' in result) && (result.ok || result.outcome === 'rejected')) failing.delete(key);
       if ('thrown' in result) {
         counters.failed += 1;
-        stuck.set(key, { reasonCode: 'internal', reason: `Removing the route for ${entry.dst} failed: ${result.thrown}` });
+        const issue: Issue = { reasonCode: 'internal', reason: `Removing the route for ${entry.dst} failed: ${result.thrown}` };
+        stuck.set(key, issue);
+        noteFailure(key, entry.dst, issue);
       } else if (result.ok && result.outcome === 'not-ours') {
         // The entry at the destination is no longer the route this engine
         // added (an interface joined that very subnet, or someone replaced the
@@ -1023,7 +1132,9 @@ export const createEngine = (deps: EngineDeps): Engine => {
         });
       } else {
         counters.failed += 1;
-        stuck.set(key, { reasonCode: 'route-failed', reason: `Could not remove the route for ${entry.dst}: ${result.message}` });
+        const issue: Issue = { reasonCode: 'route-failed', reason: `Could not remove the route for ${entry.dst}: ${result.message}` };
+        stuck.set(key, issue);
+        noteFailure(key, entry.dst, issue);
         logger.error('route delete failed; the route stays applied and is retried on the next reconcile', {
           reason,
           dst: entry.dst,
@@ -1061,15 +1172,36 @@ export const createEngine = (deps: EngineDeps): Engine => {
       }
 
       const refusal = `${route.gateway}|${facts}`;
-      if (refusedAdds.get(key) === refusal && !REFUSAL_RETRY_REASONS.has(reason)) {
+      if (refusedAdds.get(key) === refusal && !urgent) {
         // Refused before, nothing relevant changed and this is a periodic
         // pass: the rule keeps its verdict without `route add` running again.
         fail('connected-network', connectedRouteText(route.dst));
         continue;
       }
       refusedAdds.delete(key);
+      const waiting = backedOff(key, route.dst);
+      if (waiting !== null) {
+        fail(waiting.reasonCode, waiting.reason);
+        continue;
+      }
 
       const result = await safeAdd(route);
+      // Failures that are retried in every pass count towards the backoff; a refusal has its own rule.
+      if ('thrown' in result || !(result.ok || result.outcome === 'rejected' || result.failure === 'connected-route')) {
+        const issue: Issue =
+          'thrown' in result
+            ? { reasonCode: 'internal', reason: `Adding the route for ${route.dst} failed: ${result.thrown}` }
+            : {
+                reasonCode: 'route-failed',
+                reason:
+                  result.failure === 'existing-route-unknown' || result.step !== 're-add'
+                    ? `Could not add the route for ${route.dst}: ${result.message}`
+                    : `Replacing the route for ${route.dst} failed, the route is now absent: ${result.message}`,
+              };
+        noteFailure(key, route.dst, issue);
+      } else {
+        failing.delete(key);
+      }
       if ('thrown' in result) {
         counters.failed += 1;
         applied.delete(key);
@@ -1125,8 +1257,10 @@ export const createEngine = (deps: EngineDeps): Engine => {
     for (const [key, issue] of stuck) {
       for (const ruleId of applied.get(key)?.ruleIds ?? []) recordIssue(drafts.get(ruleId), issue.reasonCode, issue.reason);
     }
-    // A refusal is remembered only while its route is still wanted.
+    // A refusal is remembered only while its route is still wanted; a failure while
+    // its route is wanted or still ours.
     for (const key of refusedAdds.keys()) if (!desired.has(key)) refusedAdds.delete(key);
+    for (const key of failing.keys()) if (!desired.has(key) && !applied.has(key)) failing.delete(key);
     return counters;
   };
 
@@ -1300,7 +1434,7 @@ export const createEngine = (deps: EngineDeps): Engine => {
     return { mode: 'hold', retry: degradedStreak };
   };
 
-  const pass = async (reason: ReconcileReason, force: boolean): Promise<ReconcileOutcome> => {
+  const pass = async (reason: ReconcileReason, force: boolean, retryRefused: boolean): Promise<ReconcileOutcome> => {
     const startedAt = now().getTime();
     // One consistent view for the whole pass: `setConfig` replaces the object, it never mutates it.
     const snapshot = config;
@@ -1327,7 +1461,8 @@ export const createEngine = (deps: EngineDeps): Engine => {
     // The files depend on the config only, so they are kept in line whatever the detection is like.
     const resolverIssues = await safeSyncResolvers(snapshot);
     const plan = await buildPlan(snapshot, detected, guardInterfaces, resolverIssues);
-    const counters = await applyDiff(plan, mode, allowAdds, reason, JSON.stringify(current));
+    const counters = await applyDiff(plan, mode, allowAdds, reason, JSON.stringify(current), retryRefused);
+    lastDeferred = counters.deferred;
     const owning = new Set([...applied.values()].flatMap((entry) => entry.ruleIds));
     const verdictOf = (draft: Draft): Verdict => {
       if (draft.issue !== null) return errorVerdict(draft.issue.reasonCode, draft.issue.reason);
@@ -1345,7 +1480,10 @@ export const createEngine = (deps: EngineDeps): Engine => {
     }
     logRuleIssues(plan.drafts, reason);
     logRuleWarnings(plan.drafts, reason, verdictOf);
-    if (counters.changed) await notifyApplied();
+    if (counters.changed || appliedDirty) {
+      appliedDirty = false;
+      await notifyApplied();
+    }
     if (retry !== null) requestRetry(reason, retry);
 
     const finishedAt = now();
@@ -1392,9 +1530,9 @@ export const createEngine = (deps: EngineDeps): Engine => {
   };
 
   /** `pass` with a last line of defence: a bug in it must not reject or leave the engine stuck. */
-  const guardedPass = async (reason: ReconcileReason, force: boolean): Promise<ReconcileOutcome> => {
+  const guardedPass = async (reason: ReconcileReason, force: boolean, retryRefused: boolean): Promise<ReconcileOutcome> => {
     try {
-      return await pass(reason, force);
+      return await pass(reason, force, retryRefused);
     } catch (error) {
       const thrown = describeThrown(error);
       logger.error('reconcile failed unexpectedly', { reason, error: thrown });
@@ -1431,6 +1569,7 @@ export const createEngine = (deps: EngineDeps): Engine => {
   interface Pending {
     reason: ReconcileReason;
     force: boolean;
+    retryRefused: boolean;
     readonly promise: Promise<ReconcileOutcome>;
     readonly resolve: (outcome: ReconcileOutcome) => void;
   }
@@ -1438,12 +1577,12 @@ export const createEngine = (deps: EngineDeps): Engine => {
   let running = false;
   let queued: Pending | null = null;
 
-  const newPending = (reason: ReconcileReason, force: boolean): Pending => {
+  const newPending = (reason: ReconcileReason, force: boolean, retryRefused: boolean): Pending => {
     let resolve: (outcome: ReconcileOutcome) => void = () => undefined;
     const promise = new Promise<ReconcileOutcome>((done) => {
       resolve = done;
     });
-    return { reason, force, promise, resolve };
+    return { reason, force, retryRefused, promise, resolve };
   };
 
   /** Used only when `guardedPass` itself fails; must not throw. */
@@ -1468,21 +1607,25 @@ export const createEngine = (deps: EngineDeps): Engine => {
       request.resolve(outcome);
       if (next !== null) start(next);
     };
-    guardedPass(request.reason, request.force).then(settle, (error: unknown) => {
+    guardedPass(request.reason, request.force, request.retryRefused).then(settle, (error: unknown) => {
       settle(lastResort(request.reason, error));
     });
   };
 
   const reconcile = (reason: ReconcileReason, options?: ReconcileOptions): Promise<ReconcileOutcome> => {
     const force = options?.force === true;
+    const retryRefused = options?.retryRefused === true;
     if (!running) {
-      const request = newPending(reason, force);
+      const request = newPending(reason, force, retryRefused);
       start(request);
       return request.promise;
     }
     if (queued === null) {
-      queued = newPending(reason, force);
+      queued = newPending(reason, force, retryRefused);
     } else {
+      // The merged pass runs with the latest reason; an event reason it replaces keeps its
+      // urgency: refused and backed-off commands are still tried in that pass.
+      queued.retryRefused = queued.retryRefused || retryRefused || REFUSAL_RETRY_REASONS.has(queued.reason);
       queued.reason = reason;
       queued.force = queued.force || force;
     }
@@ -1518,6 +1661,28 @@ export const createEngine = (deps: EngineDeps): Engine => {
     logger.info('global toggle changed', { configRevision, enabled });
     notifyConfigChanged();
     return true;
+  };
+
+  const forgetApplied = (routes: readonly DriftedRoute[]): number => {
+    let forgotten = 0;
+    // Read as untrusted like `restoreApplied`: only exact, valid destinations are matched.
+    for (const { dst, gateway, found } of routes) {
+      const destination = typeof dst === 'string' ? parseIpv4Destination(dst) : null;
+      const key = destination === null ? null : routeKey(destination);
+      const entry = key === null ? undefined : applied.get(key);
+      if (key === null || entry === undefined || entry.gateway !== gateway) continue;
+      applied.delete(key);
+      failing.delete(key);
+      forgotten += 1;
+      logger.warn('applied route is not in the routing table as it was added; forgotten, the next reconcile adds it again', {
+        dst: entry.dst,
+        gateway: entry.gateway,
+        ruleIds: entry.ruleIds,
+        found: typeof found === 'string' ? clamp(found, 40) : null,
+      });
+    }
+    if (forgotten > 0) appliedDirty = true;
+    return forgotten;
   };
 
   const restoreApplied = (restored: readonly AppliedRoute[]): RestoreResult => {
@@ -1571,6 +1736,9 @@ export const createEngine = (deps: EngineDeps): Engine => {
       };
     },
     getApplied: appliedSnapshot,
+    forgetApplied,
+    isReconciling: () => running,
+    getRetryNeeds: () => ({ deferred: lastDeferred, refused: refusedAdds.size, failing: failing.size }),
     restoreApplied,
   };
 };

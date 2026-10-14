@@ -4,6 +4,9 @@ import { describe, expect, it } from 'vitest';
 import {
   DEGRADED_ACCEPT_AFTER,
   DNS_LOSS_GRACE,
+  FAILURE_BACKOFF_AFTER,
+  FAILURE_BACKOFF_BASE_MS,
+  FAILURE_BACKOFF_MAX_MS,
   MAX_EXCLUDED_DNS_PER_ROLE,
   MAX_EXCLUDED_DNS_SERVERS,
   MAX_EXCLUDED_OTHER_DNS,
@@ -1195,14 +1198,15 @@ describe('reconcile: a delete the wrapper did not carry out', () => {
     expect(outcome.summary).toEqual({ added: 0, removed: 0, failed: 1, kept: 0, deferred: 0 });
     expect(h.engine.getApplied().map((route) => route.dst)).toEqual(['172.16.12.40', '172.16.0.0/12']);
 
-    // Not throttled: a pending delete is retried on periodic passes too.
+    // Not throttled at first: a pending delete is retried on periodic passes too (after
+    // FAILURE_BACKOFF_AFTER failures in a row they back off; see the backoff tests).
     await h.run('drift-check');
     await h.run('dns-refresh');
     expect(h.take()).toEqual([del('172.16.12.40', ETH_GW), del('172.16.12.40', ETH_GW)]);
     expect(h.engine.getApplied()).toHaveLength(2);
 
     h.routes.onDelete = (request) => deleted(request);
-    const settled = await h.run('drift-check');
+    const settled = await h.run('manual');
     expect(h.take()).toEqual([del('172.16.12.40', ETH_GW)]);
     expect(settled.summary.removed).toBe(1);
     expect(ruleState(settled, 1)).toMatchObject({ status: 'disabled', appliedDestinations: [] });
@@ -4373,5 +4377,292 @@ describe('a partly applied domain rule', () => {
     const h = setup(config([DOMAIN_RULE, WIFI_IP]), { deps: { resolveDomain: () => answer(overridden) } });
     h.routes.onAdd = (request) => (request.dst === '172.16.12.41' ? addFailed('add') : added(request));
     expect(ruleState(await h.run(), 5)).toMatchObject({ status: 'error', reasonCode: 'route-failed' });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Seams of the network monitor (TASK-112)
+// ---------------------------------------------------------------------------
+
+describe('forgetApplied (drift check)', () => {
+  it('forgets only an entry still applied with the given gateway, deletes nothing, and the next pass adds it again', async () => {
+    const snapshots: (readonly AppliedRoute[])[] = [];
+    const h = setup(config([HOST, NET]), { deps: { onApplied: (routes) => void snapshots.push(routes) } });
+    await h.run('startup');
+    h.take();
+    snapshots.length = 0;
+
+    const forgotten = h.engine.forgetApplied([
+      { dst: '172.16.12.40', gateway: ETH_GW, found: 'missing' },
+      // Applied through ETH_GW, not this one: left alone.
+      { dst: '172.16.0.0/12', gateway: WIFI_GW, found: 'other-gateway' },
+      // Not applied / not a destination at all.
+      { dst: '198.51.100.7', gateway: ETH_GW, found: 'missing' },
+      { dst: 'garbage', gateway: ETH_GW, found: 'missing' },
+    ]);
+
+    expect(forgotten).toBe(1);
+    expect(h.take()).toEqual([]);
+    expect(h.engine.getApplied().map((route) => route.dst)).toEqual(['172.16.0.0/12']);
+    const [warning] = engineLogs(h.entries, 'warn', 'applied route is not in the routing table as it was added; forgotten, the next reconcile adds it again');
+    expect(warning?.context).toMatchObject({ dst: '172.16.12.40', gateway: ETH_GW, ruleIds: [ruleId(1)], found: 'missing' });
+
+    const outcome = await h.run('drift-check');
+    expect(h.take()).toEqual([add('172.16.12.40', ETH_GW)]);
+    expect(outcome.summary.added).toBe(1);
+    expect(ruleState(outcome, 1)).toMatchObject({ status: 'active', appliedDestinations: ['172.16.12.40'] });
+    expect(snapshots.at(-1)?.map((route) => route.dst).sort()).toEqual(['172.16.0.0/12', '172.16.12.40']);
+  });
+
+  it('reports the smaller applied set to onApplied even when adding it again fails', async () => {
+    const snapshots: (readonly AppliedRoute[])[] = [];
+    const h = setup(config([HOST]), { deps: { onApplied: (routes) => void snapshots.push(routes) } });
+    await h.run('startup');
+    snapshots.length = 0;
+    expect(h.engine.forgetApplied([{ dst: '172.16.12.40', gateway: ETH_GW, found: 'missing' }])).toBe(1);
+    h.routes.onAdd = () => addFailed('add');
+
+    const outcome = await h.run('drift-check');
+
+    expect(outcome.summary).toMatchObject({ added: 0, failed: 1 });
+    expect(snapshots).toEqual([[]]);
+    // Reported once: the next pass with nothing changed does not report again.
+    await h.run('drift-check');
+    expect(snapshots).toHaveLength(1);
+  });
+
+  it('returns 0 and changes nothing for an empty or unknown list', async () => {
+    const h = setup(config([HOST]));
+    await h.run('startup');
+    expect(h.engine.forgetApplied([])).toBe(0);
+    expect(h.engine.forgetApplied([{ dst: '172.16.12.40', gateway: '10.20.4.99', found: 'other-gateway' }])).toBe(0);
+    expect(h.engine.getApplied()).toHaveLength(1);
+  });
+});
+
+describe('isReconciling and getRetryNeeds', () => {
+  it('is true while a pass runs and false once it has finished', async () => {
+    const netinfo = createFakeNetInfo();
+    const gate = deferred();
+    netinfo.gate = gate;
+    const h = setup(config([HOST]), { netinfo });
+    expect(h.engine.isReconciling()).toBe(false);
+    const pending = h.engine.reconcile('startup');
+    expect(h.engine.isReconciling()).toBe(true);
+    gate.open();
+    await pending;
+    expect(h.engine.isReconciling()).toBe(false);
+  });
+
+  it('reports deferred routes of the last pass, refused routes and failing routes', async () => {
+    const LAN = rule(1, 'subnet', '10.20.4.0/24', 'ethernet');
+    const netinfo = createFakeNetInfo(network({ degraded: true }), network({ ethernet: iface('ethernet', { subnet: null, netmask: null }) }));
+    const h = setup(config([LAN, HOST_B]), { netinfo });
+    expect(h.engine.getRetryNeeds()).toEqual({ deferred: 0, refused: 0, failing: 0 });
+
+    await h.run('startup');
+    // The LAN rule is the ethernet's own subnet, which the guard keeps out; only HOST_B waits.
+    expect(h.engine.getRetryNeeds()).toEqual({ deferred: 1, refused: 0, failing: 0 });
+
+    h.routes.onAdd = (request) =>
+      request.dst === '10.20.4.0/24' ? inspectFailed('connected-route', 'connected route in the way') : addFailed('add');
+    await h.run('startup');
+    expect(h.engine.getRetryNeeds()).toEqual({ deferred: 0, refused: 1, failing: 1 });
+
+    h.routes.onAdd = (request) => added(request);
+    await h.run('network-change');
+    expect(h.engine.getRetryNeeds()).toEqual({ deferred: 0, refused: 0, failing: 0 });
+  });
+});
+
+describe('reconcile option retryRefused', () => {
+  const LAN = rule(1, 'subnet', '10.20.4.0/24', 'ethernet');
+  const staticEthernet = network({ ethernet: iface('ethernet', { subnet: null, netmask: null }) });
+
+  it('runs a refused add again on a periodic pass', async () => {
+    const h = setup(config([LAN]), { netinfo: createFakeNetInfo(staticEthernet) });
+    h.routes.onAdd = () => inspectFailed('connected-route', 'connected route in the way');
+    await h.run('startup');
+    await h.run('drift-check');
+    expect(h.take()).toEqual([add('10.20.4.0/24', ETH_GW)]);
+
+    h.routes.onAdd = (request) => added(request);
+    const outcome = await h.engine.reconcile('drift-check', { retryRefused: true });
+
+    expect(h.take()).toEqual([add('10.20.4.0/24', ETH_GW)]);
+    expect(ruleState(outcome, 1)).toMatchObject({ status: 'active' });
+    expect(h.engine.getRetryNeeds().refused).toBe(0);
+  });
+
+  it('is kept when calls are merged into one follow-up pass', async () => {
+    const netinfo = createFakeNetInfo(staticEthernet);
+    const h = setup(config([LAN]), { netinfo });
+    h.routes.onAdd = () => inspectFailed('connected-route', 'connected route in the way');
+    await h.run('startup');
+    h.take();
+
+    const gate = deferred();
+    netinfo.gate = gate;
+    const first = h.engine.reconcile('drift-check');
+    const merged = [h.engine.reconcile('drift-check', { retryRefused: true }), h.engine.reconcile('dns-refresh')];
+    gate.open();
+    await Promise.all([first, ...merged]);
+
+    // The first pass skipped the refused add, the merged follow-up ran it.
+    expect(h.take()).toEqual([add('10.20.4.0/24', ETH_GW)]);
+  });
+});
+
+describe('backoff of a route command that keeps failing', () => {
+  const clockedSetup = (rules: readonly Rule[]) => {
+    const clock = { ms: NOW.getTime() };
+    const h = setup(config(rules), { deps: { now: () => new Date(clock.ms) } });
+    return { h, clock };
+  };
+
+  it('stops deleting on every periodic pass after FAILURE_BACKOFF_AFTER failures and retries after a growing delay', async () => {
+    expect(FAILURE_BACKOFF_AFTER).toBe(3);
+    const { h, clock } = clockedSetup([HOST, NET]);
+    await h.run('startup');
+    h.take();
+    h.routes.onDelete = (request) => deleteUnidentified(request.dst);
+    h.engine.setConfig(config([NET]));
+
+    await h.run('config-change');
+    await h.run('drift-check');
+    await h.run('dns-refresh');
+    expect(h.take()).toEqual([del('172.16.12.40', ETH_GW), del('172.16.12.40', ETH_GW), del('172.16.12.40', ETH_GW)]);
+    expect(engineLogs(h.entries, 'warn', 'route command keeps failing; periodic passes retry it less often from now on')).toHaveLength(1);
+
+    // Backed off: no command, the route stays applied, the problem is still counted.
+    clock.ms += FAILURE_BACKOFF_BASE_MS - 1;
+    const waiting = await h.run('drift-check');
+    expect(h.take()).toEqual([]);
+    expect(waiting.summary.failed).toBe(0);
+    expect(h.engine.getApplied().map((route) => route.dst)).toContain('172.16.12.40');
+    expect(h.engine.getRetryNeeds().failing).toBe(1);
+
+    clock.ms += 1;
+    await h.run('dns-refresh');
+    expect(h.take()).toEqual([del('172.16.12.40', ETH_GW)]);
+    // The 4th failure doubles the delay.
+    clock.ms += FAILURE_BACKOFF_BASE_MS;
+    await h.run('drift-check');
+    expect(h.take()).toEqual([]);
+    clock.ms += FAILURE_BACKOFF_BASE_MS;
+    await h.run('drift-check');
+    expect(h.take()).toEqual([del('172.16.12.40', ETH_GW)]);
+
+    // An event pass and a `retryRefused` pass always try.
+    await h.run('network-change');
+    await h.engine.reconcile('drift-check', { retryRefused: true });
+    expect(h.take()).toEqual([del('172.16.12.40', ETH_GW), del('172.16.12.40', ETH_GW)]);
+
+    h.routes.onDelete = (request) => deleted(request);
+    await h.run('manual');
+    expect(h.take()).toEqual([del('172.16.12.40', ETH_GW)]);
+    expect(h.engine.getRetryNeeds().failing).toBe(0);
+    expect(h.engine.getApplied().map((route) => route.dst)).toEqual(['172.16.0.0/12']);
+  });
+
+  it('backs off a failing add the same way and keeps the rule in error meanwhile', async () => {
+    const { h, clock } = clockedSetup([HOST]);
+    h.routes.onAdd = () => addFailed('add');
+    const outcomes = [await h.run('startup'), await h.run('drift-check'), await h.run('dns-refresh')];
+    expect(h.take()).toHaveLength(3);
+
+    const skipped = await h.run('drift-check');
+    expect(h.take()).toEqual([]);
+    expect(ruleState(skipped, 1)).toEqual(ruleState(outcomes[2] ?? clean(), 1));
+    expect(ruleState(skipped, 1)).toMatchObject({ status: 'error', reasonCode: 'route-failed' });
+
+    clock.ms += FAILURE_BACKOFF_BASE_MS;
+    h.routes.onAdd = (request) => added(request);
+    const fixed = await h.run('drift-check');
+    expect(h.take()).toEqual([add('172.16.12.40', ETH_GW)]);
+    expect(ruleState(fixed, 1)).toMatchObject({ status: 'active' });
+    expect(h.engine.getRetryNeeds().failing).toBe(0);
+  });
+
+  it('never waits longer than FAILURE_BACKOFF_MAX_MS', async () => {
+    const { h, clock } = clockedSetup([HOST]);
+    h.routes.onAdd = () => addFailed('add');
+    // Many failures through event passes, which are never backed off.
+    for (let index = 0; index < 30; index += 1) await h.run('network-change');
+    h.take();
+    clock.ms += FAILURE_BACKOFF_MAX_MS - 1;
+    await h.run('drift-check');
+    expect(h.take()).toEqual([]);
+    clock.ms += 1;
+    await h.run('drift-check');
+    expect(h.take()).toEqual([add('172.16.12.40', ETH_GW)]);
+  });
+
+  it('does not count a refusal or a rejection towards the backoff', async () => {
+    const LAN = rule(1, 'subnet', '10.20.4.0/24', 'ethernet');
+    const h = setup(config([LAN]), { netinfo: createFakeNetInfo(network({ ethernet: iface('ethernet', { subnet: null, netmask: null }) })) });
+    h.routes.onAdd = () => inspectFailed('connected-route', 'connected route in the way');
+    for (let index = 0; index < 5; index += 1) await h.run('network-change');
+    expect(h.engine.getRetryNeeds()).toMatchObject({ refused: 1, failing: 0 });
+  });
+});
+
+describe('merged passes keep the urgency of an event reason', () => {
+  /** drift-check runs; network-change and then dns-refresh arrive while it does and are merged into one pass. */
+  const mergedAfterEvent = async (h: Harness, netinfo: FakeNetInfo): Promise<void> => {
+    const gate = deferred();
+    netinfo.gate = gate;
+    const running = h.engine.reconcile('drift-check');
+    const merged = [h.engine.reconcile('network-change'), h.engine.reconcile('dns-refresh')];
+    gate.open();
+    await Promise.all([running, ...merged]);
+    netinfo.gate = null;
+  };
+
+  it('retries a backed-off add exactly once', async () => {
+    const clock = { ms: NOW.getTime() };
+    const netinfo = createFakeNetInfo();
+    const h = setup(config([HOST]), { netinfo, deps: { now: () => new Date(clock.ms) } });
+    h.routes.onAdd = () => addFailed('add');
+    await h.run('startup');
+    await h.run('drift-check');
+    await h.run('dns-refresh');
+    h.take();
+    await h.run('drift-check');
+    expect(h.take()).toEqual([]);
+
+    await mergedAfterEvent(h, netinfo);
+
+    // The running drift-check is backed off; the merged follow-up (reason dns-refresh) still tries.
+    expect(h.take()).toEqual([add('172.16.12.40', ETH_GW)]);
+    expect(h.engine.getState().lastReconcileReason).toBe('dns-refresh');
+  });
+
+  it('retries a refused add exactly once', async () => {
+    const LAN = rule(1, 'subnet', '10.20.4.0/24', 'ethernet');
+    const netinfo = createFakeNetInfo(network({ ethernet: iface('ethernet', { subnet: null, netmask: null }) }));
+    const h = setup(config([LAN]), { netinfo });
+    h.routes.onAdd = () => inspectFailed('connected-route', 'connected route in the way');
+    await h.run('startup');
+    h.take();
+
+    await mergedAfterEvent(h, netinfo);
+
+    expect(h.take()).toEqual([add('10.20.4.0/24', ETH_GW)]);
+  });
+
+  it('does not make a merge of periodic reasons urgent', async () => {
+    const LAN = rule(1, 'subnet', '10.20.4.0/24', 'ethernet');
+    const netinfo = createFakeNetInfo(network({ ethernet: iface('ethernet', { subnet: null, netmask: null }) }));
+    const h = setup(config([LAN]), { netinfo });
+    h.routes.onAdd = () => inspectFailed('connected-route', 'connected route in the way');
+    await h.run('startup');
+    h.take();
+    const gate = deferred();
+    netinfo.gate = gate;
+    const passes = [h.engine.reconcile('drift-check'), h.engine.reconcile('dns-refresh'), h.engine.reconcile('drift-check')];
+    gate.open();
+    await Promise.all(passes);
+    expect(h.take()).toEqual([]);
   });
 });
