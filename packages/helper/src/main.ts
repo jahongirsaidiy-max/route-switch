@@ -14,6 +14,7 @@ import { DEGRADED_ACCEPT_AFTER, createEngine, type Engine } from './engine';
 import { createCommandRunner, type CommandRunner } from './exec';
 import { createJsonLinesSink, createLogger, type LineWritable, type Logger } from './logger';
 import { createNetInfo } from './netinfo';
+import { createResolverFiles, type ResolverFiles, type ResolverFs } from './resolver';
 import { createRouteOperations } from './route';
 
 /**
@@ -90,6 +91,10 @@ export interface RunDeps {
   readonly clearTimer?: ClearTimer | undefined;
   /** The resolvers of the process, which a domain rule never routes; defaults to `dns.getServers()`. */
   readonly systemDnsServers?: (() => readonly string[]) | undefined;
+  /** Directory of the scoped-DNS files; defaults to `PATHS.resolverDir`. Tests pass a temporary one. */
+  readonly resolverDir?: string | undefined;
+  /** File system of the scoped-DNS files; defaults to the real one. */
+  readonly resolverFs?: ResolverFs | undefined;
 }
 
 export type ParsedArgs =
@@ -172,6 +177,8 @@ const runOnce = async (configPath: string, deps: RunDeps): Promise<number> => {
 export interface HelperCore {
   readonly engine: Engine;
   readonly dns: DomainResolverService;
+  /** The scoped-DNS files; synced by the engine on every pass. Shutdown (`removeAll`) is TASK-113's. */
+  readonly resolverFiles: ResolverFiles;
   readonly setTimer: SetTimer;
   readonly clearTimer: ClearTimer;
 }
@@ -201,6 +208,12 @@ export const createCore = (
   });
   dns.syncConfig(config);
   const runner = deps.createRunner(root);
+  const resolverFiles = createResolverFiles({
+    dir: deps.resolverDir ?? PATHS.resolverDir,
+    runner,
+    logger: root,
+    fs: deps.resolverFs,
+  });
   const engine = createEngine({
     netinfo: createNetInfo({ runner, logger: root }),
     routes: createRouteOperations({ runner, logger: root }),
@@ -210,8 +223,9 @@ export const createCore = (
     now: deps.now,
     resolveDomain: dns.resolveDomain,
     onConfigChanged: dns.syncConfig,
+    syncResolvers: (current) => resolverFiles.sync(current),
   });
-  return { engine, dns, setTimer, clearTimer };
+  return { engine, dns, resolverFiles, setTimer, clearTimer };
 };
 
 const isResolving = (state: EngineState): boolean =>

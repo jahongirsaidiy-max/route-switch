@@ -1,7 +1,9 @@
-import { readFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 
 import { Config, EngineState, PATHS } from '@routeswitch/shared';
-import { describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it } from 'vitest';
 
 import type { ConfigFileRead, ConfigFileReader } from './config-store';
 import { LOOKUP_TIMEOUT_MS } from './dns';
@@ -14,6 +16,19 @@ const ROUTE = '/sbin/route';
 const NETWORKSETUP = '/usr/sbin/networksetup';
 const IPCONFIG = '/usr/sbin/ipconfig';
 const SCUTIL = '/usr/sbin/scutil';
+const DSCACHEUTIL = '/usr/bin/dscacheutil';
+const KILLALL = '/usr/bin/killall';
+
+/** Scoped-DNS files of every harness go to a temporary directory of its own, never to the real one. */
+const resolverDirs: string[] = [];
+const newResolverDir = (): string => {
+  const dir = mkdtempSync(join(tmpdir(), 'routeswitch-main-test-'));
+  resolverDirs.push(dir);
+  return dir;
+};
+afterEach(() => {
+  for (const dir of resolverDirs.splice(0)) rmSync(dir, { recursive: true, force: true });
+});
 const ETH_GW = '10.20.4.1';
 const NOW = new Date('2026-10-12T08:30:00.000Z');
 
@@ -62,11 +77,11 @@ const machine = (): FakeCommandRunner => {
   const runner = createFakeCommandRunner();
   runner.whenMatching((bin, args) => {
     if (bin === ROUTE) return {};
+    if (bin === DSCACHEUTIL || bin === KILLALL) return {};
     if (bin === NETWORKSETUP) return { stdout: PORTS };
     if (bin === '/usr/sbin/netstat') return { stdout: 'Routing tables\n\nInternet:\nDestination        Gateway            Flags               Netif Expire\n' };
     // No DNS server anywhere unless a test says otherwise.
     if (bin === SCUTIL) return scutilDns({});
-    if (bin !== IPCONFIG) return undefined;
     const wifi = args[1] === 'en0';
     if (args[0] === 'getifaddr') return { stdout: wifi ? '192.168.1.23\n' : '10.20.4.23\n' };
     if (args[2] === 'router') return { stdout: wifi ? '192.168.1.1\n' : `${ETH_GW}\n` };
@@ -113,6 +128,7 @@ const harness = (file: unknown = CONFIG, extra: Partial<RunDeps> = {}): Harness 
       createDnsResolver: dns.factory,
       // Never the resolvers of the machine the tests run on.
       systemDnsServers: () => [],
+      resolverDir: newResolverDir(),
       setTimer: scheduler.setTimer,
       clearTimer: scheduler.clearTimer,
       ...extra,
@@ -466,7 +482,13 @@ const DOMAIN_CONFIG = {
 
 /** Lets the run get on until `ready` holds; fails instead of waiting for ever. */
 const until = async (ready: () => boolean): Promise<void> => {
-  for (let round = 0; round < 2000 && !ready(); round += 1) await flush(5);
+  for (let round = 0; round < 2000 && !ready(); round += 1) {
+    await flush(5);
+    // The resolver files are real file-system work (in a temporary directory): let it finish.
+    await new Promise<void>((resolve) => {
+      setImmediate(resolve);
+    });
+  }
   if (!ready()) throw new Error('the run never got there');
 };
 
@@ -665,14 +687,18 @@ describe('run --once: domain rules', () => {
     // Two passes, one cached detection: one command.
     expect(dnsArgv(h)).toEqual([['--dns']]);
     expect(h.dns.lookups.map((lookup) => lookup.servers)).toEqual([['198.51.100.53']]);
-    // The real route wrapper on the fake runner: no argv carries the address of a DNS server.
-    expect(h.routeArgv()).toEqual([['-n', 'add', '-host', '198.51.100.20', '192.168.1.1']]);
-    expect(JSON.stringify(h.routeArgv())).not.toMatch(/10\.20\.4\.53|198\.51\.100\.53/);
+    // The real route wrapper on the fake runner: the rule's own server is routed (TASK-111), the
+    // server of an interface never is.
+    expect(h.routeArgv()).toEqual([
+      ['-n', 'add', '-host', '198.51.100.53', '192.168.1.1'],
+      ['-n', 'add', '-host', '198.51.100.20', '192.168.1.1'],
+    ]);
+    expect(JSON.stringify(h.routeArgv())).not.toMatch(/10\.20\.4\.53/);
     expect(code).toBe(EXIT_CODES.ruleError);
     expect(EngineState.parse(JSON.parse(h.out[0] ?? '')).rules[0]).toMatchObject({
       reasonCode: 'forbidden-destination',
       reason: '1 resolved address of corp.local must never be routed (dns-server: 1)',
-      appliedDestinations: ['198.51.100.20'],
+      appliedDestinations: ['198.51.100.53', '198.51.100.20'],
     });
   });
 
@@ -868,5 +894,90 @@ describe('run --once: domain rules', () => {
     expect(h.dns.lookups.map((lookup) => lookup.hostname)).toEqual(['other.corp.local']);
     expect(h.routeArgv()).toEqual([['-n', 'add', '-host', '198.51.100.20', '192.168.1.1']]);
     expect(outcome.state.rules.map((rule) => rule.reasonCode)).toEqual(['interface-down', 'forbidden-destination']);
+  });
+});
+
+describe('run --once: scoped DNS files (TASK-111)', () => {
+  const WITH_DNS = {
+    version: 1,
+    rules: [{ id: ID_A, kind: 'domain', target: 'corp.local', iface: 'ethernet', dns: '10.30.0.53' }],
+  };
+
+  it('never points a test at the real resolver directory', () => {
+    expect(harness().deps.resolverDir).not.toBe(PATHS.resolverDir);
+    expect(harness().deps.resolverDir?.startsWith(tmpdir())).toBe(true);
+  });
+
+  it('wires the resolver files to the engine: the file is written, the cache flushed, the server routed', async () => {
+    const h = harness(WITH_DNS);
+    h.dns.auto = () => ['198.51.100.20'];
+    const dir = h.deps.resolverDir ?? '';
+
+    expect(await run(['--once'], h.deps)).toBe(EXIT_CODES.ok);
+
+    expect(readdirSync(dir)).toEqual(['corp.local']);
+    expect(readFileSync(join(dir, 'corp.local'), 'utf8')).toBe('nameserver 10.30.0.53\n# managed-by: routeswitch\n');
+    // One flush for the pass that wrote the file; the follow-up pass changed nothing.
+    expect(h.runner.calls.filter((call) => call.bin === DSCACHEUTIL || call.bin === KILLALL).map((call) => [call.bin, ...call.args])).toEqual([
+      [DSCACHEUTIL, '-flushcache'],
+      [KILLALL, '-HUP', 'mDNSResponder'],
+    ]);
+    expect(h.routeArgv()).toEqual([
+      ['-n', 'add', '-host', '10.30.0.53', ETH_GW],
+      ['-n', 'add', '-host', '198.51.100.20', ETH_GW],
+    ]);
+    expect(h.dns.lookups.map((lookup) => lookup.servers)).toEqual([['10.30.0.53']]);
+  });
+
+  it('leaves a file that is not ours alone and reports the rule', async () => {
+    const h = harness(WITH_DNS);
+    h.dns.auto = () => ['198.51.100.20'];
+    const dir = h.deps.resolverDir ?? '';
+    writeFileSync(join(dir, 'corp.local'), 'nameserver 10.1.1.1\n');
+
+    expect(await run(['--once'], h.deps)).toBe(EXIT_CODES.ruleError);
+
+    expect(readFileSync(join(dir, 'corp.local'), 'utf8')).toBe('nameserver 10.1.1.1\n');
+    expect(EngineState.parse(JSON.parse(h.out[0] ?? '')).rules[0]).toMatchObject({ status: 'error', reasonCode: 'resolver-conflict' });
+    expect(h.runner.calls.some((call) => call.bin === DSCACHEUTIL)).toBe(false);
+  });
+
+  it('uses the file system it is given for the resolver files', async () => {
+    const seen: string[] = [];
+    const real = await import('node:fs/promises');
+    const h = harness(WITH_DNS, {
+      resolverFs: {
+        open: ((path: string, ...rest: unknown[]) => {
+          seen.push(`open ${path}`);
+          return (real.open as (...args: unknown[]) => unknown)(path, ...rest);
+        }) as typeof real.open,
+        readdir: (path) => {
+          seen.push(`readdir ${path}`);
+          return real.readdir(path);
+        },
+        lstat: ((path: string) => {
+          seen.push(`lstat ${path}`);
+          return real.lstat(path);
+        }) as typeof real.lstat,
+        rename: real.rename,
+        unlink: real.unlink,
+        mkdir: (path, options) => real.mkdir(path, options),
+        chmod: (path, mode) => real.chmod(path, mode),
+      },
+    });
+    h.dns.auto = () => ['198.51.100.20'];
+
+    await run(['--once'], h.deps);
+
+    const dir = h.deps.resolverDir ?? '';
+    expect(seen).toContain(`lstat ${dir}`);
+    expect(seen).toContain(`readdir ${dir}`);
+    expect(seen).toContain(`open ${dir}/corp.local`);
+  });
+
+  it('exposes the resolver files on the core for the shutdown path', () => {
+    const h = harness(WITH_DNS);
+    const core = createCore(Config.parse(WITH_DNS), h.deps, createLogger({ sinks: [] }));
+    expect(typeof core.resolverFiles.removeAll).toBe('function');
   });
 });

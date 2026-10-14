@@ -21,6 +21,7 @@ import {
   type EngineDeps,
   type GuardFacts,
   type ReconcileOutcome,
+  type ResolverSync,
   type RetryRequest,
 } from './engine';
 import { createLogger, createMemorySink, type LogEntry } from './logger';
@@ -2448,8 +2449,9 @@ describe('reconcile: domain rules', () => {
 
     const outcome = await h.run();
 
-    expect(h.routes.calls).toHaveLength(33);
-    expect(ruleState(outcome, 5).appliedDestinations).toEqual(many.slice(0, 33));
+    // The rule's own server takes the 33rd place; on the interface's own link it needs no route.
+    expect(h.routes.calls).toHaveLength(32);
+    expect(ruleState(outcome, 5).appliedDestinations).toEqual(many.slice(0, 32));
   });
 
   it('turns a resolver that throws into an internal error of that rule only', async () => {
@@ -3958,5 +3960,255 @@ describe('DNS servers of the interfaces', () => {
     await h.run('config-change');
 
     expect(contexts.at(-1)).toEqual({ dnsServers: null, interfaceDnsServers: ['10.30.0.10'] });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// TASK-111: the rule's own DNS server and the resolver files
+// ---------------------------------------------------------------------------
+
+describe('scoped DNS: the route to the rule\'s own DNS server', () => {
+  const answer = (destinations: readonly string[]): DomainTargets => ({
+    destinations,
+    status: 'active',
+    reasonCode: null,
+    reason: null,
+    lastResolvedAt: '2026-10-12T08:29:00.000Z',
+  });
+  const withServer = (server: string, iface: Rule['iface'] = 'ethernet', n = 5): Rule =>
+    rule(n, 'domain', 'corp.local', iface, { dns: server });
+
+  it('routes the server through the rule\'s interface, first, before any answer and as long as the rule lives', async () => {
+    let destinations: readonly string[] | null = null;
+    const contexts: DomainContext[] = [];
+    const h = setup(config([withServer('10.30.0.53')]), {
+      deps: {
+        resolveDomain: (_rule, context) => {
+          contexts.push(context);
+          return destinations === null ? unresolvedDomain(_rule) : answer(destinations);
+        },
+      },
+    });
+
+    // Still resolving: the server's route is already there, since the lookups need it.
+    const first = await h.run();
+    expect(h.take()).toEqual([add('10.30.0.53', ETH_GW)]);
+    expect(ruleState(first, 5)).toMatchObject({ status: 'pending', reasonCode: 'resolving', appliedDestinations: ['10.30.0.53'] });
+
+    destinations = ['172.16.12.40'];
+    const second = await h.run('dns-refresh');
+    expect(h.take()).toEqual([add('172.16.12.40', ETH_GW)]);
+    expect(ruleState(second, 5)).toMatchObject({ status: 'active', appliedDestinations: ['10.30.0.53', '172.16.12.40'] });
+
+    // The context is the engine's own: nothing about the rule's server is added to it.
+    expect(contexts.every((context) => !context.interfaceDnsServers.includes('10.30.0.53'))).toBe(true);
+
+    h.engine.setConfig(config([]));
+    await h.run('config-change');
+    expect(h.take()).toEqual([del('10.30.0.53', ETH_GW), del('172.16.12.40', ETH_GW)]);
+  });
+
+  it('adds no route for a server on the interface\'s own link, nor for its gateway, and says nothing about it', async () => {
+    for (const server of ['10.20.4.53', ETH_GW]) {
+      const h = setup(config([withServer(server)]), { deps: { resolveDomain: () => answer(['172.16.12.40']) } });
+
+      const outcome = await h.run();
+
+      expect(h.take()).toEqual([add('172.16.12.40', ETH_GW)]);
+      expect(ruleState(outcome, 5)).toMatchObject({ status: 'active', reasonCode: null, appliedDestinations: ['172.16.12.40'] });
+    }
+    // The gateway with an unknown subnet: still the rule's own interface, still no route and no problem.
+    const unknownSubnet = createFakeNetInfo(network({ ethernet: iface('ethernet', { subnet: null, netmask: null }) }));
+    const h = setup(config([withServer(ETH_GW)]), { netinfo: unknownSubnet, deps: { resolveDomain: () => answer(['172.16.12.40']) } });
+    const outcome = await h.run();
+    expect(h.take()).toEqual([add('172.16.12.40', ETH_GW)]);
+    expect(ruleState(outcome, 5).status).toBe('active');
+  });
+
+  it('still refuses a server on the link of the other interface', async () => {
+    const h = setup(config([withServer(WIFI_GW)]), { deps: { resolveDomain: () => answer(['172.16.12.40']) } });
+
+    const outcome = await h.run();
+
+    expect(h.take()).toEqual([add('172.16.12.40', ETH_GW)]);
+    expect(ruleState(outcome, 5)).toMatchObject({ status: 'error', reasonCode: 'connected-network' });
+  });
+
+  it('routes the server like an explicit rule: a resolved address of another rule does not take it over, an explicit rule does', async () => {
+    const viaWifi = rule(6, 'domain', 'other.corp.local', 'wifi');
+    const answers = new Map([[ruleId(6), ['10.30.0.53']]]);
+    const h = setup(config([viaWifi, withServer('10.30.0.53')]), {
+      deps: { resolveDomain: (r) => answer(answers.get(r.id) ?? []) },
+    });
+
+    const outcome = await h.run();
+
+    // The domain rules are planned in config order, but the server's route is explicit: the
+    // resolved address of the earlier rule gives way.
+    expect(h.take()).toEqual([add('10.30.0.53', ETH_GW)]);
+    expect(ruleState(outcome, 5)).toMatchObject({ status: 'active', appliedDestinations: ['10.30.0.53'] });
+    expect(ruleState(outcome, 6)).toMatchObject({
+      status: 'error',
+      reasonCode: 'route-failed',
+      reason: '10.30.0.53 is routed through the ethernet interface as the DNS server of another rule, which takes precedence over a resolved address',
+    });
+
+    const explicitFirst = setup(config([rule(1, 'ip', '10.30.0.53', 'wifi'), withServer('10.30.0.53')]), {
+      deps: { resolveDomain: () => answer(['172.16.12.40']) },
+    });
+    const second = await explicitFirst.run();
+    expect(explicitFirst.take()).toEqual([add('10.30.0.53', WIFI_GW), add('172.16.12.40', ETH_GW)]);
+    expect(ruleState(second, 5)).toMatchObject({
+      status: 'error',
+      reasonCode: 'route-failed',
+      reason: '10.30.0.53 is already routed through the wifi interface by another rule',
+    });
+  });
+
+  it('never routes the server twice when an answer contains it, and keeps the rule within the protocol limit', async () => {
+    const many = Array.from({ length: 40 }, (_unused, index) => `172.16.13.${String(index + 1)}`);
+    const h = setup(config([withServer('10.30.0.53')]), { deps: { resolveDomain: () => answer(['10.30.0.53', ...many]) } });
+
+    const outcome = await h.run();
+
+    expect(ruleState(outcome, 5).appliedDestinations).toEqual(['10.30.0.53', ...many.slice(0, 32)]);
+    expect(h.take().filter((call) => call.dst === '10.30.0.53')).toHaveLength(1);
+  });
+
+  it('adds no route for the server of an interface (a rule without `dns`)', async () => {
+    const withDetected = network();
+    const netinfo = createFakeNetInfo({ ...withDetected, dnsServers: { ethernet: ['10.30.0.53'], wifi: [] } });
+    const h = setup(config([rule(5, 'domain', 'corp.local', 'ethernet')]), {
+      netinfo,
+      deps: { resolveDomain: () => answer(['172.16.12.40']) },
+    });
+
+    await h.run();
+
+    expect(h.take()).toEqual([add('172.16.12.40', ETH_GW)]);
+  });
+});
+
+describe('scoped DNS: a server of the interface outside its connected subnet', () => {
+  const answer: DomainResolver = () => ({ destinations: [], status: 'pending', reasonCode: 'resolving', reason: 'x', lastResolvedAt: null });
+  const outsideWarnings = (entries: readonly LogEntry[]): LogEntry[] =>
+    engineLogs(entries, 'warn', 'a DNS server of the interface is outside its connected subnet; set `dns` in the rule to route it');
+  const detection = (ethernet: readonly string[], subnet = '10.20.4.0/24'): DetectedInterfaces => ({
+    ...network({ ethernet: iface('ethernet', { subnet }) }),
+    dnsServers: { ethernet, wifi: ['192.168.1.1'] },
+  });
+
+  it('warns once per role and set of servers, and again only after it changed', async () => {
+    const netinfo = createFakeNetInfo(
+      detection(['10.20.4.53', '10.99.0.53']),
+      detection(['10.20.4.53', '10.99.0.53']),
+      detection(['10.20.4.53']),
+      detection(['10.99.0.53']),
+      detection(['10.99.0.53'], '10.99.0.0/16'),
+      detection(['10.99.0.54'], '10.20.4.0/24'),
+    );
+    const h = setup(config([rule(5, 'domain', 'corp.local', 'ethernet')]), { netinfo, deps: { resolveDomain: answer } });
+
+    for (let pass = 0; pass < 6; pass += 1) await h.run('network-change');
+
+    expect(outsideWarnings(h.entries).map((entry) => entry.context)).toEqual([
+      expect.objectContaining({ role: 'ethernet', subnet: '10.20.4.0/24', servers: ['10.99.0.53'] }),
+      expect.objectContaining({ role: 'ethernet', subnet: '10.20.4.0/24', servers: ['10.99.0.53'] }),
+      expect.objectContaining({ role: 'ethernet', subnet: '10.20.4.0/24', servers: ['10.99.0.54'] }),
+    ]);
+  });
+
+  it('says nothing for a rule that names its own server, a subnet that is not known, or no server', async () => {
+    const cases: readonly (readonly [Rule, DetectedInterfaces])[] = [
+      [rule(5, 'domain', 'corp.local', 'ethernet', { dns: '10.30.0.53' }), detection(['10.99.0.53'])],
+      [rule(5, 'domain', 'corp.local', 'ethernet'), { ...detection(['10.99.0.53']), ethernet: iface('ethernet', { subnet: null }) }],
+      [rule(5, 'domain', 'corp.local', 'ethernet'), detection([])],
+    ];
+    for (const [domainRule, detected] of cases) {
+      const h = setup(config([domainRule]), { netinfo: createFakeNetInfo(detected), deps: { resolveDomain: answer } });
+      await h.run();
+      expect(outsideWarnings(h.entries)).toEqual([]);
+    }
+  });
+});
+
+describe('scoped DNS: resolver files', () => {
+  const DOMAIN_DNS = rule(5, 'domain', 'corp.local', 'ethernet', { dns: '10.30.0.53' });
+  const pendingAnswer: DomainResolver = () => ({ destinations: [], status: 'pending', reasonCode: 'resolving', reason: 'x', lastResolvedAt: null });
+
+  it('syncs the files with the config of each pass, and makes the rule `error` for a file not in place', async () => {
+    const seen: Config[] = [];
+    let issues = new Map<string, { reasonCode: 'resolver-conflict'; reason: string }>([
+      [ruleId(5), { reasonCode: 'resolver-conflict', reason: '/etc/resolver/corp.local exists and is not managed by RouteSwitch' }],
+    ]);
+    const syncResolvers = (snapshot: Config): ResolverSync => {
+      seen.push(snapshot);
+      return { issues };
+    };
+    const h = setup(config([DOMAIN_DNS, HOST]), { deps: { syncResolvers, resolveDomain: pendingAnswer } });
+
+    const outcome = await h.run();
+
+    expect(seen).toEqual([h.engine.getConfig()]);
+    expect(ruleState(outcome, 5)).toMatchObject({ status: 'error', reasonCode: 'resolver-conflict' });
+    // The route to the server is not tied to the file: the helper's own lookups still need it.
+    expect(h.take()).toEqual([add('172.16.12.40', ETH_GW), add('10.30.0.53', ETH_GW)]);
+    expect(ruleState(outcome, 1).status).toBe('active');
+
+    issues = new Map();
+    expect(ruleState(await h.run(), 5)).toMatchObject({ status: 'pending', reasonCode: 'resolving' });
+    expect(seen).toHaveLength(2);
+  });
+
+  it('shows a file problem also while the interface is down or the detection failed, but never on a disabled rule', async () => {
+    const issues = new Map([
+      [ruleId(5), { reasonCode: 'resolver-failed' as const, reason: 'cannot write' }],
+      [ruleId(6), { reasonCode: 'resolver-failed' as const, reason: 'cannot write' }],
+    ]);
+    const disabled = rule(6, 'domain', 'other.corp.local', 'ethernet', { dns: '10.30.0.54', enabled: false });
+    for (const netinfo of [
+      createFakeNetInfo(network({ ethernet: down('ethernet') })),
+      createFakeNetInfo(() => {
+        throw new Error('detection failed');
+      }),
+    ]) {
+      const seen: Config[] = [];
+      const h = setup(config([DOMAIN_DNS, disabled]), {
+        netinfo,
+        deps: {
+          syncResolvers: (snapshot) => {
+            seen.push(snapshot);
+            return { issues };
+          },
+        },
+      });
+      const outcome = await h.run();
+      expect(seen).toHaveLength(1);
+      expect(ruleState(outcome, 5)).toMatchObject({ status: 'error', reasonCode: 'resolver-failed', reason: 'cannot write' });
+      expect(ruleState(outcome, 6).status).toBe('disabled');
+    }
+  });
+
+  it('turns a sync that throws or rejects into `resolver-failed` of the rules with a server, and nothing else', async () => {
+    const plain = rule(6, 'domain', 'other.corp.local', 'ethernet');
+    for (const syncResolvers of [
+      (): ResolverSync => {
+        throw new Error('disk on fire');
+      },
+      (): Promise<ResolverSync> => Promise.reject(new Error('disk on fire')),
+    ]) {
+      const h = setup(config([DOMAIN_DNS, plain, HOST]), { deps: { syncResolvers, resolveDomain: pendingAnswer } });
+
+      const outcome = await h.run();
+
+      expect(ruleState(outcome, 5)).toMatchObject({
+        status: 'error',
+        reasonCode: 'resolver-failed',
+        reason: 'Resolver files could not be synced: disk on fire',
+      });
+      expect(ruleState(outcome, 6)).toMatchObject({ status: 'pending', reasonCode: 'resolving' });
+      expect(ruleState(outcome, 1).status).toBe('active');
+      expect(engineLogs(h.entries, 'error', 'resolver file sync threw')).toHaveLength(1);
+    }
   });
 });

@@ -74,12 +74,13 @@ import type { Logger } from './logger';
  * goes to that server, which is also what the `/etc/resolver` file of the
  * rule makes the rest of the system do.
  *
- * Nothing here adds the route to the DNS server or writes resolver files. The
- * module that does (scoped DNS) wraps `resolveDomain` and puts `rule.dns` in
- * front of `destinations`; the engine applies one destination more than
- * `LIMITS.maxIpsPerDomain` per rule for exactly that. `rule.dns` is never
- * among the destinations returned here (see above), so the wrapper is the
- * only source of that route. A first query that went out before that route
+ * Nothing here adds the route to the DNS server or writes resolver files.
+ * The engine plans the route to `rule.dns` itself, as the first destination
+ * of the rule and like an explicit rule (one destination more than
+ * `LIMITS.maxIpsPerDomain` per rule is for exactly that); `resolver.ts`
+ * writes the `/etc/resolver` file. `rule.dns` is never among the destinations
+ * returned here (see above), so the engine is the only source of that route.
+ * A first query that went out before that route
  * existed fails and is retried after `RETRY_FLOOR_MS`, or at once when
  * `refreshAll()` is called.
  */

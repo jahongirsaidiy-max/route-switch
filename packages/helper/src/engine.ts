@@ -201,6 +201,19 @@ export interface EngineDeps {
    * logged and changes nothing.
    */
   readonly onConfigChanged?: ((config: Config) => void) | undefined;
+  /**
+   * Brings the scoped-DNS files (`/etc/resolver/<domain>`) in line with the
+   * config, once per pass, before the plan; the result's problems make the
+   * rules `error`. The daemon passes `resolverFiles.sync`. A throw or a
+   * rejection is logged and makes every rule that needs a file `error` /
+   * `resolver-failed`.
+   */
+  readonly syncResolvers?: ((config: Config) => ResolverSync | Promise<ResolverSync>) | undefined;
+}
+
+/** What `EngineDeps.syncResolvers` reports: rule id -> why its resolver file is not in place. */
+export interface ResolverSync {
+  readonly issues: ReadonlyMap<string, { readonly reasonCode: RuleReasonCode; readonly reason: string }>;
 }
 
 export interface Engine {
@@ -547,6 +560,8 @@ export const createEngine = (deps: EngineDeps): Engine => {
   /** Rule id -> the problem logged for it in the previous pass, so a standing error is not repeated at `warn`. */
   let reportedIssues = new Map<string, string>();
   let reportedGuardSkips = '';
+  /** Per role, the DNS servers outside the connected subnet that were warned about last ('' = none). */
+  const warnedOutsideDns: Record<IfaceRole, string> = { ethernet: '', wifi: '' };
   /**
    * Guard facts of the last clean (non-degraded) detection. Replaced by every
    * clean detection and by nothing else: a degraded or failed detection must
@@ -689,6 +704,42 @@ export const createEngine = (deps: EngineDeps): Engine => {
     }
   };
 
+  const safeSyncResolvers = async (snapshot: Config): Promise<ResolverSync['issues']> => {
+    if (deps.syncResolvers === undefined) return new Map();
+    try {
+      return (await deps.syncResolvers(snapshot)).issues;
+    } catch (error) {
+      const thrown = describeThrown(error);
+      logger.error('resolver file sync threw', { error: thrown });
+      const failed = { reasonCode: 'resolver-failed' as const, reason: `Resolver files could not be synced: ${thrown}` };
+      return new Map(
+        snapshot.rules.filter((rule) => rule.kind === 'domain' && rule.dns !== undefined).map((rule) => [rule.id, failed]),
+      );
+    }
+  };
+
+  /**
+   * A rule without `dns` asks the servers of its interface, and that query
+   * leaves through the interface only when the server is in its connected
+   * subnet; no route is ever added for such a server. Said once per role and
+   * set of servers, so the user knows to set `dns` before a lookup times out.
+   */
+  const noteOutsideDns = (role: IfaceRole, info: InterfaceInfo): void => {
+    const servers = trustedDns[role] ?? [];
+    const subnet = info.subnet;
+    if (subnet === null || servers.length === 0) return;
+    const outside = servers.filter((server) => !cidrContains(subnet, server));
+    const signature = outside.length === 0 ? '' : `${subnet}|${outside.join(',')}`;
+    if (signature !== '' && signature !== warnedOutsideDns[role]) {
+      logger.warn('a DNS server of the interface is outside its connected subnet; set `dns` in the rule to route it', {
+        role,
+        subnet,
+        servers: outside,
+      });
+    }
+    warnedOutsideDns[role] = signature;
+  };
+
   // -------------------------------------------------------------------------
   // Desired set
   // -------------------------------------------------------------------------
@@ -727,6 +778,7 @@ export const createEngine = (deps: EngineDeps): Engine => {
     snapshot: Config,
     detected: DetectedInterfaces | null,
     interfaces: readonly GuardFacts[],
+    resolverIssues: ResolverSync['issues'],
   ): Promise<Plan> => {
     const drafts = new Map<string, Draft>();
     const desired = new Map<string, DesiredRoute>();
@@ -786,11 +838,21 @@ export const createEngine = (deps: EngineDeps): Engine => {
 
       let targets: readonly string[] = [rule.target];
       let draft: Draft;
+      /** The destination that is the rule's own DNS server: routed like an explicit rule. */
+      let serverTarget: string | null = null;
       if (rule.kind === 'domain') {
+        if (rule.dns === undefined) noteOutsideDns(rule.iface, info);
         const resolved = await safeResolve(rule);
         const reasonCode = resolved.reasonCode ?? (resolved.status === 'active' ? null : 'internal');
         draft = draftOf(rule, { status: resolved.status, reasonCode, reason: resolved.reason }, resolved.lastResolvedAt);
-        targets = resolved.destinations.slice(0, PROTOCOL_LIMITS.maxAppliedDestinationsPerRule);
+        // The rule's own server goes first: its route is what lets the lookups (and the
+        // resolver file) reach it. The resolver never returns it among the destinations.
+        serverTarget = rule.dns ?? null;
+        const answers = resolved.destinations.filter((target) => target !== serverTarget);
+        targets = [...(serverTarget === null ? [] : [serverTarget]), ...answers].slice(
+          0,
+          PROTOCOL_LIMITS.maxAppliedDestinationsPerRule,
+        );
       } else {
         draft = draftOf(rule, ACTIVE);
       }
@@ -802,20 +864,37 @@ export const createEngine = (deps: EngineDeps): Engine => {
           recordIssue(draft, 'forbidden-destination', `Destination must never be routed (${forbidden ?? 'invalid-destination'})`);
           continue;
         }
-        anyDestination = true;
         const dst = wireDestination(destination);
+        if (target === serverTarget && info.subnet !== null && cidrContains(info.subnet, dst)) {
+          // The rule's own DNS server on the interface's own link is reached directly: no route.
+          continue;
+        }
+        anyDestination = true;
         const conflict = findConnectedConflict(destination, interfaces);
+        if (conflict !== null && target === serverTarget && conflict.role === rule.iface) continue;
         if (conflict !== null) {
           recordIssue(draft, 'connected-network', `${dst} ${CONFLICT_TEXT[conflict.kind]} (${conflict.role})`);
           continue;
         }
         const key = routeKey(destination);
         const existing = desired.get(key);
+        const explicit = rule.kind !== 'domain' || target === serverTarget;
         if (existing === undefined) {
-          desired.set(key, { key, dst, gateway, role: rule.iface, explicit: rule.kind !== 'domain', ruleIds: [rule.id] });
+          desired.set(key, { key, dst, gateway, role: rule.iface, explicit, ruleIds: [rule.id] });
         } else if (existing.gateway === gateway) {
           if (!existing.ruleIds.includes(rule.id)) existing.ruleIds.push(rule.id);
-        } else if (existing.explicit && rule.kind === 'domain') {
+        } else if (explicit && !existing.explicit) {
+          // Only a rule's own DNS server gets here (explicit rules are planned before every domain
+          // rule): it takes the destination over from the addresses other domains resolved to.
+          desired.set(key, { key, dst, gateway, role: rule.iface, explicit, ruleIds: [rule.id] });
+          for (const ruleId of existing.ruleIds) {
+            recordIssue(
+              drafts.get(ruleId),
+              'route-failed',
+              `${dst} is routed through the ${rule.iface} interface as the DNS server of another rule, which takes precedence over a resolved address`,
+            );
+          }
+        } else if (existing.explicit && !explicit) {
           recordIssue(
             draft,
             'route-failed',
@@ -825,6 +904,13 @@ export const createEngine = (deps: EngineDeps): Engine => {
           recordIssue(draft, 'route-failed', `${dst} is already routed through the ${existing.role} interface by another rule`);
         }
       }
+    }
+
+    // A resolver file that is not in place is the problem a rule shows, whatever else it has,
+    // and also while its interface is down: the file does not depend on the interface.
+    for (const [ruleId, issue] of resolverIssues) {
+      const draft = drafts.get(ruleId);
+      if (draft !== undefined && draft.base.status !== 'disabled') draft.issue = { reasonCode: issue.reasonCode, reason: issue.reason };
     }
 
     // Only a clean detection can say "this interface really has no known subnet".
@@ -1171,13 +1257,16 @@ export const createEngine = (deps: EngineDeps): Engine => {
     // either it or the last trusted detection knows everything the guard needs.
     const allowAdds = mode === 'normal' || (mode === 'accepted' && detected !== null && guardCoversEveryRole(detected, trusted));
 
-    const plan = await buildPlan(snapshot, detected, guardInterfaces);
+    // The files depend on the config only, so they are kept in line whatever the detection is like.
+    const resolverIssues = await safeSyncResolvers(snapshot);
+    const plan = await buildPlan(snapshot, detected, guardInterfaces, resolverIssues);
     const counters = await applyDiff(plan, mode, allowAdds, reason, JSON.stringify(current));
     const owning = new Set([...applied.values()].flatMap((entry) => entry.ruleIds));
     const verdictOf = (draft: Draft): Verdict => {
       if (draft.issue !== null) return errorVerdict(draft.issue.reasonCode, draft.issue.reason);
       // A rule that already has routes keeps its status; one with nothing applied waits.
-      return draft.deferred && !owning.has(draft.rule.id) ? DEFERRED : draft.base;
+      // A rule that is waiting anyway (a domain still resolving) keeps its own reason.
+      return draft.deferred && !owning.has(draft.rule.id) && draft.base.status !== 'pending' ? DEFERRED : draft.base;
     };
 
     logRuleIssues(plan.drafts, reason);

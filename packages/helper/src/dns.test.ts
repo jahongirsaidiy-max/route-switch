@@ -2717,8 +2717,12 @@ describe('the DNS servers of the interfaces are never routed from an answer', ()
     const outcome = await h.settle();
 
     expect(h.dns.lookups[0]?.servers).toEqual(['198.51.100.53']);
-    expect(h.take()).toEqual([`add 172.16.12.40 ${WIFI_GW}`]);
-    expect(stateOf(outcome)).toMatchObject({ reasonCode: 'forbidden-destination', appliedDestinations: ['172.16.12.40'] });
+    // The rule's own server is routed (TASK-111): it is not the server of an interface.
+    expect(h.take()).toEqual([`add 198.51.100.53 ${WIFI_GW}`, `add 172.16.12.40 ${WIFI_GW}`]);
+    expect(stateOf(outcome)).toMatchObject({
+      reasonCode: 'forbidden-destination',
+      appliedDestinations: ['198.51.100.53', '172.16.12.40'],
+    });
   });
 
   it('when the detection is never clean and is accepted as it is (QA scenario ii)', async () => {
@@ -2732,8 +2736,11 @@ describe('the DNS servers of the interfaces are never routed from an answer', ()
     expect(h.take()).toEqual([]);
     const accepted = await h.engine.reconcile('network-change');
 
-    expect(h.take()).toEqual([`add 172.16.12.40 ${WIFI_GW}`]);
-    expect(stateOf(accepted)).toMatchObject({ reasonCode: 'forbidden-destination', appliedDestinations: ['172.16.12.40'] });
+    expect(h.take()).toEqual([`add 198.51.100.53 ${WIFI_GW}`, `add 172.16.12.40 ${WIFI_GW}`]);
+    expect(stateOf(accepted)).toMatchObject({
+      reasonCode: 'forbidden-destination',
+      appliedDestinations: ['198.51.100.53', '172.16.12.40'],
+    });
   });
 
   it('for a server an interface got while no domain rule existed (QA scenario iii)', async () => {
@@ -2766,8 +2773,8 @@ describe('the DNS servers of the interfaces are never routed from an answer', ()
     await h.engine.reconcile('startup');
     await answer(h, ['10.20.9.53', '172.16.12.40']);
     await h.settle();
-    // Not a DNS server as far as anyone knows: routed.
-    expect(h.take()).toEqual([`add 10.20.9.53 ${WIFI_GW}`, `add 172.16.12.40 ${WIFI_GW}`]);
+    // Not a DNS server as far as anyone knows: routed (after the rule's own server).
+    expect(h.take()).toEqual([`add 198.51.100.53 ${WIFI_GW}`, `add 10.20.9.53 ${WIFI_GW}`, `add 172.16.12.40 ${WIFI_GW}`]);
 
     // A degraded detection reports it as Ethernet's server. Nothing is deleted on a held pass ...
     network.current = detection({ ethernet: ['10.20.9.53'], wifi: null }, true);
@@ -2799,7 +2806,7 @@ describe('the DNS servers of the interfaces are never routed from an answer', ()
     await h.engine.reconcile('startup');
     await flush();
     await h.settle();
-    expect(h.take()).toEqual([`add 172.16.12.40 ${ETH_GW}`, `add 172.16.12.50 ${WIFI_GW}`]);
+    expect(h.take()).toEqual([`add 10.77.0.53 ${WIFI_GW}`, `add 172.16.12.40 ${ETH_GW}`, `add 172.16.12.50 ${WIFI_GW}`]);
 
     // Eight degraded detections, each with another Ethernet DNS server: more than the cap of the remembered ones.
     for (let index = 1; index <= MAX_EXCLUDED_DNS_PER_ROLE; index += 1) {
