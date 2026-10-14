@@ -280,6 +280,13 @@ export interface Engine {
   getState(): EngineState;
   getConfig(): Config;
   /**
+   * Revision of the config `getConfig` returns right now: it goes up exactly
+   * when `setConfig` or `setEnabled` changes the config. The published state
+   * carries it only after the next pass; the socket server pairs it with
+   * `getConfig` so the app can tell which revision a config belongs to.
+   */
+  getConfigRevision(): number;
+  /**
    * Replaces the config (already validated by the caller). Returns whether it
    * differed from the stored one; only then `configRevision` goes up. Does not
    * reconcile: the caller follows up with `reconcile('config-change')`.
@@ -1646,8 +1653,12 @@ export const createEngine = (deps: EngineDeps): Engine => {
       const next = queued;
       queued = null;
       request.resolve(outcome);
-      if (next !== null) start(next);
-      else releaseIdleWaiters();
+      // A final `clear()` that is waiting has set `shutDown`: what queued up meanwhile does not run.
+      if (next !== null && !shutDown) start(next);
+      else {
+        next?.resolve(idleOutcome());
+        releaseIdleWaiters();
+      }
     };
     guardedPass(request.reason, request.force, request.retryRefused).then(settle, (error: unknown) => {
       settle(lastResort(request.reason, error));
@@ -1830,6 +1841,9 @@ export const createEngine = (deps: EngineDeps): Engine => {
 
   const clear = async (options?: ClearOptions): Promise<ClearResult> => {
     const final = options?.final === true;
+    // Set before waiting: a stream of `reconcile` calls (socket requests, monitor events) must not
+    // keep the final cleanup waiting. The running pass finishes; whatever queues up behind it does not run.
+    if (final) shutDown = true;
     // Exclusive with the passes: wait until none runs or is queued, then hold the slot.
     while (running) {
       await new Promise<void>((resolve) => {
@@ -1837,8 +1851,6 @@ export const createEngine = (deps: EngineDeps): Engine => {
       });
     }
     running = true;
-    // Set before the deletes: a `reconcile` that comes in meanwhile must not run after them.
-    if (final) shutDown = true;
     try {
       return await runClear();
     } catch (error) {
@@ -1898,6 +1910,7 @@ export const createEngine = (deps: EngineDeps): Engine => {
     reconcile,
     getState: () => state,
     getConfig: () => config,
+    getConfigRevision: () => configRevision,
     setConfig,
     setEnabled,
     subscribe: (listener) => {

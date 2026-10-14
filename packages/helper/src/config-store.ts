@@ -1,6 +1,9 @@
-import { open } from 'node:fs/promises';
+import { constants } from 'node:fs';
+import * as nodeFs from 'node:fs/promises';
 
-import { Config, MAX_LINE_BYTES, describeIssues, findStructureViolation } from '@routeswitch/shared';
+import { Config, MAX_LINE_BYTES, PATHS, describeIssues, findStructureViolation } from '@routeswitch/shared';
+
+import type { Logger } from './logger';
 
 /**
  * Reads the rules file. Nothing here throws or rejects for a runtime
@@ -54,7 +57,7 @@ const errorCodeOf = (error: unknown): string => {
 /** The real reader: one open file handle, size checked before the content is read. */
 export const readConfigFile: ConfigFileReader = async (path, maxBytes) => {
   try {
-    const handle = await open(path, 'r');
+    const handle = await nodeFs.open(path, 'r');
     try {
       const stats = await handle.stat();
       if (!stats.isFile()) return { kind: 'unreadable', detail: 'ENOTFILE' };
@@ -112,4 +115,119 @@ export const loadConfig = async (path: string, read: ConfigFileReader = readConf
     return failure('invalid-json', 'Config file is not valid JSON');
   }
   return parseConfig(value);
+};
+
+// ---------------------------------------------------------------------------
+// Writing (daemon only: the helper is the only writer of the config file)
+// ---------------------------------------------------------------------------
+
+const FILE_MODE = 0o644;
+const DIR_MODE = 0o755;
+
+/** The part of `node:fs/promises` the writer uses; tests point it at a temporary directory or inject failures. */
+export interface ConfigFs {
+  readonly open: typeof nodeFs.open;
+  readonly rename: typeof nodeFs.rename;
+  readonly unlink: typeof nodeFs.unlink;
+  readonly mkdir: (path: string, options: { readonly mode: number }) => Promise<unknown>;
+}
+
+const realConfigFs: ConfigFs = {
+  open: nodeFs.open,
+  rename: nodeFs.rename,
+  unlink: nodeFs.unlink,
+  mkdir: (path, options) => nodeFs.mkdir(path, options),
+};
+
+/** `ok: false` carries a short system error code (`EACCES`) or `too-large`, never file content. */
+export type SaveConfigResult = { readonly ok: true; readonly bytes: number } | { readonly ok: false; readonly code: string };
+
+export interface ConfigWriter {
+  /** Writes a validated config. Writes are serialised. Never rejects. */
+  save(config: Config): Promise<SaveConfigResult>;
+}
+
+export interface ConfigWriterDeps {
+  readonly logger: Logger;
+  /** `PATHS.config` in the daemon; a file in a temporary directory in tests. Must be absolute. */
+  readonly path?: string | undefined;
+  readonly fs?: ConfigFs | undefined;
+}
+
+/** Pretty-printed so the file stays readable for a person looking at it; `loadConfig` reads it back unchanged. */
+export const serializeConfig = (config: Config): string => `${JSON.stringify(config, null, 2)}\n`;
+
+const dirOf = (path: string): string => path.slice(0, Math.max(1, path.lastIndexOf('/')));
+
+/**
+ * The writer of `config.json`. Atomic: the content goes to a temporary file of
+ * our own in the same directory (created exclusively, never following a link,
+ * mode 0644 whatever the umask, synced) which is then renamed over the
+ * config. A reader, and the helper after a crash, sees either the old or the
+ * new file, never half of one. A leftover temporary file is ours by name and
+ * removed first. A missing directory is created (0755) once.
+ *
+ * Only configs that passed the `Config` schema reach it (the socket request
+ * was parsed with it), and nothing larger than `MAX_CONFIG_BYTES` is written:
+ * `loadConfig` would refuse it at the next start.
+ */
+export const createConfigWriter = (deps: ConfigWriterDeps): ConfigWriter => {
+  const fs = deps.fs ?? realConfigFs;
+  const path = deps.path ?? PATHS.config;
+  const dir = dirOf(path);
+  const tempPath = `${dir}/.config.json.routeswitch.tmp`;
+  const logger = deps.logger.child({ component: 'config' });
+
+  const writeTemp = async (content: string): Promise<void> => {
+    await fs.unlink(tempPath).catch((error: unknown) => {
+      if (errorCodeOf(error) !== 'ENOENT') throw error;
+    });
+    const handle = await fs.open(tempPath, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, FILE_MODE);
+    try {
+      await handle.writeFile(content, { encoding: 'utf8' });
+      // The mode given to open is reduced by the umask; the file must be readable as documented.
+      await handle.chmod(FILE_MODE);
+      await handle.sync();
+    } finally {
+      await handle.close();
+    }
+  };
+
+  const write = async (config: Config): Promise<SaveConfigResult> => {
+    const content = serializeConfig(config);
+    const bytes = Buffer.byteLength(content, 'utf8');
+    if (bytes > MAX_CONFIG_BYTES) {
+      logger.error('config not saved: it would be larger than the helper reads back', { path, bytes, limit: MAX_CONFIG_BYTES });
+      return { ok: false, code: 'too-large' };
+    }
+    try {
+      try {
+        await writeTemp(content);
+      } catch (error) {
+        if (errorCodeOf(error) !== 'ENOENT') throw error;
+        // The directory is missing (normally the install script creates it): create it, once, and retry.
+        await fs.mkdir(dir, { mode: DIR_MODE });
+        logger.warn('config directory was missing and has been created', { dir });
+        await writeTemp(content);
+      }
+      await fs.rename(tempPath, path);
+      logger.info('config saved', { path, rules: config.rules.length, enabled: config.enabled, bytes });
+      return { ok: true, bytes };
+    } catch (error) {
+      const code = errorCodeOf(error);
+      logger.error('config could not be saved; the previous one stays in effect', { path, error: code });
+      // Best effort: the failure is logged above, and a leftover temporary file is removed before the next write.
+      await fs.unlink(tempPath).catch(() => undefined);
+      return { ok: false, code };
+    }
+  };
+
+  let last: Promise<unknown> = Promise.resolve();
+  return {
+    save: (config) => {
+      const result = last.then(() => write(config));
+      last = result;
+      return result;
+    },
+  };
 };

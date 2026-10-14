@@ -76,7 +76,7 @@ async function handshake(h: Harness, state: EngineState = engineState(1), config
   await flush();
   socket.receive(ok(socket.lastRequest().id, statusResult(state)));
   await flush();
-  socket.receive(ok(socket.lastRequest().id, { config }));
+  socket.receive(ok(socket.lastRequest().id, { config, configRevision: state.configRevision }));
   await flush();
   return socket;
 }
@@ -117,7 +117,7 @@ describe('connecting', () => {
     expect(h.client.snapshot().status).toEqual({ kind: 'connecting' });
     expect(h.states).toEqual([]);
 
-    socket.receive(ok(1, { config: oneRuleConfig() }));
+    socket.receive(ok(1, { config: oneRuleConfig(), configRevision: 3 }));
     await flush();
     expect(h.client.snapshot()).toEqual({
       status: { kind: 'connected', helperVersion: '1.2.3' },
@@ -308,8 +308,8 @@ describe('requests', () => {
 
     const getConfig = client.request('getConfig');
     expect(live.lastRequest()).toEqual({ id: 3, method: 'getConfig' });
-    live.receive(ok(3, { config: oneRuleConfig() }));
-    expect(await getConfig).toEqual({ ok: true, value: { config: oneRuleConfig() } });
+    live.receive(ok(3, { config: oneRuleConfig(), configRevision: 1 }));
+    expect(await getConfig).toEqual({ ok: true, value: { config: oneRuleConfig(), configRevision: 1 } });
 
     const setConfig = client.request('setConfig', { config: { version: 1, rules: [{ id: RULE_ID, kind: 'subnet', target: '10.1.2.3/8', iface: 'ethernet' }] } });
     // Sent normalised and with defaults filled in — built from the parsed request.
@@ -329,7 +329,7 @@ describe('requests', () => {
 
     // The revision moved (2 → 3) without a config in the result: the client fetches it itself.
     expect(live.lastRequest()).toEqual({ id: 7, method: 'getConfig' });
-    live.receive(ok(7, { config: { ...oneRuleConfig(), enabled: false } }));
+    live.receive(ok(7, { config: { ...oneRuleConfig(), enabled: false }, configRevision: 3 }));
     await flush();
     expect(client.snapshot()).toMatchObject({ configRevision: 3, config: { enabled: false } });
 
@@ -405,13 +405,13 @@ describe('requests', () => {
     const second = client.request('test', { target: '10.1.2.3' });
     const third = client.request('getConfig');
     expect(live.requests().slice(2).map((request) => request.id)).toEqual([2, 3, 4]);
-    live.receive(ok(4, { config: oneRuleConfig() }));
+    live.receive(ok(4, { config: oneRuleConfig(), configRevision: 1 }));
     live.receive(refused(3, 'No route', 'operation-failed'));
     live.receive(ok(2, { state: engineState(2) }));
     expect(await Promise.all([first, second, third])).toEqual([
       { ok: true, value: { state: engineState(2) } },
       { ok: false, code: 'operation-failed', error: 'No route' },
-      { ok: true, value: { config: oneRuleConfig() } },
+      { ok: true, value: { config: oneRuleConfig(), configRevision: 1 } },
     ]);
   });
 
@@ -528,7 +528,7 @@ describe('losing the connection', () => {
       { id: 0, method: 'status' },
       { id: 1, method: 'getConfig' },
     ]);
-    next.receive(ok(1, { config: emptyConfig() }));
+    next.receive(ok(1, { config: emptyConfig(), configRevision: 1 }));
     await flush();
 
     expect(h.client.snapshot()).toEqual({
@@ -724,7 +724,7 @@ describe('state and config', () => {
     expect(h.live.requests().slice(2)).toEqual([{ id: 2, method: 'getConfig' }]);
     expect(h.client.snapshot()).toMatchObject({ config: emptyConfig(), configRevision: 1 });
 
-    h.live.receive(ok(2, { config: oneRuleConfig() }));
+    h.live.receive(ok(2, { config: oneRuleConfig(), configRevision: 2 }));
     await flush();
     expect(h.client.snapshot()).toMatchObject({ config: oneRuleConfig(), configRevision: 2 });
     expect(h.configs).toEqual([emptyConfig(), oneRuleConfig()]);
@@ -739,12 +739,13 @@ describe('state and config', () => {
     h.live.receive({ event: 'state', state: engineState(5, 5) });
     expect(h.live.requests().filter((request) => request.method === 'getConfig')).toHaveLength(2); // handshake + one
 
-    h.live.receive(ok(2, { config: oneRuleConfig() }));
+    // The helper read the config while the revision was still 2.
+    h.live.receive(ok(2, { config: oneRuleConfig(), configRevision: 2 }));
     await flush();
     expect(h.client.snapshot().configRevision).toBe(2);
     expect(h.live.requests().filter((request) => request.method === 'getConfig')).toHaveLength(3);
 
-    h.live.receive(ok(3, { config: emptyConfig() }));
+    h.live.receive(ok(3, { config: emptyConfig(), configRevision: 5 }));
     await flush();
     expect(h.client.snapshot()).toMatchObject({ state: engineState(5, 5), config: emptyConfig(), configRevision: 5 });
     expect(h.live.requests().filter((request) => request.method === 'getConfig')).toHaveLength(3);
@@ -769,13 +770,77 @@ describe('state and config', () => {
     socket.receive(ok(0, statusResult(engineState(1, 1))));
     await flush();
     socket.receive({ event: 'state', state: engineState(2, 2) });
-    socket.receive(ok(1, { config: emptyConfig() }));
+    // Read before the change: revision 1.
+    socket.receive(ok(1, { config: emptyConfig(), configRevision: 1 }));
     await flush();
     expect(h.states).toEqual([engineState(2, 2)]);
     expect(socket.lastRequest()).toEqual({ id: 2, method: 'getConfig' });
-    socket.receive(ok(2, { config: oneRuleConfig() }));
+    socket.receive(ok(2, { config: oneRuleConfig(), configRevision: 2 }));
     await flush();
     expect(h.client.snapshot()).toMatchObject({ config: oneRuleConfig(), configRevision: 2 });
+  });
+
+  it('takes the revision the helper read with the config: a config newer than the status state needs no second fetch', async () => {
+    const h = setup();
+    h.client.start();
+    const socket = h.socket();
+    socket.emit('connect');
+    await flush();
+    socket.receive(ok(0, statusResult(engineState(1, 1))));
+    await flush();
+    socket.receive({ event: 'state', state: engineState(2, 2) });
+    // Read after the change: the config of revision 2.
+    socket.receive(ok(1, { config: oneRuleConfig(), configRevision: 2 }));
+    await flush();
+    expect(h.client.snapshot()).toMatchObject({ status: { kind: 'connected' }, state: engineState(2, 2), config: oneRuleConfig(), configRevision: 2 });
+    expect(socket.requests().filter((request) => request.method === 'getConfig')).toHaveLength(1);
+  });
+
+  it('does not apply a fetched config older than one a setConfig result already gave', async () => {
+    const h = await connected(engineState(1, 1));
+    h.live.receive({ event: 'state', state: engineState(2, 2) }); // fetch #2 starts
+    const setConfig = h.client.request('setConfig', { config: oneRuleConfig() });
+    h.live.receive(ok(3, { config: oneRuleConfig(), state: engineState(3, 3) }));
+    await setConfig;
+    // The late answer to the fetch: revision 2, older than the 3 already held.
+    h.live.receive(ok(2, { config: emptyConfig(), configRevision: 2 }));
+    await flush();
+    expect(h.client.snapshot()).toMatchObject({ config: oneRuleConfig(), configRevision: 3 });
+    expect(h.configs.at(-1)).toEqual(oneRuleConfig());
+  });
+
+  it('a config read ahead of the states is current: the states that catch up start no fetch (bounded fetches)', async () => {
+    const h = await connected(engineState(1, 1));
+    h.live.receive({ event: 'state', state: engineState(2, 2) });
+    expect(h.live.lastRequest()).toEqual({ id: 2, method: 'getConfig' });
+    // Two more changes happened before the helper read the config.
+    h.live.receive(ok(2, { config: oneRuleConfig(), configRevision: 4 }));
+    await flush();
+    expect(h.client.snapshot()).toMatchObject({ config: oneRuleConfig(), configRevision: 4 });
+    for (let seq = 3; seq <= 20; seq += 1) h.live.receive({ event: 'state', state: engineState(seq, seq <= 10 ? 3 : 4) });
+    await flush();
+    expect(h.live.requests().filter((request) => request.method === 'getConfig')).toHaveLength(2); // handshake + one
+    // A revision past the one held fetches again, once.
+    h.live.receive({ event: 'state', state: engineState(21, 5) });
+    h.live.receive({ event: 'state', state: engineState(22, 5) });
+    expect(h.live.requests().filter((request) => request.method === 'getConfig')).toHaveLength(3);
+  });
+
+  it('a handshake config read ahead of the first state starts no fetch either', async () => {
+    const h = setup();
+    h.client.start();
+    const socket = h.socket();
+    socket.emit('connect');
+    await flush();
+    socket.receive(ok(0, statusResult(engineState(1, 1))));
+    await flush();
+    socket.receive(ok(1, { config: oneRuleConfig(), configRevision: 3 }));
+    await flush();
+    socket.receive({ event: 'state', state: engineState(2, 2) });
+    socket.receive({ event: 'state', state: engineState(3, 3) });
+    await flush();
+    expect(h.client.snapshot()).toMatchObject({ status: { kind: 'connected' }, configRevision: 3 });
+    expect(socket.requests().filter((request) => request.method === 'getConfig')).toHaveLength(1);
   });
 
   it('tries again after two seconds when fetching the changed config fails', async () => {
@@ -787,7 +852,7 @@ describe('state and config', () => {
     expect(h.scheduler.pending()).toEqual([RECONNECT_DELAY_MS]);
     h.scheduler.advance(RECONNECT_DELAY_MS);
     expect(h.live.lastRequest()).toEqual({ id: 3, method: 'getConfig' });
-    h.live.receive(ok(3, { config: oneRuleConfig() }));
+    h.live.receive(ok(3, { config: oneRuleConfig(), configRevision: 2 }));
     await flush();
     expect(h.client.snapshot().configRevision).toBe(2);
     expect(h.scheduler.pending()).toEqual([]);
@@ -965,7 +1030,7 @@ describe('timers and bookkeeping', () => {
     socket.receive({ event: 'state', state: engineState(8, 3) });
     expect(h.client.snapshot()).toEqual({ status: { kind: 'connecting' }, state: null, config: null, configRevision: null });
     expect(h.states).toEqual([]);
-    socket.receive(ok(1, { config: emptyConfig() }));
+    socket.receive(ok(1, { config: emptyConfig(), configRevision: 3 }));
     await flush();
     expect(h.client.snapshot()).toMatchObject({ status: { kind: 'connected' }, state: engineState(8, 3), config: emptyConfig() });
   });
@@ -989,7 +1054,7 @@ describe('timers and bookkeeping', () => {
     await flush();
     socket.receive(ok(0, statusResult(engineState(7, 3))));
     await flush();
-    socket.receive(ok(1, { config: oneRuleConfig() })); // the answer is in …
+    socket.receive(ok(1, { config: oneRuleConfig(), configRevision: 3 })); // the answer is in …
     end(h); // … but the connection ends before the handshake reads it
     await flush();
     expect(h.client.snapshot()).toEqual({ status, state: null, config: null, configRevision: null });
@@ -1221,7 +1286,7 @@ describe('subscribers that call back into the client', () => {
       live.receive({ event: 'state', state: engineState(2, 2) });
       live.receive({ event: 'state', state: engineState(3, 3) });
       track(h.client.request('apply'));
-      live.receive(ok(2, { config: oneRuleConfig() }));
+      live.receive(ok(2, { config: oneRuleConfig(), configRevision: 3 }));
       await flush();
     }],
     ['onLog, on a log event (with a state after it in the same chunk)', 'log', always, async ({ h, track }) => {
@@ -1243,7 +1308,7 @@ describe('subscribers that call back into the client', () => {
       old.receive({ event: 'state', state: engineState(900, 9) });
       old.receive({ event: 'log', level: 'error', msg: 'late', at: '2026-01-02T03:04:05.000Z' });
       old.receive(ok(2, { state: engineState(901, 9), config: emptyConfig() }));
-      old.receive(ok(3, { config: oneRuleConfig() }));
+      old.receive(ok(3, { config: oneRuleConfig(), configRevision: 9 }));
       old.emit('connect');
       old.emit('error', socketError('EPIPE'));
       old.emit('close');

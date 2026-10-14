@@ -5,8 +5,15 @@ import { join } from 'node:path';
 import { Config } from '@routeswitch/shared';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 
+import { existsSync, readdirSync, readFileSync, statSync, symlinkSync } from 'node:fs';
+import * as nodeFs from 'node:fs/promises';
+
+import { createLogger, createMemorySink } from './logger';
 import {
   MAX_CONFIG_BYTES,
+  createConfigWriter,
+  serializeConfig,
+  type ConfigFs,
   emptyConfig,
   loadConfig,
   parseConfig,
@@ -271,5 +278,82 @@ describe('parseConfig and emptyConfig', () => {
 
     expect(emptyConfig()).toEqual({ version: 1, enabled: true, rules: [] });
     expect(Config.parse(emptyConfig())).toEqual(emptyConfig());
+  });
+});
+
+describe('createConfigWriter', () => {
+  const realFs: ConfigFs = { open: nodeFs.open, rename: nodeFs.rename, unlink: nodeFs.unlink, mkdir: (path, options) => nodeFs.mkdir(path, options) };
+  const writer = async (fs: ConfigFs = realFs) => {
+    const dir = await mkdtemp(join(tmpdir(), 'routeswitch-config-writer-'));
+    const memory = createMemorySink();
+    const path = join(dir, 'RouteSwitch', 'config.json');
+    return { dir, path, memory, writer: createConfigWriter({ logger: createLogger({ sinks: [memory.sink] }), path, fs }) };
+  };
+
+  it('writes atomically with mode 0644 (whatever the umask), creating the directory, and loadConfig reads it back unchanged', async () => {
+    const w = await writer();
+    const config = Config.parse(VALID);
+    const previous = process.umask(0o077);
+    try {
+      expect(await w.writer.save(config)).toMatchObject({ ok: true });
+    } finally {
+      process.umask(previous);
+    }
+    expect(statSync(w.path).mode & 0o777).toBe(0o644);
+    expect(readFileSync(w.path, 'utf8')).toBe(serializeConfig(config));
+    expect(readdirSync(join(w.dir, 'RouteSwitch'))).toEqual(['config.json']);
+    expect(await loadConfig(w.path)).toEqual({ ok: true, source: 'file', config });
+    const inode = statSync(w.path).ino;
+    await w.writer.save({ ...config, enabled: false });
+    // Replaced by rename, not rewritten in place.
+    expect(statSync(w.path).ino).not.toBe(inode);
+    await rm(w.dir, { recursive: true, force: true });
+  });
+
+  it('removes a temporary file a crash left, and never writes through a link at the temporary name', async () => {
+    const w = await writer();
+    await mkdir(join(w.dir, 'RouteSwitch'));
+    const target = join(w.dir, 'elsewhere');
+    await writeFile(target, 'keep');
+    symlinkSync(target, join(w.dir, 'RouteSwitch', '.config.json.routeswitch.tmp'));
+    expect(await w.writer.save(emptyConfig())).toMatchObject({ ok: true });
+    expect(readFileSync(target, 'utf8')).toBe('keep');
+    expect(existsSync(join(w.dir, 'RouteSwitch', '.config.json.routeswitch.tmp'))).toBe(false);
+    await rm(w.dir, { recursive: true, force: true });
+  });
+
+  it('a link that appears at the temporary name after the cleanup is never written through (O_EXCL, O_NOFOLLOW)', async () => {
+    // The unlink "loses the race": the link is still there when the file is opened.
+    const racing: ConfigFs = { ...realFs, unlink: () => Promise.resolve() };
+    const w = await writer(racing);
+    await mkdir(join(w.dir, 'RouteSwitch'));
+    const target = join(w.dir, 'elsewhere');
+    await writeFile(target, 'keep');
+    symlinkSync(target, join(w.dir, 'RouteSwitch', '.config.json.routeswitch.tmp'));
+    expect(await w.writer.save(emptyConfig())).toMatchObject({ ok: false });
+    expect(readFileSync(target, 'utf8')).toBe('keep');
+    expect(existsSync(w.path)).toBe(false);
+    await rm(w.dir, { recursive: true, force: true });
+  });
+
+  it('a failed write leaves the previous config in place and reports the error code', async () => {
+    const failing: ConfigFs = { ...realFs, rename: () => Promise.reject(Object.assign(new Error('x'), { code: 'EACCES' })) };
+    const w = await writer(failing);
+    await mkdir(join(w.dir, 'RouteSwitch'));
+    await writeFile(w.path, serializeConfig(emptyConfig()));
+    expect(await w.writer.save(Config.parse(VALID))).toEqual({ ok: false, code: 'EACCES' });
+    expect(readFileSync(w.path, 'utf8')).toBe(serializeConfig(emptyConfig()));
+    expect(readdirSync(join(w.dir, 'RouteSwitch'))).toEqual(['config.json']);
+    expect(w.memory.entries.some((entry) => entry.level === 'error')).toBe(true);
+    await rm(w.dir, { recursive: true, force: true });
+  });
+
+  it('serialises writes: the last one wins', async () => {
+    const w = await writer();
+    const config = Config.parse(VALID);
+    const results = await Promise.all([w.writer.save(emptyConfig()), w.writer.save(config)]);
+    expect(results.every((result) => result.ok)).toBe(true);
+    expect(readFileSync(w.path, 'utf8')).toBe(serializeConfig(config));
+    await rm(w.dir, { recursive: true, force: true });
   });
 });

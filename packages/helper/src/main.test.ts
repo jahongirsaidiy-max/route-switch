@@ -1,8 +1,9 @@
-import { mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, readdirSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { createServer } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
-import { Config, EngineState, PATHS } from '@routeswitch/shared';
+import { Config, EngineState, PATHS, PROTOCOL_VERSION } from '@routeswitch/shared';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import type { ConfigFileRead, ConfigFileReader } from './config-store';
@@ -11,6 +12,7 @@ import { createFakeDns, createFakeScheduler, dnsError, flush, type FakeDns, type
 import { createLogger } from './logger';
 import { EXIT_CODES, HELPER_VERSION, ONE_SHOT_DNS_WAIT_MS, SHUTDOWN_EXIT_TIMEOUT_SEC, USAGE, cleanupAll, createCore, parseArgs, run, type RunDeps } from './main';
 import type { ProcessSpawner } from './exec';
+import { connectTestClient } from './socket-test-client';
 import { createStateStore } from './state-store';
 import { createFakeCommandRunner, type FakeCommandResponse, type FakeCommandRunner } from './test-utils';
 import { assertFsGuardInstalled } from './test-fs-guard-check';
@@ -139,6 +141,9 @@ const harness = (file: unknown = CONFIG, extra: Partial<RunDeps> = {}): Harness 
       clearTimer: scheduler.clearTimer,
       wallNow: () => scheduler.now().getTime(),
       monotonicNow: () => scheduler.now().getTime() - NOW.getTime(),
+      // Never the real socket: a path in a temporary directory, left with the owner it was created with.
+      socketPath: join(newResolverDir(), 's.sock'),
+      socketOwner: null,
       ...extra,
     },
     runner,
@@ -1054,6 +1059,9 @@ describe('run without --once (daemon): state.json and cleanup', () => {
       signalAtOnce?: string;
       /** While `gate` is set, every `networksetup` call waits for it. */
       hold?: { gate: Promise<void> | null };
+      /** Command line of the daemon; `[]` by default. */
+      argv?: readonly string[];
+      socketPath?: string;
     } = {},
   ): Daemon => {
     const table = options.table ?? { routes: new Map<string, string>(), failDelete: new Set<string>() };
@@ -1083,6 +1091,7 @@ describe('run without --once (daemon): state.json and cleanup', () => {
       statePath,
       createSpawner: () => spawner,
       waitForSignal: () => signalled,
+      ...(options.socketPath === undefined ? {} : { socketPath: options.socketPath }),
       ...(hold === undefined
         ? {}
         : {
@@ -1097,7 +1106,7 @@ describe('run without --once (daemon): state.json and cleanup', () => {
     });
     holder.runner = h.runner;
     withTable(h.runner, table);
-    const exit = run([], h.deps);
+    const exit = run(options.argv ?? [], h.deps);
     return {
       h,
       table,
@@ -1321,15 +1330,193 @@ describe('run without --once (daemon): state.json and cleanup', () => {
     expect(daemon.h.logs().some((entry) => entry['msg'] === 'interface detection is degraded; no route is added, and none is removed because of interface state, in this reconcile' || entry['msg'] === 'interface detection threw')).toBe(true);
   });
 
-  it('with a config that cannot be loaded: cleans up the leftovers, touches nothing else, exits 3', async () => {
+  it('with a config that cannot be loaded: cleans up the leftovers, applies nothing, keeps serving, and a setConfig repairs it', async () => {
     const table: Table = { routes: new Map([['192.0.2.0/24', ETH_GW]]), failDelete: new Set() };
-    const statePath = join(newResolverDir(), 'state.json');
+    const dir = newResolverDir();
+    const statePath = join(dir, 'state.json');
+    const configPath = join(dir, 'config.json');
+    const socketPath = join(dir, 's.sock');
     writeFileSync(statePath, JSON.stringify({ version: 1, routes: [{ dst: '192.0.2.0/24', gateway: ETH_GW, ruleIds: [] }] }));
-    const daemon = startDaemon({ table, statePath, file: { kind: 'unreadable', detail: 'EACCES' } });
-    expect(await daemon.exit).toBe(EXIT_CODES.configError);
+    const daemon = startDaemon({ table, statePath, socketPath, argv: ['--config', configPath], file: { kind: 'unreadable', detail: 'EACCES' } });
+    await running(daemon);
     expect(daemon.table.routes.size).toBe(0);
-    expect(daemon.processes).toEqual([]);
-    expect(daemon.commands().every((command) => /^route -n (get|delete) /.test(command))).toBe(true);
+    expect(daemon.commands().every((command) => /^route -n (get|delete|monitor)/.test(command) || !command.startsWith('route'))).toBe(true);
+
+    const client = await connectTestClient(socketPath);
+    const status = await client.request({ id: 1, method: 'status' });
+    expect(status).toMatchObject({ id: 1, ok: true, result: { protocolVersion: PROTOCOL_VERSION, state: { enabled: false, rules: [] } } });
+    // Never an empty config in place of the broken one.
+    expect(await client.request({ id: 2, method: 'getConfig' })).toMatchObject({ id: 2, ok: false, code: 'operation-failed' });
+    expect(await client.request({ id: 3, method: 'setEnabled', enabled: true })).toMatchObject({ id: 3, ok: false, code: 'operation-failed' });
+    expect(existsSync(configPath)).toBe(false);
+
+    const set = await client.request({ id: 4, method: 'setConfig', config: CONFIG });
+    expect(set).toMatchObject({ id: 4, ok: true });
+    expect(Config.parse(JSON.parse(readFileSync(configPath, 'utf8')))).toEqual(Config.parse(CONFIG));
+    expect(statSync(configPath).mode & 0o777).toBe(0o644);
+    expect(await client.request({ id: 5, method: 'getConfig' })).toMatchObject({ id: 5, ok: true, result: { configRevision: 1 } });
+    expect(daemon.table.routes.size).toBe(2);
+    client.close();
+    daemon.signal();
+    expect(await daemon.exit).toBe(EXIT_CODES.ok);
+    expect(daemon.table.routes.size).toBe(0);
+  });
+
+  it('serves the socket: status, getConfig, setConfig, setEnabled, apply, with state events to the client', async () => {
+    const dir = newResolverDir();
+    const socketPath = join(dir, 's.sock');
+    const configPath = join(dir, 'config.json');
+    const daemon = startDaemon({ socketPath, argv: ['--config', configPath] });
+    await running(daemon);
+    expect(statSync(socketPath).mode & 0o777).toBe(0o660);
+    expect(statSync(socketPath).isSocket()).toBe(true);
+
+    const client = await connectTestClient(socketPath);
+    const status = await client.request({ id: 1, method: 'status' });
+    expect(status).toMatchObject({ ok: true, result: { protocolVersion: PROTOCOL_VERSION, helperVersion: HELPER_VERSION } });
+    const got = await client.request({ id: 2, method: 'getConfig' });
+    expect(got).toMatchObject({ ok: true, result: { configRevision: 0 } });
+
+    const oneRule = { version: 1, rules: [CONFIG.rules[0]] };
+    const set = await client.request({ id: 3, method: 'setConfig', config: oneRule });
+    expect(set.ok).toBe(true);
+    const setState = set.ok ? EngineState.parse(set.result['state']) : null;
+    expect(setState?.configRevision).toBe(1);
+    expect(setState?.lastReconcileReason).toBe('config-change');
+    expect([...daemon.table.routes.keys()]).toEqual(['198.51.100.0/24']);
+    // The event of that pass reached the client too, with the same seq.
+    await client.waitFor(() => client.events.some((event) => event.event === 'state' && event.state.seq === setState?.seq));
+
+    const off = await client.request({ id: 4, method: 'setEnabled', enabled: false });
+    expect(off).toMatchObject({ ok: true, result: { state: { enabled: false, configRevision: 2 } } });
+    expect(daemon.table.routes.size).toBe(0);
+    expect(JSON.parse(readFileSync(configPath, 'utf8'))).toMatchObject({ enabled: false });
+
+    const on = await client.request({ id: 5, method: 'setEnabled', enabled: true });
+    expect(on).toMatchObject({ ok: true, result: { state: { enabled: true, configRevision: 3 } } });
+    expect(daemon.table.routes.size).toBe(1);
+    const applied = await client.request({ id: 6, method: 'apply' });
+    expect(applied).toMatchObject({ ok: true, result: { state: { lastReconcileReason: 'manual' } } });
+
+    // seq only ever grows on the connection.
+    const seqs = client.events.flatMap((event) => (event.event === 'state' ? [event.state.seq] : []));
+    expect(seqs).toEqual([...seqs].sort((x, y) => x - y));
+    expect(client.invalid).toEqual([]);
+
+    // SIGTERM: the connection is closed before the cleanup, so no state event reports it (TASK-002).
+    const eventsBefore = client.events.length;
+    daemon.signal();
+    expect(await daemon.exit).toBe(EXIT_CODES.ok);
+    await client.closed;
+    expect(client.events.slice(eventsBefore).filter((event) => event.event === 'state')).toEqual([]);
+    expect(daemon.table.routes.size).toBe(0);
+    expect(existsSync(socketPath)).toBe(false);
+    expect(daemon.h.scheduler.pending()).toBe(0);
+  });
+
+  it('uninstall: removes every route and resolver file, answers, closes the socket, then waits for the signal', async () => {
+    const dir = newResolverDir();
+    const socketPath = join(dir, 's.sock');
+    const daemon = startDaemon({ socketPath, argv: ['--config', join(dir, 'config.json')] });
+    await running(daemon);
+    expect(daemon.table.routes.size).toBe(2);
+    const client = await connectTestClient(socketPath);
+    await client.request({ id: 1, method: 'status' });
+    const eventsBefore = client.events.length;
+
+    expect(await client.request({ id: 2, method: 'uninstall' })).toEqual({ id: 2, ok: true, result: {} });
+    expect(daemon.table.routes.size).toBe(0);
+    expect(daemon.state()).toEqual({ version: 1, routes: [] });
+    expect(daemon.processes[0]?.stopped).toBe(true);
+    await client.closed;
+    expect(client.events.slice(eventsBefore).filter((event) => event.event === 'state')).toEqual([]);
+    await vi.waitFor(() => {
+      expect(existsSync(socketPath)).toBe(false);
+    });
+
+    daemon.signal();
+    expect(await daemon.exit).toBe(EXIT_CODES.ok);
+    expect(daemon.table.routes.size).toBe(0);
+  });
+
+  it('does not take over the socket of a helper that is running: exits 7 and touches nothing', async () => {
+    const dir = newResolverDir();
+    const socketPath = join(dir, 's.sock');
+    const first = startDaemon({ socketPath, argv: ['--config', join(dir, 'config.json')] });
+    await running(first);
+    const routes = [...first.table.routes];
+
+    const statePath = join(dir, 'second-state.json');
+    writeFileSync(statePath, JSON.stringify({ version: 1, routes: [{ dst: '198.51.100.0/24', gateway: ETH_GW, ruleIds: [] }] }));
+    const second = startDaemon({ socketPath, statePath, table: first.table });
+    expect(await second.exit).toBe(EXIT_CODES.socketUnavailable);
+    expect(second.processes).toEqual([]);
+    expect([...first.table.routes]).toEqual(routes);
+    expect(second.h.runner.calls).toEqual([]);
+
+    // The first still answers.
+    const client = await connectTestClient(socketPath);
+    expect(await client.request({ id: 1, method: 'status' })).toMatchObject({ ok: true });
+    client.close();
+    first.signal();
+    expect(await first.exit).toBe(EXIT_CODES.ok);
+  });
+
+  it('replaces a stale socket file left by a crashed helper', async () => {
+    const dir = newResolverDir();
+    const socketPath = join(dir, 's.sock');
+    // A socket file nobody listens on any more.
+    const stale = createServer();
+    await new Promise<void>((resolve) => stale.listen(socketPath, resolve));
+    const staleIno = statSync(socketPath).ino;
+    await new Promise<void>((resolve) => {
+      // Node removes the file on close; put a socket file back without a listener.
+      stale.close(() => {
+        resolve();
+      });
+    });
+    const ghost = createServer();
+    await new Promise<void>((resolve) => ghost.listen(socketPath, resolve));
+    // Leave the file, drop the listener: close the handle without unlinking.
+    const ghostIno = statSync(socketPath).ino;
+    expect(ghostIno).not.toBe(staleIno);
+    renameSync(socketPath, `${socketPath}.keep`);
+    await new Promise<void>((resolve) => {
+      ghost.close(() => {
+        resolve();
+      });
+    });
+    renameSync(`${socketPath}.keep`, socketPath);
+
+    const daemon = startDaemon({ socketPath, argv: ['--config', join(dir, 'config.json')] });
+    await running(daemon);
+    expect(statSync(socketPath).ino).not.toBe(ghostIno);
+    const client = await connectTestClient(socketPath);
+    expect(await client.request({ id: 1, method: 'status' })).toMatchObject({ ok: true });
+    client.close();
+    daemon.signal();
+    expect(await daemon.exit).toBe(EXIT_CODES.ok);
+  });
+
+  it('leaves a path that is not a socket alone and exits 7', async () => {
+    const dir = newResolverDir();
+    const socketPath = join(dir, 's.sock');
+    writeFileSync(socketPath, 'not a socket');
+    const daemon = startDaemon({ socketPath });
+    expect(await daemon.exit).toBe(EXIT_CODES.socketUnavailable);
+    expect(readFileSync(socketPath, 'utf8')).toBe('not a socket');
+    expect(daemon.h.runner.calls).toEqual([]);
+  });
+
+  it('logs to the log file when one is given, and not to stderr', async () => {
+    const dir = newResolverDir();
+    const logPath = join(dir, 'logs', 'helper.log');
+    const h = harness(CONFIG, { logPath, waitForSignal: () => Promise.resolve('SIGTERM'), createSpawner: () => ({ spawn: () => ({ stop: () => undefined }) }) });
+    expect(await run(['--config', join(dir, 'config.json')], h.deps)).toBe(EXIT_CODES.ok);
+    const lines = readFileSync(logPath, 'utf8').trim().split('\n').map((line) => JSON.parse(line) as Record<string, unknown>);
+    expect(lines.some((line) => line['msg'] === 'shutting down')).toBe(true);
+    expect(statSync(logPath).mode & 0o777).toBe(0o644);
+    expect(h.err).toEqual([]);
   });
 
   it('cleanupAll (global toggle off): routes and resolver files go, the engine keeps working', async () => {
@@ -1370,6 +1557,14 @@ describe('run without --once (daemon): state.json and cleanup', () => {
 
   it('documents the launchd exit timeout the cleanup is sized for', () => {
     expect(SHUTDOWN_EXIT_TIMEOUT_SEC).toBe(60);
+  });
+
+  it('never points a daemon test at the real socket or log file', () => {
+    const daemonDeps = harness().deps;
+    expect(daemonDeps.socketPath).not.toBe(PATHS.socket);
+    expect(daemonDeps.socketPath?.startsWith(tmpdir())).toBe(true);
+    expect(daemonDeps.socketOwner).toBeNull();
+    expect(daemonDeps.logPath).toBeUndefined();
   });
 
   it('never points a daemon test at the real state file', () => {

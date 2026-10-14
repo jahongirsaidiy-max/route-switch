@@ -120,7 +120,7 @@ const testResultInput = (overrides: Record<string, unknown> = {}): Record<string
 /** A valid result for every method, as the helper would send it. */
 const RESULT_INPUTS: Record<RequestMethod, Record<string, unknown>> = {
   status: { protocolVersion: PROTOCOL_VERSION, helperVersion: '0.1.0', state: stateInput() },
-  getConfig: { config: configInput() },
+  getConfig: { config: configInput(), configRevision: 3 },
   setConfig: { config: configInput(), state: stateInput() },
   apply: { state: stateInput() },
   setEnabled: { state: stateInput() },
@@ -641,6 +641,11 @@ describe('results', () => {
   it('normalises the config of a getConfig result', () => {
     const result = parseResult('getConfig', RESULT_INPUTS.getConfig);
     expect(result.ok && result.value.config.rules[0]?.target).toBe('10.0.0.0/8');
+    expect(result.ok && result.value.configRevision).toBe(3);
+  });
+
+  it('refuses a getConfig result without configRevision', () => {
+    expect(parseResult('getConfig', { config: configInput() }).ok).toBe(false);
   });
 
   it.each([
@@ -648,6 +653,8 @@ describe('results', () => {
     ['status', { protocolVersion: 0, helperVersion: '0.1.0', state: stateInput() }],
     ['status', { protocolVersion: '1', helperVersion: '0.1.0', state: stateInput() }],
     ['getConfig', {}],
+    ['getConfig', { config: configInput(), configRevision: -1 }],
+    ['getConfig', { config: configInput(), configRevision: 1.5 }],
     ['getConfig', { config: { version: 1, rules: [{ id: uuid(1), kind: 'ip', target: '127.0.0.1', iface: 'wifi' }] } }],
     ['setConfig', { config: configInput() }],
     ['apply', {}],
@@ -685,7 +692,7 @@ describe('results', () => {
     const response = { id: 1, ok: true, result: {} } satisfies OkResponseOf<'uninstall'>;
     expect(Response.safeParse(response).success).toBe(true);
     expectTypeOf<ResultOf<'apply'>>().toEqualTypeOf<{ state: EngineState }>();
-    expectTypeOf<ResultOf<'getConfig'>>().toEqualTypeOf<{ config: Config }>();
+    expectTypeOf<ResultOf<'getConfig'>>().toEqualTypeOf<{ config: Config; configRevision: number }>();
   });
 });
 

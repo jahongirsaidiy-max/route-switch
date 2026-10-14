@@ -4819,6 +4819,41 @@ describe('clear', () => {
     expect(h.engine.isReconciling()).toBe(false);
   });
 
+  it('final: a pass queued while a running one finishes does not run, so a stream of requests cannot delay the shutdown', async () => {
+    const netinfo = createFakeNetInfo();
+    const h = setup(config([HOST]), { netinfo });
+    await h.run('startup');
+    h.take();
+    const gate = deferred();
+    netinfo.gate = gate;
+    const detections = netinfo.calls.length;
+    const running = h.engine.reconcile('manual');
+    // Queued behind the running pass before the final clear came (a request, a monitor event).
+    const queuedBefore = h.engine.reconcile('config-change');
+    const clearing = h.engine.clear({ final: true });
+    // Asked for after the final clear was called: answered at once.
+    const queuedAfter = h.engine.reconcile('network-change');
+    gate.open();
+    await Promise.all([running, queuedBefore, clearing, queuedAfter]);
+    // Only the running pass detected; the queued one never ran, the clear removed the route.
+    expect(netinfo.calls.length).toBe(detections + 1);
+    expect(h.take()).toEqual([del('172.16.12.40', ETH_GW)]);
+    expect(h.engine.getApplied()).toEqual([]);
+    expect(h.engine.isReconciling()).toBe(false);
+  });
+
+  it('getConfigRevision: goes up with every real change of the config, before any pass', () => {
+    const h = setup(config([HOST]));
+    expect(h.engine.getConfigRevision()).toBe(0);
+    expect(h.engine.setEnabled(true)).toBe(false);
+    expect(h.engine.getConfigRevision()).toBe(0);
+    h.engine.setEnabled(false);
+    h.engine.setConfig(config([]));
+    expect(h.engine.getConfigRevision()).toBe(2);
+    // The published state catches up only with the next pass.
+    expect(h.engine.getState().configRevision).toBe(0);
+  });
+
   it('with nothing applied runs no command and still publishes a valid state', async () => {
     const h = setup(config([HOST], { enabled: false }));
     const seq = h.engine.getState().seq;

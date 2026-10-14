@@ -44,7 +44,7 @@ function standIn(socketPath: string): Promise<StandIn> {
           method === 'status'
             ? statusResult(state)
             : method === 'getConfig'
-              ? { config: emptyConfig() }
+              ? { config: emptyConfig(), configRevision: 1 }
               : method === 'setConfig'
                 ? { config: request.value.config, state }
                 : { state };

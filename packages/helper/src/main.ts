@@ -1,6 +1,6 @@
 import { PATHS, type Config, type EngineState } from '@routeswitch/shared';
 
-import { emptyConfig, loadConfig, type ConfigFileReader } from './config-store';
+import { createConfigWriter, emptyConfig, loadConfig, type ConfigFileReader, type ConfigFs } from './config-store';
 import {
   createDomainResolver,
   realClearTimer,
@@ -12,11 +12,19 @@ import {
 } from './dns';
 import { DEGRADED_ACCEPT_AFTER, createEngine, type AppliedRoute, type ClearResult, type Engine } from './engine';
 import { createCommandRunner, createProcessSpawner, type CommandRunner, type ProcessSpawner } from './exec';
-import { createJsonLinesSink, createLogger, type LineWritable, type Logger } from './logger';
+import { createJsonLinesFileSink, createJsonLinesSink, createLogger, type LineWritable, type LogSink, type Logger } from './logger';
 import { createNetworkMonitor, type NetworkMonitor } from './monitor';
 import { createNetInfo, type NetInfo } from './netinfo';
 import { createResolverFiles, type ResolverFiles, type ResolverFs } from './resolver';
-import { createRouteOperations } from './route';
+import { createRouteOperations, type RouteOperations } from './route';
+import {
+  SOCKET_GROUP_GID,
+  createLogForwarder,
+  createRequestHandler,
+  createSocketServer,
+  type SocketFs,
+  type SocketServer,
+} from './server';
 import { createStateStore, type StateFs, type StateStore } from './state-store';
 
 /**
@@ -25,18 +33,27 @@ import { createStateStore, type StateFs, type StateStore } from './state-store';
  * `--once`: load the config, run a single reconcile and print the resulting
  * `EngineState` as JSON on stdout. It does not read or write `state.json`.
  *
- * Without `--once`, the daemon (the socket server arrives with TASK-114):
- * 1. clean up what a previous run left behind: the routes of `state.json`
+ * Without `--once`, the daemon:
+ * 1. take the socket over (`server.ts`); when another helper answers on it,
+ *    or something that is not a socket sits there, exit 7 without touching
+ *    anything (a second instance must not clean up the routes of the first);
+ * 2. clean up what a previous run left behind: the routes of `state.json`
  *    (restored into the engine, then removed through `routeDelete`, which
  *    deletes only routes that are still ours) and every managed resolver file;
- * 2. reconcile (`startup`), start the network monitor;
- * 3. on SIGTERM or SIGINT: stop the DNS module, then the monitor, then
+ * 3. reconcile (`startup`), start the network monitor. Requests are read from
+ *    step 1 on; changes wait until step 3 is done;
+ * 4. on SIGTERM or SIGINT: close the socket (no event about the cleanup
+ *    reaches a client), stop the DNS module, then the monitor, then
  *    `cleanupAll` (every applied route and resolver file), and exit.
  * Every change of the applied routes is written to `state.json`, so a crash
- * at any point is cleaned up by step 1 of the next start.
+ * at any point is cleaned up by step 2 of the next start.
+ * A stored config that cannot be loaded no longer stops the daemon: the
+ * leftovers are cleaned up, nothing is applied, `getConfig` answers
+ * `operation-failed` and a `setConfig` replaces the file.
  *
- * The log goes to stderr as JSON lines in both modes, so stdout carries
- * nothing but the state.
+ * The one-shot run logs to stderr as JSON lines, so stdout carries nothing
+ * but the state; the daemon logs to `RunDeps.logPath` (`PATHS.log`) when set,
+ * to stderr otherwise.
  *
  * Domain rules in `--once` mode: the first pass only starts their DNS lookups
  * (a pass never waits for DNS), so when it leaves a rule `resolving` the run
@@ -60,6 +77,8 @@ export const EXIT_CODES = {
   detectionUnreliable: 5,
   /** Nothing failed, but a domain rule was still being resolved when the one-shot wait ended; its routes are missing. */
   resolvePending: 6,
+  /** Daemon: another helper answers on the socket, or it could not be set up; nothing was touched. */
+  socketUnavailable: 7,
   /** `run` itself failed, which is a bug. */
   internal: 70,
 } as const;
@@ -90,8 +109,9 @@ export const USAGE = `Usage: com.routeswitch.helper [--once] [--config <path>]
   --help            show this text
   --version         print the helper version
 
-Exit codes: 0 applied; 1 a rule is in error; 2 usage; 3 config could not be loaded; 4 mode not implemented;
-            5 interfaces could not be detected reliably, nothing was added; 6 a domain is still being resolved.
+Exit codes: 0 applied; 1 a rule is in error; 2 usage; 3 config could not be loaded (--once); 4 mode not implemented;
+            5 interfaces could not be detected reliably, nothing was added; 6 a domain is still being resolved;
+            7 daemon: the socket is in use by another helper or could not be set up.
 `;
 
 export interface RunDeps {
@@ -125,6 +145,15 @@ export interface RunDeps {
   /** Daemon: wall clock and monotonic clock of the monitor, in milliseconds. */
   readonly wallNow?: (() => number) | undefined;
   readonly monotonicNow?: (() => number) | undefined;
+  /** Daemon: the socket; defaults to `PATHS.socket`. Tests pass a path in a temporary directory. */
+  readonly socketPath?: string | undefined;
+  /** Daemon: owner of the socket file; defaults to root:staff. Tests that do not run as root pass `null`. */
+  readonly socketOwner?: { readonly uid: number; readonly gid: number } | null | undefined;
+  readonly socketFs?: SocketFs | undefined;
+  /** Daemon: `config.json` is written here (atomically); defaults to the `--config` path. */
+  readonly configFs?: ConfigFs | undefined;
+  /** Daemon: JSON-lines log file (`PATHS.log` in `realDeps`); without it the daemon logs to stderr. */
+  readonly logPath?: string | undefined;
 }
 
 export type ParsedArgs =
@@ -211,6 +240,8 @@ export interface HelperCore {
   readonly resolverFiles: ResolverFiles;
   /** The very instance the engine detects with: the monitor invalidates this one. */
   readonly netinfo: NetInfo;
+  /** The route wrapper the engine uses; the socket's `test` method looks up with it. */
+  readonly routes: RouteOperations;
   readonly runner: CommandRunner;
   readonly setTimer: SetTimer;
   readonly clearTimer: ClearTimer;
@@ -256,9 +287,10 @@ export const createCore = (
     fs: deps.resolverFs,
   });
   const netinfo = createNetInfo({ runner, logger: root });
+  const routes = createRouteOperations({ runner, logger: root });
   const engine = createEngine({
     netinfo,
-    routes: createRouteOperations({ runner, logger: root }),
+    routes,
     logger: root,
     helperVersion: HELPER_VERSION,
     initialConfig: config,
@@ -269,7 +301,7 @@ export const createCore = (
     onApplied: hooks.onApplied,
     scheduleRetry: hooks.scheduleRetry,
   });
-  return { engine, dns, resolverFiles, netinfo, runner, setTimer, clearTimer };
+  return { engine, dns, resolverFiles, netinfo, routes, runner, setTimer, clearTimer };
 };
 
 const isResolving = (state: EngineState): boolean =>
@@ -406,14 +438,26 @@ const defaultWaitForSignal = (): Promise<string> =>
     }
   });
 
+const daemonLogger = (deps: RunDeps): Logger => {
+  const sink: LogSink =
+    deps.logPath === undefined ? createJsonLinesSink(deps.stderr) : createJsonLinesFileSink(deps.logPath);
+  return createLogger({
+    sinks: [sink],
+    minLevel: 'info',
+    // A log file that cannot be written is reported once on stderr (launchd's `StandardErrorPath`).
+    onSinkError: (failure) => {
+      deps.stderr.write(
+        `${JSON.stringify({ level: 'error', at: failure.entry.at, msg: 'log sink failed', error: failure.error instanceof Error ? failure.error.message : 'unknown' })}\n`,
+      );
+    },
+    ...(deps.now === undefined ? {} : { now: deps.now }),
+  });
+};
+
 const runDaemon = async (configPath: string, deps: RunDeps): Promise<number> => {
   // Listening before anything else: a SIGTERM during the startup still gets the cleanup.
   const signalled = (deps.waitForSignal ?? defaultWaitForSignal)();
-  const root = createLogger({
-    sinks: [createJsonLinesSink(deps.stderr)],
-    minLevel: 'info',
-    ...(deps.now === undefined ? {} : { now: deps.now }),
-  });
+  const root = daemonLogger(deps);
   const logger = root.child({ component: 'main' });
   if (deps.euid !== undefined && deps.euid() !== 0) {
     logger.warn('not running as root; route commands will be refused by the system');
@@ -421,7 +465,7 @@ const runDaemon = async (configPath: string, deps: RunDeps): Promise<number> => 
 
   const loaded = await loadConfig(configPath, deps.readConfig);
   if (!loaded.ok) {
-    logger.error('config could not be loaded; cleaning up leftovers and exiting', {
+    logger.error('stored config could not be loaded; nothing is applied until a new config is sent', {
       config: configPath,
       code: loaded.code,
       error: loaded.message,
@@ -432,6 +476,7 @@ const runDaemon = async (configPath: string, deps: RunDeps): Promise<number> => 
   const config = loaded.ok ? loaded.config : { ...emptyConfig(), enabled: false };
 
   const store = createStateStore({ logger: root, path: deps.statePath, fs: deps.stateFs });
+  const writer = createConfigWriter({ logger: root, path: configPath, fs: deps.configFs });
   const retryTimers = new Set<unknown>();
   // An object, not a `let`: `shutdown` sets it while the startup and the retry hook still run.
   const life = { stopping: false };
@@ -460,50 +505,127 @@ const runDaemon = async (configPath: string, deps: RunDeps): Promise<number> => 
   const clearTimer = deps.clearTimer ?? realClearTimer;
 
   let monitor: NetworkMonitor | null = null;
+  /** Stops every source of passes: DNS lookups, the monitor, the retry timers. Idempotent. */
+  const stopSources = (): void => {
+    helper.dns.stop();
+    monitor?.stop();
+    for (const timer of retryTimers) clearTimer(timer);
+    retryTimers.clear();
+  };
+
+  // Events: every computed state and the user-relevant log lines go to the clients.
+  let server: SocketServer | null = null;
+  const detachEvents: (() => void)[] = [];
+  const stopEvents = (): void => {
+    for (const detach of detachEvents.splice(0)) detach();
+  };
+
+  let startupDone: () => void = () => undefined;
+  const started = new Promise<void>((resolve) => {
+    startupDone = resolve;
+  });
+
+  const handler = createRequestHandler({
+    engine: helper.engine,
+    helperVersion: HELPER_VERSION,
+    logger: root,
+    routeGet: (target) => helper.routes.routeGet(target),
+    saveConfig: (next) => writer.save(next),
+    started,
+    storedConfigProblem: loaded.ok ? null : loaded.code,
+    disableAll: () => cleanupAll(helper, store, root),
+    uninstall: async () => {
+      // No event about the cleanup reaches a client (TASK-002: a cleanup publishes no state).
+      stopEvents();
+      stopSources();
+      const result = await cleanupAll(helper, store, root, { final: true });
+      stopSources();
+      logger.info('uninstalled: nothing is applied any more; the helper waits to be stopped', { ...result });
+      return result;
+    },
+    afterUninstall: () => {
+      void server?.close();
+    },
+    setTimer: helper.setTimer,
+    clearTimer: helper.clearTimer,
+  });
+
+  server = createSocketServer({
+    path: deps.socketPath ?? PATHS.socket,
+    logger: root,
+    dispatch: handler.dispatch,
+    owner: deps.socketOwner === undefined ? { uid: 0, gid: SOCKET_GROUP_GID } : deps.socketOwner,
+    setTimer: helper.setTimer,
+    clearTimer: helper.clearTimer,
+    fs: deps.socketFs,
+  });
+  const socket = server;
+  const listening = await socket.start();
+  if (!listening.ok) {
+    // Nothing was touched: the routes in the table may belong to the helper that holds the socket.
+    helper.dns.stop();
+    logger.error('the daemon cannot run without its socket; exiting', { reason: listening.reason, error: listening.detail });
+    return EXIT_CODES.socketUnavailable;
+  }
+  detachEvents.push(
+    helper.engine.subscribe((state) => {
+      socket.broadcast({ event: 'state', state });
+    }),
+    root.addSink(
+      createLogForwarder({
+        send: (event) => {
+          socket.broadcast(event);
+        },
+        monotonicNow: deps.monotonicNow ?? (() => performance.now()),
+      }),
+    ),
+  );
+
   // Whatever comes first: the startup finishing, or a signal during it.
   const startup = (async (): Promise<'started'> => {
-    await recoverFromState(helper, store, root);
-    if (loaded.ok && !life.stopping) await helper.engine.reconcile('startup');
+    try {
+      await recoverFromState(helper, store, root);
+      if (loaded.ok && !life.stopping) await helper.engine.reconcile('startup');
+    } finally {
+      startupDone();
+    }
     return 'started';
   })();
 
   const shutdown = async (signal: string): Promise<number> => {
     life.stopping = true;
     logger.info('shutting down', { signal });
+    // The socket first: no new request, and no event about the cleanup (TASK-002).
+    stopEvents();
+    await socket.close();
     // A signal during the startup: let it finish its cleanup first (it adds nothing once `stopping` is set).
     await startup;
     // DNS first (no lookup asks for a pass any more), then the monitor, then the timers of the retries.
-    helper.dns.stop();
-    monitor?.stop();
-    for (const timer of retryTimers) clearTimer(timer);
-    retryTimers.clear();
+    stopSources();
     const result = await cleanupAll(helper, store, root, { final: true });
     // Again: a pass the cleanup waited for may have asked for a retry before `stopping` was seen everywhere.
-    for (const timer of retryTimers) clearTimer(timer);
-    retryTimers.clear();
+    stopSources();
     return result.failed > 0 || result.resolverFilesFailed > 0 ? EXIT_CODES.ruleError : EXIT_CODES.ok;
   };
 
   const first = await Promise.race([startup, signalled]);
   if (first !== 'started') return shutdown(first);
-  if (!loaded.ok) {
-    helper.dns.stop();
-    return EXIT_CODES.configError;
-  }
 
-  monitor = createNetworkMonitor({
-    engine: helper.engine,
-    netinfo: helper.netinfo,
-    dns: helper.dns,
-    runner: helper.runner,
-    spawner: (deps.createSpawner ?? ((spawnLogger) => createProcessSpawner({ logger: spawnLogger })))(root),
-    logger: root,
-    setTimer: helper.setTimer,
-    clearTimer: helper.clearTimer,
-    now: deps.wallNow,
-    monotonicNow: deps.monotonicNow,
-  });
-  monitor.start();
+  if (!handler.isUninstalled()) {
+    monitor = createNetworkMonitor({
+      engine: helper.engine,
+      netinfo: helper.netinfo,
+      dns: helper.dns,
+      runner: helper.runner,
+      spawner: (deps.createSpawner ?? ((spawnLogger) => createProcessSpawner({ logger: spawnLogger })))(root),
+      logger: root,
+      setTimer: helper.setTimer,
+      clearTimer: helper.clearTimer,
+      now: deps.wallNow,
+      monotonicNow: deps.monotonicNow,
+    });
+    monitor.start();
+  }
   logger.info('daemon running', { pid: process.pid });
   return shutdown(await signalled);
 };
@@ -537,6 +659,8 @@ export const realDeps = (): RunDeps => ({
   stderr: process.stderr,
   createRunner: (logger) => createCommandRunner({ logger }),
   euid: () => (typeof process.geteuid === 'function' ? process.geteuid() : null),
+  socketPath: PATHS.socket,
+  logPath: PATHS.log,
 });
 
 if (import.meta.main) {

@@ -94,11 +94,13 @@ export type HelperStatus =
  * current connection only: both are `null` whenever the status is not
  * `connected`, and both are set from the moment it is.
  *
- * `config` was fetched after the helper reported `configRevision`, so it is
- * never older than that revision. While `state.configRevision` equals
- * `configRevision` the two belong together; when they differ a fetch is under
- * way and `onConfig` fires when it lands — until then a rule of `state` may
- * have no counterpart in `config` (or the reverse).
+ * `configRevision` is the revision the helper read together with `config`
+ * (`GetConfigResult.configRevision`, or the state of a `setConfig` result).
+ * It may run ahead of `state.configRevision` (the config was read after a
+ * change whose state has not arrived yet). Only a state whose revision is
+ * strictly greater than `configRevision` starts a fetch; `onConfig` fires when
+ * it lands — until then a rule of `state` may have no counterpart in `config`
+ * (or the reverse).
  */
 export interface HelperSnapshot {
   readonly status: HelperStatus;
@@ -274,6 +276,12 @@ export function createHelperClient(options: HelperClientOptions): HelperClient {
   let state: EngineState | null = null;
   let config: Config | null = null;
   let configRevision: number | null = null;
+  /**
+   * The state names a config newer than the one held. Revisions only grow on
+   * one connection, so a config read ahead of the state (a higher revision)
+   * is current, not stale: comparing with `!==` re-fetched it back to back.
+   */
+  const configBehind = (stateRevision: number): boolean => configRevision === null || stateRevision > configRevision;
   let connection: Connection | null = null;
   let reconnectTimer: unknown = null;
   let failedAttempts = 0;
@@ -371,7 +379,7 @@ export function createHelperClient(options: HelperClientOptions): HelperClient {
     // first state together with its config, when the status turns `connected`.
     if (!active.ready) return;
     stateChannel.publish(next, () => alive(active));
-    if (next.configRevision !== configRevision) fetchConfig(active);
+    if (configBehind(next.configRevision)) fetchConfig(active);
   };
 
   const acceptConfig = (active: Connection, next: Config, revision: number): void => {
@@ -387,7 +395,6 @@ export function createHelperClient(options: HelperClientOptions): HelperClient {
     // A fetch replaces a retry that was waiting: there is never more than one retry timer.
     clearTimer(active.configRetryTimer);
     active.configRetryTimer = null;
-    const revision = state.configRevision;
     void send(active, 'getConfig', {}).then((result) => {
       active.configFetchInFlight = false;
       if (!alive(active)) return;
@@ -396,12 +403,16 @@ export function createHelperClient(options: HelperClientOptions): HelperClient {
         if (active.configRetryTimer !== null) return;
         active.configRetryTimer = setTimer(() => {
           active.configRetryTimer = null;
-          if (state !== null && state.configRevision !== configRevision) fetchConfig(active);
+          if (state !== null && configBehind(state.configRevision)) fetchConfig(active);
         }, RECONNECT_DELAY_MS);
         return;
       }
-      acceptConfig(active, result.value.config, revision);
-      if (state !== null && state.configRevision !== configRevision) fetchConfig(active);
+      // The helper reads the config and its revision together (`GetConfigResult.configRevision`).
+      // Revisions only grow on one connection: an answer older than a config
+      // already taken (from a `setConfig` result) is not applied.
+      const revision = result.value.configRevision;
+      if (configRevision === null || revision >= configRevision) acceptConfig(active, result.value.config, revision);
+      if (state !== null && configBehind(state.configRevision)) fetchConfig(active);
     });
   };
 
@@ -627,14 +638,15 @@ export function createHelperClient(options: HelperClientOptions): HelperClient {
 
     // 2. `getConfig`, on every connection: the helper may have restarted, and
     //    a restarted helper can reach the same revision with another config.
-    const revision = statusResult.value.state.configRevision;
     const fetched = await send(active, 'getConfig', {});
     if (!alive(active)) return;
     if (!fetched.ok) {
       drop(active, { kind: 'disconnected', reason: fetched.code === 'timeout' ? 'timeout' : 'protocol-error' });
       return;
     }
-    acceptConfig(active, fetched.value.config, revision);
+    // The revision the helper read together with this config — not the one of
+    // the status state, which a change in between would leave behind.
+    acceptConfig(active, fetched.value.config, fetched.value.configRevision);
 
     // Read before any subscriber runs: what is published below is what this
     // connection delivered, whatever a subscriber does in between.
@@ -647,7 +659,7 @@ export function createHelperClient(options: HelperClientOptions): HelperClient {
     stateChannel.publish(firstState, () => alive(active));
     configChannel.publish(firstConfig, () => alive(active));
     // A state event may have moved the revision on while the config was in flight.
-    if (firstState.configRevision !== configRevision) fetchConfig(active);
+    if (configBehind(firstState.configRevision)) fetchConfig(active);
   };
 
   const open = (): void => {

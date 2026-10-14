@@ -131,7 +131,7 @@ function attachHelper(socket: FakeSocket, helper: FakeHelper): void {
           socket.receive(ok(request.id, statusResult(state())));
           return;
         case 'getConfig':
-          socket.receive(ok(request.id, { config: helper.config }));
+          socket.receive(ok(request.id, { config: helper.config, configRevision: helper.configRevision }));
           return;
         case 'setConfig':
           helper.config = request['config'] as Config;

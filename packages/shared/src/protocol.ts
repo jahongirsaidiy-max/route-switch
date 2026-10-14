@@ -436,8 +436,19 @@ export type HelperVersionInfo = z.infer<typeof HelperVersionInfo>;
 export const StatusResult = HelperVersionInfo.extend({ state: EngineState });
 export type StatusResult = z.infer<typeof StatusResult>;
 
-/** Result of `getConfig`: the stored config, or an empty one when none was saved yet. */
-export const GetConfigResult = z.object({ config: Config });
+/**
+ * Result of `getConfig`: the stored config, or an empty one when none was saved
+ * yet, with the `configRevision` it has. Both are read at the same moment, so
+ * the app knows exactly which `EngineState.configRevision` this config belongs
+ * to (a state whose revision differs was computed for another config).
+ * When the stored config could not be loaded the helper answers
+ * `operation-failed` instead of an empty config.
+ */
+export const GetConfigResult = z.object({
+  config: Config,
+  /** The revision this config has; the app's client pairs the config with it. */
+  configRevision: Counter,
+});
 export type GetConfigResult = z.infer<typeof GetConfigResult>;
 
 /** Result of `setConfig`: the config as stored (normalised) and the state after the reconcile it caused. */
