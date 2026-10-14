@@ -16,7 +16,6 @@ export {
 } from './model';
 export {
   ADD_RULE_UNAVAILABLE,
-  IMPORT_EXPORT_UNAVAILABLE,
   RulesPanel,
   RulesScreen,
   type RulesPanelProps,
@@ -31,3 +30,17 @@ export {
   type RulesWindowFrameProps,
   type RulesWindowProps,
 } from './RulesWindow';
+export {
+  createTransferController,
+  importFailureText,
+  importQuestion,
+  importSummary,
+  INITIAL_TRANSFER_UI,
+  returnImportFocus,
+  transferPanelProps,
+  type ImportPreview,
+  type ImportSummary,
+  type TransferApi,
+  type TransferController,
+  type TransferUiState,
+} from './transfer';

@@ -10,7 +10,7 @@ import type { EngineState } from '@routeswitch/shared';
 import type { Menu, MenuItemConstructorOptions, NativeImage, Rectangle } from 'electron';
 
 import type { HelperClient, HelperStatus } from './helperClient';
-import { registerIpcHandlers, type IpcMainLike } from './ipc';
+import { registerIpcHandlers, type ConfigDialogs, type IpcMainLike } from './ipc';
 import type { Logger } from './logger';
 import type { Settings } from './settings';
 import { createWindowManager, type CreateWindow, type WindowManagerDeps } from './windows';
@@ -106,6 +106,8 @@ export interface ShellDeps {
   readonly quit: () => void;
   /** The login item and the network service order, for the settings screen's IPC calls. */
   readonly settings: Settings;
+  /** The system file dialogs of config import / export. */
+  readonly configDialogs: ConfigDialogs;
   readonly logger: Logger;
   readonly now?: () => number;
 }
@@ -144,6 +146,7 @@ export function startShell(deps: ShellDeps, context: ShellContext): Shell {
     logger: deps.logger,
     listRecipients: windows.contents,
     settings: deps.settings,
+    configDialogs: deps.configDialogs,
     // "Qoidalarni boshqarish" of the menu bar window: the same window as the tray menu item.
     openRulesWindow: windows.openRules,
   });

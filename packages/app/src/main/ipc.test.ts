@@ -1,5 +1,9 @@
 import { LIMITS, type Config, type EngineState, type RuleInput } from '@routeswitch/shared';
-import { describe, expect, it, vi } from 'vitest';
+import { mkdtemp, readdir, readFile, rm, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import path from 'node:path';
+
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import type { RsApi, RsLogEntry, RsResult, RsSnapshot } from '../renderer/src/rs';
 import { createHelperClient, type HelperClient } from './helperClient';
@@ -15,7 +19,17 @@ import {
   RULE_ID,
   statusResult,
 } from './helperClient.fixtures';
-import { INVOKE_CHANNELS, LOG_CHANNEL, registerIpcHandlers, STATE_CHANNEL, type InvokeEvent, type StateRecipient } from './ipc';
+import type { ConfigFileSystem } from './configFile';
+import {
+  IMPORT_TTL_MS,
+  INVOKE_CHANNELS,
+  LOG_CHANNEL,
+  registerIpcHandlers,
+  STATE_CHANNEL,
+  type ConfigDialogs,
+  type InvokeEvent,
+  type StateRecipient,
+} from './ipc';
 import { createLogBuffer, type LogBuffer } from './logBuffer';
 import { APP_ENTRY_URL } from './runtime';
 import { createSettings, type Settings } from './settings';
@@ -169,7 +183,13 @@ interface SetupOptions {
   readonly logBuffer?: LogBuffer;
   readonly settings?: Settings;
   readonly openRulesWindow?: () => void;
+  readonly configDialogs?: ConfigDialogs;
+  readonly configFs?: ConfigFileSystem;
+  readonly now?: () => number;
 }
+
+/** File dialogs the user always cancels. */
+const CANCELLED_DIALOGS: ConfigDialogs = { chooseImportFile: () => Promise.resolve(null), chooseExportFile: () => Promise.resolve(null) };
 
 async function setup(options: SetupOptions = {}) {
   const scheduler = fakeScheduler();
@@ -205,6 +225,9 @@ async function setup(options: SetupOptions = {}) {
     ...(options.logBuffer === undefined ? {} : { logBuffer: options.logBuffer }),
     settings: options.settings ?? unusedSettings(logger),
     openRulesWindow: options.openRulesWindow ?? (() => undefined),
+    configDialogs: options.configDialogs ?? CANCELLED_DIALOGS,
+    ...(options.configFs === undefined ? {} : { configFs: options.configFs }),
+    ...(options.now === undefined ? {} : { now: options.now }),
   });
 
   if (options.client === undefined) {
@@ -253,10 +276,10 @@ const newRule = (extra: Partial<RuleInput> = {}): RuleInput => ({
 // ---------------------------------------------------------------------------
 
 describe('registration', () => {
-  it('handles exactly the eighteen invoke channels of the renderer API', async () => {
+  it('handles exactly the nineteen invoke channels of the renderer API', async () => {
     const h = await setup({ connect: false });
     expect([...h.ipcMain.handlers.keys()].sort()).toEqual([...INVOKE_CHANNELS].sort());
-    expect(INVOKE_CHANNELS).toHaveLength(18);
+    expect(INVOKE_CHANNELS).toHaveLength(19);
   });
 
   it('dispose removes every handler and stops the state pushes; a second dispose does nothing', async () => {
@@ -267,7 +290,7 @@ describe('registration', () => {
     h.registration.dispose();
     h.registration.dispose();
     expect(h.ipcMain.handlers.size).toBe(0);
-    expect(h.ipcMain.removeHandler).toHaveBeenCalledTimes(18);
+    expect(h.ipcMain.removeHandler).toHaveBeenCalledTimes(19);
     h.sockets[0]?.emit('connect');
     for (let i = 0; i < 6; i += 1) await flush();
     expect(sent).toEqual([]);
@@ -488,12 +511,169 @@ describe('failures reach the renderer as values', () => {
     expect(h.entries.filter((entry) => entry.level === 'error' && entry.msg === 'A call failed unexpectedly')).toHaveLength(3);
   });
 
-  it.each([['rs:import'], ['rs:export']])('%s is not implemented yet and says which task adds it', async (channel) => {
-    const h = await setup();
-    const result = await h.call(channel);
-    expect(result).toMatchObject({ ok: false, code: 'not-implemented' });
-    expect(!result.ok && result.error).toContain('TASK-215');
+});
+
+describe('config import / export (main-process dialogs and files only)', () => {
+  let dir = '';
+  beforeEach(async () => {
+    dir = await mkdtemp(path.join(tmpdir(), 'routeswitch-ipc-config-'));
+  });
+  afterEach(async () => {
+    await rm(dir, { recursive: true, force: true });
+  });
+
+  const importedConfig = (): Config => ({
+    version: 1,
+    enabled: false,
+    rules: [
+      { id: NEW_ID, enabled: true, kind: 'domain', target: 'corp.local', iface: 'ethernet', refreshSec: 900, dns: '10.20.0.10' },
+      { id: OTHER_ID, enabled: true, kind: 'ip', target: '172.16.12.40', iface: 'wifi', refreshSec: 600 },
+    ],
+  });
+  const dialogsFor = (importFile: string | null, exportFile: string | null = null): ConfigDialogs => ({
+    chooseImportFile: vi.fn(() => Promise.resolve(importFile)),
+    chooseExportFile: vi.fn(() => Promise.resolve(exportFile)),
+  });
+  const fileWith = async (content: string) => {
+    const file = path.join(dir, 'in.json');
+    await writeFile(file, content);
+    return file;
+  };
+
+  it('import reads, checks and returns the config with a token; nothing reaches the helper until it is applied', async () => {
+    const file = await fileWith(JSON.stringify(importedConfig()));
+    const h = await setup({ configDialogs: dialogsFor(file) });
+    const preview = valueOf(await h.call('rs:import')) as { token: string; config: Config };
+    expect(preview.config).toEqual(importedConfig());
+    expect(JSON.stringify(preview)).not.toContain(dir);
     expect(h.sentAfterHandshake()).toEqual([]);
+
+    const applied = valueOf(await h.call('rs:applyImport', preview.token)) as { config: Config };
+    expect(h.sentAfterHandshake()).toEqual(['setConfig']);
+    // Replaced as a whole: the stored rule is gone.
+    expect(h.helper.config).toEqual(importedConfig());
+    expect(applied.config).toEqual(importedConfig());
+    expect(h.entries.some((entry) => entry.msg === 'Config imported')).toBe(true);
+    // One use.
+    expect(await h.call('rs:applyImport', preview.token)).toMatchObject({ ok: false, code: 'import-expired' });
+    expect(h.sentAfterHandshake()).toEqual(['setConfig']);
+  });
+
+  it.each([
+    ['broken JSON', '{"version":1,', 'file-not-json', undefined],
+    ['a schema refusal', JSON.stringify({ version: 1, rules: [{ id: NEW_ID, kind: 'subnet', target: '0.0.0.0/0', iface: 'wifi' }] }), 'invalid-config', { path: ['rules', 0, 'target'], code: 'default-route' }],
+    ['an old version', JSON.stringify({ version: 0, rules: [] }), 'invalid-config', { path: ['version'], code: 'invalid_value' }],
+  ])('a file with %s is refused with its code and never reaches the helper', async (_name, content, code, issue) => {
+    const h = await setup({ configDialogs: dialogsFor(await fileWith(content)) });
+    const result = await h.call('rs:import');
+    expect(result).toMatchObject({ ok: false, code });
+    if (issue !== undefined) expect(!result.ok && result.issue).toEqual(issue);
+    expect(h.sentAfterHandshake()).toEqual([]);
+    expect(h.helper.config).toEqual(oneRuleConfig());
+    expect(h.entries.some((entry) => entry.level === 'warn' && entry.msg === 'Refused a config file')).toBe(true);
+  });
+
+  it('applyImport runs in the edit queue: a saveRule already under way finishes first, then the import replaces the config', async () => {
+    const file = await fileWith(JSON.stringify(importedConfig()));
+    const h = await setup({ configDialogs: dialogsFor(file) });
+    const preview = valueOf(await h.call('rs:import')) as { token: string };
+    const saveRule = h.ipcMain.handlers.get('rs:saveRule');
+    const applyImport = h.ipcMain.handlers.get('rs:applyImport');
+    if (saveRule === undefined || applyImport === undefined) throw new Error('handlers');
+    // Both arrive before either is answered.
+    const saving = saveRule(TRUSTED, newRule({ id: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa', target: '10.77.0.1' }));
+    const importing = applyImport(TRUSTED, preview.token);
+    for (let i = 0; i < 16; i += 1) await flush();
+    expect((await saving) as RsResult<unknown>).toMatchObject({ ok: true });
+    expect((await importing) as RsResult<unknown>).toMatchObject({ ok: true });
+    expect(h.sentAfterHandshake()).toEqual(['getConfig', 'setConfig', 'setConfig']);
+    expect(h.helper.config).toEqual(importedConfig());
+  });
+
+  it('a refused file also cancels the import that was waiting', async () => {
+    const good = await fileWith(JSON.stringify(importedConfig()));
+    const bad = path.join(dir, 'bad.json');
+    await writeFile(bad, '{"version":1,');
+    const files = [good, bad];
+    const dialogs: ConfigDialogs = { chooseImportFile: () => Promise.resolve(files.shift() ?? null), chooseExportFile: () => Promise.resolve(null) };
+    const h = await setup({ configDialogs: dialogs });
+    const preview = valueOf(await h.call('rs:import')) as { token: string };
+    expect(await h.call('rs:import')).toMatchObject({ ok: false, code: 'file-not-json' });
+    expect(await h.call('rs:applyImport', preview.token)).toMatchObject({ ok: false, code: 'import-expired' });
+    expect(h.sentAfterHandshake()).toEqual([]);
+  });
+
+  it('a cancelled dialog is null; a second import while a dialog is open is busy', async () => {
+    let choose: (file: string | null) => void = () => undefined;
+    const dialogs: ConfigDialogs = {
+      chooseImportFile: () =>
+        new Promise((resolve) => {
+          choose = resolve;
+        }),
+      chooseExportFile: () => Promise.resolve(null),
+    };
+    const h = await setup({ configDialogs: dialogs });
+    const first = h.ipcMain.handlers.get('rs:import')?.(TRUSTED);
+    await flush();
+    expect(await h.call('rs:import')).toMatchObject({ ok: false, code: 'busy' });
+    expect(await h.call('rs:export')).toMatchObject({ ok: false, code: 'busy' });
+    choose(null);
+    expect(await first).toEqual({ ok: true, value: null });
+  });
+
+  it('an import token expires after ten minutes, and a newer import replaces the older one', async () => {
+    let clock = 1_000_000;
+    const file = await fileWith(JSON.stringify(importedConfig()));
+    const h = await setup({ configDialogs: dialogsFor(file), now: () => clock });
+    const old = valueOf(await h.call('rs:import')) as { token: string };
+    const fresh = valueOf(await h.call('rs:import')) as { token: string };
+    expect(fresh.token).not.toBe(old.token);
+    expect(await h.call('rs:applyImport', old.token)).toMatchObject({ ok: false, code: 'import-expired' });
+    clock += IMPORT_TTL_MS + 1;
+    expect(await h.call('rs:applyImport', fresh.token)).toMatchObject({ ok: false, code: 'import-expired' });
+    expect(h.sentAfterHandshake()).toEqual([]);
+  });
+
+  it('applyImport takes exactly one UUID token', async () => {
+    const h = await setup();
+    expect(await h.call('rs:applyImport', '../config.json')).toMatchObject({ ok: false, code: 'invalid-input' });
+    expect(await h.call('rs:applyImport')).toMatchObject({ ok: false, code: 'invalid-input' });
+  });
+
+  it('import and export answer only the app page', async () => {
+    const dialogs = dialogsFor(null, null);
+    const h = await setup({ configDialogs: dialogs });
+    const foreign: InvokeEvent = { senderFrame: { url: 'https://example.com/', parent: null } };
+    expect(await h.callAs(foreign, 'rs:import')).toMatchObject({ ok: false, code: 'forbidden' });
+    expect(await h.callAs(foreign, 'rs:export')).toMatchObject({ ok: false, code: 'forbidden' });
+    expect(dialogs.chooseImportFile).not.toHaveBeenCalled();
+    expect(dialogs.chooseExportFile).not.toHaveBeenCalled();
+  });
+
+  it('export reads the stored config and writes it to the chosen path only', async () => {
+    const file = path.join(dir, 'out.json');
+    const h = await setup({ configDialogs: dialogsFor(null, file) });
+    const result = valueOf(await h.call('rs:export')) as { rules: number; bytes: number };
+    expect(result.rules).toBe(1);
+    expect(h.sentAfterHandshake()).toEqual(['getConfig']);
+    expect(JSON.parse(await readFile(file, 'utf8'))).toEqual(oneRuleConfig());
+    expect(await readdir(dir)).toEqual(['out.json']);
+    expect(result.bytes).toBe((await readFile(file)).length);
+  });
+
+  it('export without a helper opens no dialog; a cancelled dialog writes nothing; a failed write says so', async () => {
+    const offline = dialogsFor(null, path.join(dir, 'x.json'));
+    const h = await setup({ connect: false, configDialogs: offline });
+    expect(await h.call('rs:export')).toMatchObject({ ok: false, code: 'not-connected' });
+    expect(offline.chooseExportFile).not.toHaveBeenCalled();
+
+    const cancelled = await setup({ configDialogs: dialogsFor(null, null) });
+    expect(await cancelled.call('rs:export')).toEqual({ ok: true, value: null });
+
+    const failing = await setup({ configDialogs: dialogsFor(null, path.join(dir, 'missing', 'x.json')) });
+    expect(await failing.call('rs:export')).toMatchObject({ ok: false, code: 'write-failed' });
+    expect(await readdir(dir)).toEqual([]);
+    expect(failing.entries.some((entry) => entry.level === 'error' && entry.msg === 'Could not write the exported config')).toBe(true);
   });
 });
 
@@ -673,6 +853,7 @@ describe('rs:state', () => {
       logger,
       settings: unusedSettings(logger),
       openRulesWindow: () => undefined,
+      configDialogs: CANCELLED_DIALOGS,
       listRecipients: () => {
         throw new Error('no windows');
       },
@@ -1056,7 +1237,7 @@ describe('rs:openRulesWindow (main process only)', () => {
 });
 
 describe('the preload against the main process (window.rs)', () => {
-  it('exposes exactly the twenty methods of the renderer API, each wired to a handled channel', async () => {
+  it('exposes exactly the twenty-one methods of the renderer API, each wired to a handled channel', async () => {
     const openRulesWindow = vi.fn();
     const h = await setup({ settings: fakeSettings().settings, openRulesWindow });
     bridge.setInvokeTarget((channel, ...args) => {
@@ -1069,6 +1250,7 @@ describe('the preload against the main process (window.rs)', () => {
     expect(Object.keys(rs).sort()).toEqual(
       [
         'apply',
+        'applyImport',
         'copyServiceOrderCommand',
         'deleteRule',
         'exportConfig',
@@ -1103,8 +1285,10 @@ describe('the preload against the main process (window.rs)', () => {
     expect((await settle(rs.setEnabled(true))).ok).toBe(true);
     expect((await settle(rs.apply())).ok).toBe(true);
     expect((await settle(rs.test('10.1.2.3'))).ok).toBe(true);
-    expect(await settle(rs.importConfig())).toMatchObject({ ok: false, code: 'not-implemented' });
-    expect(await settle(rs.exportConfig())).toMatchObject({ ok: false, code: 'not-implemented' });
+    // The test's file dialogs are cancelled: nothing is read or written.
+    expect(await settle(rs.importConfig())).toEqual({ ok: true, value: null });
+    expect(await settle(rs.applyImport(NEW_ID))).toMatchObject({ ok: false, code: 'import-expired' });
+    expect(await settle(rs.exportConfig())).toEqual({ ok: true, value: null });
     expect(await settle(rs.getLog())).toEqual({ ok: true, value: [] });
     expect(await settle(rs.getSettings())).toEqual({ ok: true, value: { openAtLogin: false } });
     expect(await settle(rs.setOpenAtLogin(true))).toEqual({ ok: true, value: { openAtLogin: true } });

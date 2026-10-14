@@ -37,11 +37,19 @@ import {
   type RuleRow,
 } from './model';
 import styles from './RulesScreen.module.css';
+import {
+  createTransferController,
+  importQuestion,
+  importSummary,
+  INITIAL_TRANSFER_UI,
+  returnImportFocus,
+  transferPanelProps,
+  type TransferApi,
+  type TransferUiState,
+} from './transfer';
 
 /** Why "Qoida qo'shish" / "Tahrirlash" are off until the add-rule form exists. */
 export const ADD_RULE_UNAVAILABLE = "Qoida qo'shish oynasi hali tayyor emas";
-/** Why "Import / Export" is off until it exists (the API answers `not-implemented`). */
-export const IMPORT_EXPORT_UNAVAILABLE = "Import va eksport hali qo'shilmagan";
 
 export interface RulesPanelProps {
   readonly engine: EngineStateView;
@@ -68,6 +76,14 @@ export interface RulesPanelProps {
   readonly onEditRule?: ((id: string) => void) | undefined;
   /** The ref for a rule's trash button, so the focus can return to it after a cancelled removal. */
   readonly trashRef?: ((id: string) => Ref<HTMLButtonElement>) | undefined;
+  /** Config import / export (TASK-215). */
+  readonly transfer: TransferUiState;
+  readonly onImport: () => void;
+  readonly onExport: () => void;
+  readonly onConfirmImport: (token: string) => void;
+  readonly onCancelImport: () => void;
+  /** The "Import" button, so the focus can return to it after the confirmation closes. */
+  readonly importRef?: Ref<HTMLButtonElement> | undefined;
 }
 
 const COLUMNS = ['Holat', 'Manzil', 'Turi', 'Interfeys', 'Izoh', ''] as const;
@@ -205,6 +221,7 @@ export function RulesPanel(props: RulesPanelProps): ReactElement {
   const visible = loaded === null ? [] : visibleRows(rows, notesById(loaded.config), props.query, props.filter);
   const overlaps = loaded === null ? [] : overlapWarnings(loaded.config);
   const confirming = rows.find((row) => row.id === props.confirmingDelete) ?? null;
+  const importing = props.transfer.preview;
   const notice = state === null ? helperNotice(engine) : null;
   const line = loaded === null ? null : statusLine(loaded.state, props.now);
 
@@ -265,11 +282,18 @@ export function RulesPanel(props: RulesPanelProps): ReactElement {
             ))}
           </select>
         </label>
-        <span title={IMPORT_EXPORT_UNAVAILABLE}>
-          <Button disabled label={`Import / Export — ${IMPORT_EXPORT_UNAVAILABLE}`}>
-            Import / Export
-          </Button>
-        </span>
+        {/* The design's single "Import / Export" button, as two: each opens its own system file dialog. */}
+        <Button
+          ref={props.importRef}
+          busy={props.transfer.phase !== 'idle'}
+          label="Config import (JSON fayldan)"
+          onClick={props.onImport}
+        >
+          Import
+        </Button>
+        <Button busy={props.transfer.phase !== 'idle'} label="Config export (JSON faylga)" onClick={props.onExport}>
+          Export
+        </Button>
       </div>
 
       {props.feedback === null ? null : (
@@ -278,7 +302,43 @@ export function RulesPanel(props: RulesPanelProps): ReactElement {
         </p>
       )}
 
-      {confirming === null ? null : (
+      {props.transfer.feedback === null ? null : (
+        <p className={styles['feedback']} data-tone={props.transfer.feedback.tone} role={props.transfer.feedback.tone === 'danger' ? 'alert' : 'status'}>
+          {props.transfer.feedback.text}
+        </p>
+      )}
+
+      {importing === null ? null : (
+        // Keyed by file: another import opens a new question, which takes the focus again.
+        <div
+          key={importing.token}
+          className={styles['confirm']}
+          role="alertdialog"
+          aria-labelledby="rules-import-question"
+          onKeyDown={(event) => {
+            if (event.key === 'Escape') props.onCancelImport();
+          }}
+        >
+          <p id="rules-import-question" className={styles['confirmText']}>
+            {importQuestion(importSummary(config.config, importing.config))}
+          </p>
+          <Button
+            variant="primary"
+            busy={props.transfer.phase === 'applying'}
+            onClick={() => {
+              props.onConfirmImport(importing.token);
+            }}
+          >
+            Almashtirish
+          </Button>
+          {/* The safe choice takes the focus (WAI-ARIA alertdialog). */}
+          <Button autoFocus onClick={props.onCancelImport}>
+            Bekor qilish
+          </Button>
+        </div>
+      )}
+
+      {confirming === null || importing !== null ? null : (
         // Keyed by rule: asking about another rule opens a new dialog, which takes the focus again.
         <div
           key={confirming.id}
@@ -380,7 +440,7 @@ export function RulesPanel(props: RulesPanelProps): ReactElement {
 
 export interface RulesScreenProps {
   /** The preload API; `window.rs` in the app. */
-  readonly rs?: RulesApi & Pick<RsApi, 'getState' | 'onState' | 'getConfig'>;
+  readonly rs?: RulesApi & TransferApi & Pick<RsApi, 'getState' | 'onState' | 'getConfig'>;
   /** Opens the add-rule form (TASK-213). */
   readonly onAddRule?: () => void;
   readonly onEditRule?: (id: string) => void;
@@ -433,6 +493,27 @@ export function RulesScreen({ rs: given, onAddRule, onEditRule }: RulesScreenPro
     controller.focusDone();
   }, [ui.focusTrash, controller]);
 
+  const [transfer, setTransfer] = useState<TransferUiState>(INITIAL_TRANSFER_UI);
+  const latestTransfer = useRef(transfer);
+  latestTransfer.current = transfer;
+  const transferController = useMemo(
+    () =>
+      createTransferController(
+        rs,
+        (change) => {
+          latestTransfer.current = change(latestTransfer.current);
+          setTransfer(latestTransfer.current);
+        },
+        () => latestTransfer.current,
+      ),
+    [rs],
+  );
+  const importButton = useRef<HTMLButtonElement | null>(null);
+  useEffect(() => {
+    returnImportFocus(transfer, importButton.current, transferController);
+  }, [transfer, transferController]);
+  const handlers = rulesHandlers(controller);
+
   return (
     <RulesPanel
       engine={engine}
@@ -445,7 +526,8 @@ export function RulesScreen({ rs: given, onAddRule, onEditRule }: RulesScreenPro
       feedback={ui.feedback}
       onQueryChange={setQuery}
       onFilterChange={setFilter}
-      {...rulesHandlers(controller)}
+      {...handlers}
+      {...transferPanelProps(controller, transferController, transfer, importButton)}
       onReloadConfig={() => {
         configStoreFor(rs).reload();
       }}

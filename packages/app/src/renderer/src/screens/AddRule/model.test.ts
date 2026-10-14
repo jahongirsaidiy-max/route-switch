@@ -12,10 +12,10 @@ import {
   NEW_RULE_FORM,
   ruleInputOf,
   testAddressOf,
-  VALIDATION_TEXT,
   WILDCARD_TEXT,
   type RuleForm,
 } from './model';
+import { VALIDATION_TEXT } from '../../text';
 
 const NEW_ID = '77777777-7777-4777-8777-777777777777';
 const form = (extra: Partial<RuleForm> = {}): RuleForm => ({ ...NEW_RULE_FORM, ...extra });

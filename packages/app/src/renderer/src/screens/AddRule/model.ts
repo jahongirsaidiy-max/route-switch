@@ -10,7 +10,6 @@
 import {
   Config,
   LIMITS,
-  MIN_SUBNET_PREFIX,
   Rule,
   destinationKey,
   normalizeHostAddress,
@@ -21,10 +20,10 @@ import {
   type RuleKind,
   type RuleState,
   type TestResult,
-  type ValidationCode,
 } from '@routeswitch/shared';
 
 import { ROLE_LABELS } from '../../components';
+import { isValidationCode, VALIDATION_TEXT } from '../../text';
 
 /** The fields that can carry an error of their own. */
 export type FormField = 'target' | 'dns' | 'refreshSec' | 'note';
@@ -98,22 +97,6 @@ export const TARGET_FIELD: Readonly<Record<RuleKind, { readonly label: string; r
 // Words for the shared validation codes
 // ---------------------------------------------------------------------------
 
-/** One sentence per code of the shared validators (`cidr.ts`). A missing code fails `tsc`. */
-export const VALIDATION_TEXT: Readonly<Record<ValidationCode, string>> = {
-  'invalid-ipv4': 'IPv4 manzil kiriting, masalan 172.16.12.40.',
-  'invalid-cidr': "Subnetni CIDR ko'rinishida kiriting, masalan 10.0.0.0/8.",
-  'invalid-prefix': `Prefiks ${String(MIN_SUBNET_PREFIX)} dan 32 gacha bo'lishi kerak.`,
-  'prefix-too-wide': `Subnet juda keng: prefiks kamida /${String(MIN_SUBNET_PREFIX)} bo'lishi kerak.`,
-  'invalid-domain': "Domen faqat kichik lotin harflari, raqamlar, «-» va «.» dan iborat bo'ladi, masalan corp.local.",
-  'invalid-destination': 'IPv4 manzil yoki CIDR subnet kiriting.',
-  'default-route': "Default route (0.0.0.0/0) hech qachon o'zgartirilmaydi.",
-  'this-network': '0.0.0.0/8 manzillari route qilinmaydi.',
-  loopback: 'Loopback manzillari (127.0.0.0/8) route qilinmaydi.',
-  'link-local': 'Link-local manzillari (169.254.0.0/16) route qilinmaydi.',
-  multicast: 'Multicast manzillari (224.0.0.0/4) route qilinmaydi.',
-  broadcast: '255.255.255.255 route qilinmaydi.',
-};
-
 /** Wildcard domains need a DNS proxy: out of the MVP (RouteSwitch.md §Maqsad va doira). */
 export const WILDCARD_TEXT = "Wildcard domen (*.corp.local) qo'llab-quvvatlanmaydi — aniq domen kiriting, masalan corp.local.";
 const UPPER_CASE_TEXT = 'Domenni kichik harflarda yozing, masalan corp.local.';
@@ -160,7 +143,6 @@ const codeOf = (issue: IssueLike): string | null => {
   return typeof code === 'string' ? code : null;
 };
 
-const isValidationCode = (code: string | null): code is ValidationCode => code !== null && code in VALIDATION_TEXT;
 
 /** The words for an issue of one field of `Rule`. */
 function fieldText(field: FormField, issue: IssueLike, input: string): string {

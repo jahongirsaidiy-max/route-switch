@@ -41,6 +41,8 @@ export interface RulesController {
   readonly confirmDelete: (id: string) => Promise<void>;
   /** The focus has been moved back; forget the request. */
   readonly focusDone: () => void;
+  /** Closes the question without moving the focus (another panel takes it). Nothing is sent. */
+  readonly dismissDelete: () => void;
 }
 
 export function createRulesController(rs: RulesApi, update: RulesUiUpdate, current: () => RulesUiState): RulesController {
@@ -78,6 +80,13 @@ export function createRulesController(rs: RulesApi, update: RulesUiUpdate, curre
     },
     focusDone: () => {
       update((state) => (state.focusTrash === null ? state : { ...state, focusTrash: null }));
+    },
+    dismissDelete: () => {
+      update((state) => {
+        // A removal on its way keeps its question open: its outcome lands there.
+        if (state.confirmingDelete === null || state.busy.has(state.confirmingDelete)) return state;
+        return { ...state, confirmingDelete: null };
+      });
     },
   };
 }

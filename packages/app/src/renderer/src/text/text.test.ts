@@ -2,7 +2,10 @@ import { RECONCILE_REASONS, RULE_REASON_CODES } from '@routeswitch/shared';
 import { describe, expect, it } from 'vitest';
 
 import {
+  configIssueText,
   HELPER_STATUS_TEXT,
+  isValidationCode,
+  VALIDATION_TEXT,
   RECONCILE_REASON_TEXT,
   RULE_REASON_TEXT,
   errorText,
@@ -85,5 +88,37 @@ describe('HELPER_STATUS_TEXT', () => {
       expect(HELPER_STATUS_TEXT[status].text.length).toBeGreaterThan(0);
     }
     expect(HELPER_STATUS_TEXT.connected).toEqual({ text: 'Helper ishlayapti', tone: 'success' });
+  });
+});
+
+describe('validation and config-file texts', () => {
+  it('every shared validation code has words; isValidationCode knows them and nothing else', () => {
+    for (const text of Object.values(VALIDATION_TEXT)) expect(text.length).toBeGreaterThan(5);
+    expect(isValidationCode('loopback')).toBe(true);
+    expect(isValidationCode('toString')).toBe(false);
+    expect(isValidationCode(null)).toBe(false);
+  });
+
+  it('configIssueText names the rule and field, then the reason', () => {
+    expect(configIssueText({ path: ['rules', 0, 'target'], code: 'loopback' })).toBe('1-qoida, manzil: Loopback manzillari (127.0.0.0/8) route qilinmaydi.');
+    expect(configIssueText({ path: ['rules', 4, 'target'], code: 'iface-conflict' })).toBe("5-qoida, manzil: bir manzil ikki interfeysga bog'langan.");
+    expect(configIssueText({ path: ['rules', 1, 'id'], code: 'duplicate-id' })).toBe("2-qoida, id: qoida id'si takrorlangan.");
+    expect(configIssueText({ path: ['rules', 0, '?'], code: 'mystery' })).toBe("1-qoida: qiymat noto'g'ri.");
+    expect(configIssueText({ path: ['rules'], code: 'too_big' })).toBe('500 tadan ortiq qoida.');
+    expect(configIssueText({ path: [], code: 'array-too-long' })).toBe('500 tadan ortiq qoida.');
+    expect(configIssueText({ path: ['version'], code: 'invalid_value' })).toContain('versiyasi mos emas');
+    expect(configIssueText({ path: ['ifaceOverrides', '?'], code: null })).toBe("Interfeys almashtirishlari: qiymat noto'g'ri.");
+    expect(configIssueText({ path: ['enabled'], code: 'invalid_type' })).toBe("Umumiy holat: qiymat turi noto'g'ri yoki qiymat yo'q.");
+    expect(configIssueText(undefined)).toBe("Fayl config ko'rinishiga mos emas.");
+  });
+
+  it('errorText words the file and import codes', () => {
+    expect(errorText('file-too-large')).toContain('1 MB');
+    expect(errorText('file-not-json')).toContain('JSON');
+    expect(errorText('file-not-text')).toContain('UTF-8');
+    expect(errorText('file-not-regular')).toContain('oddiy fayl emas');
+    expect(errorText('file-unreadable')).toContain("o'qib bo'lmadi");
+    expect(errorText('import-expired')).toContain('qayta tanlang');
+    expect(errorText('write-failed')).toContain("yozib bo'lmadi");
   });
 });

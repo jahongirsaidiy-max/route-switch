@@ -33,6 +33,7 @@ import type {
   RsSnapshot,
   RsStateChannel,
 } from '../renderer/src/rs';
+import { readConfigFile, writeConfigFile, type ConfigFileSystem } from './configFile';
 import type { HelperClient, HelperStatus } from './helperClient';
 import { createLogBuffer, type LogBuffer } from './logBuffer';
 import type { Logger } from './logger';
@@ -57,6 +58,7 @@ export const INVOKE_CHANNELS = [
   'rs:apply',
   'rs:test',
   'rs:import',
+  'rs:applyImport',
   'rs:export',
   'rs:getLog',
   'rs:getSettings',
@@ -106,7 +108,24 @@ export interface IpcDeps {
   readonly settings: Settings;
   /** Opens the rules window or brings it to the front (`WindowManager.openRules`). Main process only, no helper call. */
   readonly openRulesWindow: () => void;
+  /** The system file dialogs of config import / export; null when the user cancels. The path never reaches the page. */
+  readonly configDialogs: ConfigDialogs;
+  /** File access for import / export; `node:fs/promises` by default. */
+  readonly configFs?: ConfigFileSystem;
+  /** Token of an import waiting for confirmation; `crypto.randomUUID` by default. */
+  readonly newToken?: () => string;
+  /** Milliseconds, for the age of a waiting import; `Date.now` by default. */
+  readonly now?: () => number;
 }
+
+/** `dialog.showOpenDialog` / `dialog.showSaveDialog`, reduced to the chosen path. */
+export interface ConfigDialogs {
+  readonly chooseImportFile: () => Promise<string | null>;
+  readonly chooseExportFile: () => Promise<string | null>;
+}
+
+/** How long a read import file waits for "Almashtirish". */
+export const IMPORT_TTL_MS = 10 * 60 * 1000;
 
 export interface IpcRegistration {
   /** Removes the handlers and the helper-client subscriptions. Idempotent. */
@@ -160,6 +179,8 @@ const Flag: Schema<boolean> = SetEnabledRequest.shape.enabled;
 /** One routable IPv4 address, normalised (forbidden destinations refused, ADR-001). */
 const TestTarget: Schema<string> = TestRequest.shape.target;
 const RuleArgument: Schema<Rule> = Rule;
+/** The token of a waiting import: a UUID, like a rule id. */
+const ImportToken: Schema<string> = Rule.in.shape.id;
 /** Device overrides per role: only `ethernet` / `wifi` keys, each an `en*` name. Required (no `undefined`). */
 const IfaceOverrides: Schema<RsIfaceOverrides> = ConfigSchema.shape.ifaceOverrides.unwrap();
 
@@ -173,6 +194,7 @@ const ARGUMENTS = {
   'rs:apply': argumentsOf(),
   'rs:test': argumentsOf(TestTarget),
   'rs:import': argumentsOf(),
+  'rs:applyImport': argumentsOf(ImportToken),
   'rs:export': argumentsOf(),
   'rs:getLog': argumentsOf(),
   'rs:getSettings': argumentsOf(),
@@ -233,6 +255,71 @@ export function registerIpcHandlers(deps: IpcDeps): IpcRegistration {
     return run;
   };
 
+  // -- config import / export (TASK-215) --------------------------------------
+  const transferLog = logger.limited('ipc-config-file');
+  const configFs = deps.configFs;
+  const newToken = deps.newToken ?? (() => globalThis.crypto.randomUUID());
+  const now = deps.now ?? Date.now;
+  // At most one system file dialog at a time; a second click is answered `busy`.
+  let dialogOpen = false;
+  const withDialog = async <T>(task: () => Promise<RsResult<T>>): Promise<RsResult<T>> => {
+    if (dialogOpen) return failure('busy', 'A file dialog is already open');
+    dialogOpen = true;
+    try {
+      return await task();
+    } finally {
+      dialogOpen = false;
+    }
+  };
+  // The one import waiting for confirmation: a newer import replaces it, `applyImport` uses it up.
+  let pendingImport: { readonly token: string; readonly config: Config; readonly at: number } | null = null;
+
+  const importConfig = () =>
+    withDialog(async (): Promise<RsResult<RsInvokeChannels['rs:import']['value']>> => {
+      const file = await deps.configDialogs.chooseImportFile();
+      if (file === null) return { ok: true, value: null };
+      const read = await readConfigFile(file, configFs);
+      if (!read.ok) {
+        pendingImport = null;
+        transferLog.warn('Refused a config file', { channel: 'rs:import', code: read.code, issue: read.issue?.code ?? null });
+        return read.issue === undefined ? failure(read.code, read.error) : { ...failure(read.code, read.error), issue: read.issue };
+      }
+      const token = newToken();
+      pendingImport = { token, config: read.config, at: now() };
+      transferLog.info('Config file read for import', { channel: 'rs:import', rules: read.config.rules.length, bytes: read.bytes });
+      return { ok: true, value: { token, config: read.config } };
+    });
+
+  const applyImport = (token: string) =>
+    serially(async (): Promise<RsResult<RsInvokeChannels['rs:applyImport']['value']>> => {
+      const waiting = pendingImport;
+      if (waiting === null || waiting.token !== token || now() - waiting.at > IMPORT_TTL_MS || now() < waiting.at) {
+        if (waiting?.token === token) pendingImport = null;
+        return failure('import-expired', 'No import is waiting for this token');
+      }
+      pendingImport = null;
+      // Replaces the stored config as a whole; the helper checks it again.
+      const saved = await helperClient.request('setConfig', { config: waiting.config });
+      if (saved.ok) changeLog.info('Config imported', { channel: 'rs:applyImport', rules: waiting.config.rules.length });
+      return saved;
+    });
+
+  const exportConfig = () =>
+    withDialog(async (): Promise<RsResult<RsInvokeChannels['rs:export']['value']>> => {
+      // Read first: without a helper there is nothing to export, and no dialog opens.
+      const current = await helperClient.request('getConfig');
+      if (!current.ok) return current;
+      const file = await deps.configDialogs.chooseExportFile();
+      if (file === null) return { ok: true, value: null };
+      const written = await writeConfigFile(file, current.value.config, configFs);
+      if (!written.ok) {
+        transferLog.error('Could not write the exported config', { channel: 'rs:export', detail: written.error });
+        return failure('write-failed', written.error);
+      }
+      transferLog.info('Config exported', { channel: 'rs:export', rules: current.value.config.rules.length, bytes: written.bytes });
+      return { ok: true, value: { rules: current.value.config.rules.length, bytes: written.bytes } };
+    });
+
   /** The Wi‑Fi role's device as the engine last saw it; it picks the Wi‑Fi service of the order. */
   const wifiDevice = (): string | null => helperClient.snapshot().state?.interfaces.wifi.device ?? null;
 
@@ -284,10 +371,10 @@ export function registerIpcHandlers(deps: IpcDeps): IpcRegistration {
       }),
     'rs:apply': () => serially(() => helperClient.request('apply')),
     'rs:test': ([target]) => helperClient.request('test', { target }),
-    // TASK-215 replaces these two: import and export go through a dialog of
-    // the main process. Until then the methods exist and say so.
-    'rs:import': () => Promise.resolve(failure('not-implemented', 'Importing a config is not available yet (TASK-215)')),
-    'rs:export': () => Promise.resolve(failure('not-implemented', 'Exporting the config is not available yet (TASK-215)')),
+    // The system dialogs of this process choose the file; the page never sends or sees a path.
+    'rs:import': () => importConfig(),
+    'rs:applyImport': ([token]) => applyImport(token),
+    'rs:export': () => exportConfig(),
     // From the main process's memory: no helper round trip, and it works while the helper is away.
     'rs:getLog': () => Promise.resolve({ ok: true, value: logBuffer.entries() }),
     'rs:getSettings': () => Promise.resolve({ ok: true, value: { openAtLogin: settings.openAtLogin() } }),

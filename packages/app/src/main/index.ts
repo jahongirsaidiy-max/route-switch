@@ -3,7 +3,7 @@ import { readFile, realpath } from 'node:fs/promises';
 import path from 'node:path';
 
 import { PATHS } from '@routeswitch/shared';
-import { app, BrowserWindow, clipboard, ipcMain, Menu, nativeImage, protocol, screen, session, Tray } from 'electron';
+import { app, BrowserWindow, clipboard, dialog, ipcMain, Menu, nativeImage, protocol, screen, session, Tray } from 'electron';
 
 import trayActive1x from '../../resources/tray/trayActiveTemplate.png?asset';
 import trayActive2x from '../../resources/tray/trayActiveTemplate@2x.png?asset';
@@ -76,6 +76,31 @@ startApp({
           writeClipboard: (text) => clipboard.writeText(text),
           logger,
         }),
+        // Config import / export: the only way a file path enters the app is the
+        // user's choice in these system dialogs, attached to the focused window.
+        configDialogs: {
+          chooseImportFile: async () => {
+            const options: Electron.OpenDialogOptions = {
+              title: 'Config import',
+              properties: ['openFile'],
+              filters: [{ name: 'JSON', extensions: ['json'] }],
+            };
+            const parent = BrowserWindow.getFocusedWindow();
+            const result = parent === null ? await dialog.showOpenDialog(options) : await dialog.showOpenDialog(parent, options);
+            return result.canceled ? null : (result.filePaths[0] ?? null);
+          },
+          chooseExportFile: async () => {
+            const options: Electron.SaveDialogOptions = {
+              title: 'Config export',
+              defaultPath: path.join(app.getPath('documents'), 'routeswitch-config.json'),
+              filters: [{ name: 'JSON', extensions: ['json'] }],
+              properties: ['createDirectory', 'showOverwriteConfirmation'],
+            };
+            const parent = BrowserWindow.getFocusedWindow();
+            const result = parent === null ? await dialog.showSaveDialog(options) : await dialog.showSaveDialog(parent, options);
+            return result.canceled || result.filePath === '' ? null : result.filePath;
+          },
+        },
         logger,
       },
       context,

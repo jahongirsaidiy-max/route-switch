@@ -27,6 +27,20 @@ export function errorText(code: RsErrorCode): string {
       return 'Amal bajarilmadi.';
     case 'forbidden':
       return "Bu oynadan ruxsat yo'q.";
+    case 'file-unreadable':
+      return "Faylni o'qib bo'lmadi.";
+    case 'file-not-regular':
+      return 'Tanlangan narsa oddiy fayl emas.';
+    case 'file-too-large':
+      return 'Fayl juda katta (1 MB dan ortiq) — bu config fayli emas.';
+    case 'file-not-text':
+      return 'Fayl UTF-8 matn emas.';
+    case 'file-not-json':
+      return "Fayl JSON emas yoki buzilgan.";
+    case 'import-expired':
+      return "Tanlangan fayl muddati o'tdi — faylni qayta tanlang.";
+    case 'write-failed':
+      return "Faylni yozib bo'lmadi — boshqa joyni tanlang.";
     default:
       return `Kutilmagan xato (${code}).`;
   }

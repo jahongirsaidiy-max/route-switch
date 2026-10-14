@@ -103,7 +103,15 @@ export type RsIfaceOverrides = Partial<Record<IfaceRole, string>>;
  * - `unspecified`    — the helper refused without giving a code;
  * - `invalid-input`  — the arguments of the call were refused; nothing was sent;
  * - `rule-not-found` — `deleteRule` / `toggleRule` named a rule the config does not hold;
- * - `forbidden`      — the call did not come from the app's own page.
+ * - `forbidden`      — the call did not come from the app's own page;
+ * - `file-unreadable`, `file-not-regular`, `file-too-large`, `file-not-text`,
+ *   `file-not-json` — `importConfig`: the chosen file is not a readable regular
+ *   file of at most 1 MiB of UTF-8 JSON (a schema refusal is `invalid-config`,
+ *   with `issue`); nothing was sent;
+ * - `import-expired` — `applyImport`: the token is unknown, used or older than
+ *   10 minutes (choose the file again); nothing was sent;
+ * - `write-failed`   — `exportConfig`: the file could not be written; the chosen
+ *   path is left as it was.
  *
  * For a call that changes something (`saveRule`, `deleteRule`, `toggleRule`,
  * `setEnabled`, `apply`), `disconnected` and `timeout` mean the outcome is
@@ -119,12 +127,44 @@ export type RsErrorCode =
   | 'unspecified'
   | 'invalid-input'
   | 'rule-not-found'
-  | 'forbidden';
+  | 'forbidden'
+  | 'file-unreadable'
+  | 'file-not-regular'
+  | 'file-too-large'
+  | 'file-not-text'
+  | 'file-not-json'
+  | 'import-expired'
+  | 'write-failed';
+
+/**
+ * Where a refused import file breaks the config schema: the first issue.
+ * `path` holds array indexes and the schema's own field names only (anything
+ * else is `?`); `code` is the shared validation code (`default-route`,
+ * `iface-conflict`, …) when there is one, otherwise zod's (`invalid_type`, …).
+ */
+export interface RsConfigIssue {
+  readonly path: readonly (string | number)[];
+  readonly code: string | null;
+}
+
+/** A config file read and accepted by `importConfig`, waiting for the user's confirmation. */
+export interface RsImportPreview {
+  /** Hand back to `applyImport` to store exactly this config. One use, 10 minutes. */
+  readonly token: string;
+  /** The config as the shared schema parsed it (normalised). It replaces the stored one as a whole. */
+  readonly config: Config;
+}
+
+/** A config written by `exportConfig`. */
+export interface RsExportResult {
+  readonly rules: number;
+  readonly bytes: number;
+}
 
 /** Every call settles with one of these and never rejects. `error` is a short English sentence for the log, not for display. */
 export type RsResult<T> =
   | { readonly ok: true; readonly value: T }
-  | { readonly ok: false; readonly code: RsErrorCode; readonly error: string };
+  | { readonly ok: false; readonly code: RsErrorCode; readonly error: string; readonly issue?: RsConfigIssue };
 
 /** Removes the subscription it was returned for. Calling it again does nothing. */
 export type RsUnsubscribe = () => void;
@@ -144,10 +184,24 @@ export interface RsApi {
   apply(): Promise<RsResult<StateResult>>;
   /** Which interface the system would use for one IPv4 address (`route -n get`). Read-only. */
   test(target: string): Promise<RsResult<TestResult>>;
-  /** Not available yet: always fails with `not-implemented` until TASK-215 adds it. */
-  importConfig(): Promise<RsResult<never>>;
-  /** Not available yet: always fails with `not-implemented` until TASK-215 adds it. */
-  exportConfig(): Promise<RsResult<never>>;
+  /**
+   * Asks the user for a config file (system dialog of the main process), reads
+   * and checks it with the shared `Config` schema, and returns it for a
+   * confirmation; nothing is sent to the helper. Null when the dialog was
+   * cancelled. The page never learns the path. `busy` while a file dialog is open.
+   */
+  importConfig(): Promise<RsResult<RsImportPreview | null>>;
+  /**
+   * Replaces the stored config with the one `importConfig` returned for
+   * `token` (`setConfig`, queued with the other changes). The token is used up
+   * either way.
+   */
+  applyImport(token: string): Promise<RsResult<SetConfigResult>>;
+  /**
+   * Writes the stored config (`getConfig`) to a JSON file the user chooses in
+   * the system save dialog; atomically, and nowhere else. Null when cancelled.
+   */
+  exportConfig(): Promise<RsResult<RsExportResult | null>>;
   /**
    * Calls `listener` with a new snapshot whenever the connection or the engine
    * state changes. Nothing is replayed: subscribe first, then call `getState`.
@@ -205,8 +259,9 @@ export interface RsInvokeChannels {
   'rs:setEnabled': { readonly args: readonly [on: boolean]; readonly value: StateResult };
   'rs:apply': { readonly args: readonly []; readonly value: StateResult };
   'rs:test': { readonly args: readonly [target: string]; readonly value: TestResult };
-  'rs:import': { readonly args: readonly []; readonly value: never };
-  'rs:export': { readonly args: readonly []; readonly value: never };
+  'rs:import': { readonly args: readonly []; readonly value: RsImportPreview | null };
+  'rs:applyImport': { readonly args: readonly [token: string]; readonly value: SetConfigResult };
+  'rs:export': { readonly args: readonly []; readonly value: RsExportResult | null };
   'rs:getLog': { readonly args: readonly []; readonly value: readonly RsLogEntry[] };
   'rs:getSettings': { readonly args: readonly []; readonly value: RsSettings };
   'rs:setOpenAtLogin': { readonly args: readonly [on: boolean]; readonly value: RsSettings };

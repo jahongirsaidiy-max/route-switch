@@ -24,7 +24,6 @@ export {
   ruleInputOf,
   TARGET_FIELD,
   testAddressOf,
-  VALIDATION_TEXT,
   WILDCARD_TEXT,
   type CommandPreview,
   type FieldErrors,

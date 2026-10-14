@@ -291,6 +291,7 @@ function shellHarness() {
         writeClipboard: () => Promise.resolve(),
         logger,
       }),
+      configDialogs: { chooseImportFile: () => Promise.resolve(null), chooseExportFile: () => Promise.resolve(null) },
       now: () => 50_000,
     },
     {

@@ -38,6 +38,7 @@ const INVOKES = [
   ['apply', [], 'rs:apply'],
   ['test', ['10.1.2.3'], 'rs:test'],
   ['importConfig', [], 'rs:import'],
+  ['applyImport', [RULE.id], 'rs:applyImport'],
   ['exportConfig', [], 'rs:export'],
   ['getLog', [], 'rs:getLog'],
   ['getSettings', [], 'rs:getSettings'],

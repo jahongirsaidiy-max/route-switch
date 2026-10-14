@@ -140,6 +140,27 @@ describe('delete', () => {
   });
 });
 
+describe('dismissDelete (another question takes the place)', () => {
+  it('closes the question without asking for the focus; nothing is sent', () => {
+    const h = harness();
+    h.controller.askDelete(ID.domain);
+    h.controller.dismissDelete();
+    expect(h.state()).toMatchObject({ confirmingDelete: null, focusTrash: null });
+    expect(h.rs.deleteRule).not.toHaveBeenCalled();
+    const same = h.state();
+    h.controller.dismissDelete();
+    expect(h.state()).toBe(same);
+  });
+
+  it('a removal on its way keeps its question open', () => {
+    const h = harness();
+    h.controller.askDelete(ID.domain);
+    void h.controller.confirmDelete(ID.domain);
+    h.controller.dismissDelete();
+    expect(h.state().confirmingDelete).toBe(ID.domain);
+  });
+});
+
 describe('focusTrashButton', () => {
   it('focuses the button of the rule when it is on the page', () => {
     const button = { focus: vi.fn() };
@@ -160,6 +181,7 @@ describe('rulesHandlers (the screen\'s wiring of the panel)', () => {
       cancelDelete: vi.fn(),
       confirmDelete: vi.fn(() => Promise.resolve()),
       focusDone: vi.fn(),
+      dismissDelete: vi.fn(),
     };
     const handlers = rulesHandlers(controller);
     handlers.onAskDelete(ID.domain);

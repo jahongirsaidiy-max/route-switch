@@ -39,6 +39,7 @@ const api: RsApi = {
   apply: () => invoke('rs:apply'),
   test: (target) => invoke('rs:test', target),
   importConfig: () => invoke('rs:import'),
+  applyImport: (token) => invoke('rs:applyImport', token),
   exportConfig: () => invoke('rs:export'),
   onState: (listener) => {
     // The page never sees the Electron event object, only the snapshot.

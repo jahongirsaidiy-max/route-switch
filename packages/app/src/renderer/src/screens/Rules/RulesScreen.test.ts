@@ -9,7 +9,8 @@ import { LOADING_VIEW, type EngineStateView } from '../../hooks/useEngineState';
 import type { RsApi } from '../../rs';
 import { RULE_REASON_TEXT } from '../../text';
 import { CONFIG, ID, NOW, STATE, ruleState } from '../MenuBar/fixtures';
-import { ADD_RULE_UNAVAILABLE, IMPORT_EXPORT_UNAVAILABLE, RulesPanel, RulesScreen, type RulesPanelProps } from './RulesScreen';
+import { ADD_RULE_UNAVAILABLE, RulesPanel, RulesScreen, type RulesPanelProps } from './RulesScreen';
+import { INITIAL_TRANSFER_UI } from './transfer';
 
 const connected = (state: EngineState = STATE): EngineStateView => ({
   helper: 'connected',
@@ -35,6 +36,11 @@ const props = (extra: Partial<RulesPanelProps> = {}): RulesPanelProps => ({
   onCancelDelete: vi.fn(),
   onConfirmDelete: vi.fn(),
   onReloadConfig: vi.fn(),
+  transfer: INITIAL_TRANSFER_UI,
+  onImport: vi.fn(),
+  onExport: vi.fn(),
+  onConfirmImport: vi.fn(),
+  onCancelImport: vi.fn(),
   ...extra,
 });
 const render = (extra: Partial<RulesPanelProps> = {}) => renderMarkup(createElement(RulesPanel, props(extra)));
@@ -84,7 +90,8 @@ describe('RulesPanel — table', () => {
     const words = text(html);
     expect(words).toContain('Qoidalar');
     expect(words).toContain("Qoida qo'shish");
-    expect(words).toContain('Import / Export');
+    expect(words).toContain('Import');
+    expect(words).toContain('Export');
     for (const column of ['Holat', 'Manzil', 'Turi', 'Interfeys', 'Izoh']) expect(words).toContain(column);
     expect(html.match(/role="row"/g)).toHaveLength(7);
     expect(words).toContain('10.0.0.0/8 Subnet ETH en5 Ichki tarmoq');
@@ -254,7 +261,6 @@ describe('RulesPanel — what is not built yet (TASK-213, TASK-215)', () => {
     expect(html).toContain(`title="${ADD_RULE_UNAVAILABLE.replace(/'/g, '&#x27;')}"`);
     expect(buttonsLabelled(elements, `Tahrirlash — ${ADD_RULE_UNAVAILABLE}`)).toHaveLength(6);
     expect(buttonsLabelled(elements, `Tahrirlash — ${ADD_RULE_UNAVAILABLE}`).every((element) => element.props.disabled === true)).toBe(true);
-    expect(buttonsLabelled(elements, `Import / Export — ${IMPORT_EXPORT_UNAVAILABLE}`)[0]?.props.disabled).toBe(true);
   });
 
   it('with handlers given (TASK-213) they work', () => {
@@ -296,6 +302,9 @@ describe('RulesScreen', () => {
       getConfig: vi.fn(),
       toggleRule: vi.fn(),
       deleteRule: vi.fn(),
+      importConfig: vi.fn(),
+      applyImport: vi.fn(),
+      exportConfig: vi.fn(),
     };
     const html = renderMarkup(createElement(RulesScreen, { rs }));
     expect(text(html)).toContain("Holat o'qilmoqda…");
