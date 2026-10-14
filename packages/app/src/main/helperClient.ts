@@ -81,6 +81,13 @@ export type HelperStatus =
   /** The socket file does not exist: the helper has never been installed (or was removed). */
   | { readonly kind: 'not-installed' }
   | { readonly kind: 'disconnected'; readonly reason: DisconnectReason }
+  /**
+   * The helper runs and answers, but the config it stored cannot be loaded:
+   * it applies nothing, and `getConfig` / `setEnabled` fail until a
+   * `setConfig` (an import, or a fresh empty config) replaces the file.
+   * Requests may be made; `state` and `config` stay null until then.
+   */
+  | { readonly kind: 'config-unreadable'; readonly helperVersion: string }
   /** A helper answered, but it speaks another version of the protocol and must be reinstalled. */
   | {
       readonly kind: 'incompatible';
@@ -119,7 +126,12 @@ export interface HelperClient {
   readonly start: () => void;
   /** Closes the connection, settles every pending request and cancels every timer. Idempotent. */
   readonly stop: () => void;
-  /** Tries to connect now instead of waiting for the next scheduled attempt (after an install, say). */
+  /**
+   * Tries to connect now instead of waiting for the next scheduled attempt
+   * (after an install, say, or when the user asks). The status turns
+   * `connecting` for the attempt, so a retry that fails the same way is seen
+   * again. Does nothing while a connection is open or being opened.
+   */
   readonly reconnectNow: () => void;
   readonly request: <M extends RequestMethod>(method: M, ...args: RequestArgs<M>) => Promise<HelperResult<ResultOf<M>>>;
   readonly snapshot: () => HelperSnapshot;
@@ -239,6 +251,12 @@ interface Connection {
   seq: number | null;
   invalidLines: number;
   configFetchInFlight: boolean;
+  /** The handshake found the stored config unreadable (`config-unreadable`); cleared once a config arrives. */
+  configUnreadable: boolean;
+  /** While `configUnreadable`: the highest config revision whose `getConfig` failed; only a newer one is asked for. */
+  unreadableRevision: number;
+  /** The helper version of the handshake, for the `connected` status after a recovered config. */
+  helperVersion: string;
   connectTimer: unknown;
   configRetryTimer: unknown;
 }
@@ -355,7 +373,10 @@ export function createHelperClient(options: HelperClientOptions): HelperClient {
     if (sameStatus(status, next)) return;
     status = next;
     // A helper that is not installed is the normal first-run state, not a fault.
-    const level = next.kind === 'incompatible' || (next.kind === 'disconnected' && next.reason !== 'not-running') ? 'warn' : 'info';
+    const level =
+      next.kind === 'incompatible' || next.kind === 'config-unreadable' || (next.kind === 'disconnected' && next.reason !== 'not-running')
+        ? 'warn'
+        : 'info';
     statusLog[level]('Helper connection status changed', { ...next, kind: undefined, status: next.kind });
     statusChannel.publish(next, () => status === next);
   };
@@ -378,20 +399,51 @@ export function createHelperClient(options: HelperClientOptions): HelperClient {
     // Until the handshake is done nothing is published: subscribers see the
     // first state together with its config, when the status turns `connected`.
     if (!active.ready) return;
-    stateChannel.publish(next, () => alive(active));
-    if (configBehind(next.configRevision)) fetchConfig(active);
+    // While the stored config is unreadable the status is not `connected`:
+    // the state is kept, not published (`state` stays null to subscribers).
+    // `leaveUnreadable` publishes it once, on recovery.
+    if (!active.configUnreadable) stateChannel.publish(next, () => alive(active));
+    if (wantsConfig(active, next.configRevision)) fetchConfig(active);
   };
+
+  /**
+   * Whether a state with this config revision calls for a `getConfig`. While
+   * the stored config is unreadable only a change after the failed read does
+   * (a `setConfig` from elsewhere): asking again for the same broken file
+   * would fail the same way, every state and every retry. Once a config is
+   * held again (a `setConfig` result, about to leave that mode), the usual
+   * rule applies.
+   */
+  const wantsConfig = (active: Connection, stateRevision: number): boolean =>
+    active.configUnreadable && config === null ? stateRevision > active.unreadableRevision : configBehind(stateRevision);
 
   const acceptConfig = (active: Connection, next: Config, revision: number): void => {
     config = next;
     configRevision = revision;
-    if (active.ready) configChannel.publish(next, () => alive(active));
+    // While the config is unreadable the status is not `connected` yet: `leaveUnreadable` publishes it.
+    if (active.ready && !active.configUnreadable) configChannel.publish(next, () => alive(active));
+  };
+
+  /**
+   * A config has arrived for a connection whose stored config was unreadable
+   * (a `setConfig` replaced the file): the connection becomes `connected`,
+   * and its state and config are published like after a handshake.
+   */
+  const leaveUnreadable = (active: Connection): void => {
+    if (!active.configUnreadable || !alive(active) || config === null) return;
+    active.configUnreadable = false;
+    const recoveredState = state;
+    const recoveredConfig = config;
+    setStatus({ kind: 'connected', helperVersion: active.helperVersion });
+    if (recoveredState !== null) stateChannel.publish(recoveredState, () => alive(active));
+    configChannel.publish(recoveredConfig, () => alive(active));
   };
 
   /** Fetches the config for the revision the latest state names. One fetch at a time; changes meanwhile cause one more. */
   const fetchConfig = (active: Connection): void => {
     if (active.configFetchInFlight || state === null) return;
     active.configFetchInFlight = true;
+    const askedRevision = state.configRevision;
     // A fetch replaces a retry that was waiting: there is never more than one retry timer.
     clearTimer(active.configRetryTimer);
     active.configRetryTimer = null;
@@ -400,10 +452,15 @@ export function createHelperClient(options: HelperClientOptions): HelperClient {
       if (!alive(active)) return;
       if (!result.ok) {
         configFetchLog.warn('Could not fetch the config after it changed', { code: result.code });
+        if (active.configUnreadable && result.code === 'operation-failed') {
+          // Still unreadable: no retry; the next change of the stored config tries again.
+          active.unreadableRevision = Math.max(active.unreadableRevision, askedRevision);
+          return;
+        }
         if (active.configRetryTimer !== null) return;
         active.configRetryTimer = setTimer(() => {
           active.configRetryTimer = null;
-          if (state !== null && configBehind(state.configRevision)) fetchConfig(active);
+          if (state !== null && wantsConfig(active, state.configRevision)) fetchConfig(active);
         }, RECONNECT_DELAY_MS);
         return;
       }
@@ -412,7 +469,8 @@ export function createHelperClient(options: HelperClientOptions): HelperClient {
       // already taken (from a `setConfig` result) is not applied.
       const revision = result.value.configRevision;
       if (configRevision === null || revision >= configRevision) acceptConfig(active, result.value.config, revision);
-      if (state !== null && configBehind(state.configRevision)) fetchConfig(active);
+      leaveUnreadable(active);
+      if (state !== null && wantsConfig(active, state.configRevision)) fetchConfig(active);
     });
   };
 
@@ -516,6 +574,8 @@ export function createHelperClient(options: HelperClientOptions): HelperClient {
         }
         // A state inside a result obeys the same `seq` rule as a state event.
         if (carried.state !== undefined) acceptState(active, carried.state);
+        // A stored config replaced the unreadable one.
+        if (method === 'setConfig') leaveUnreadable(active);
         return { result: { ok: true, value: result.value }, valid: true };
       },
     );
@@ -640,6 +700,18 @@ export function createHelperClient(options: HelperClientOptions): HelperClient {
     //    a restarted helper can reach the same revision with another config.
     const fetched = await send(active, 'getConfig', {});
     if (!alive(active)) return;
+    active.helperVersion = statusResult.value.helperVersion;
+    if (!fetched.ok && fetched.code === 'operation-failed') {
+      // The helper runs, but its stored config cannot be loaded. Dropping the
+      // connection would leave the user no way to repair it: `setConfig` is
+      // the one method that does. Requests are allowed; no state is shown.
+      active.configUnreadable = true;
+      active.unreadableRevision = state?.configRevision ?? 0;
+      active.ready = true;
+      failedAttempts = 0;
+      setStatus({ kind: 'config-unreadable', helperVersion: active.helperVersion });
+      return;
+    }
     if (!fetched.ok) {
       drop(active, { kind: 'disconnected', reason: fetched.code === 'timeout' ? 'timeout' : 'protocol-error' });
       return;
@@ -659,7 +731,7 @@ export function createHelperClient(options: HelperClientOptions): HelperClient {
     stateChannel.publish(firstState, () => alive(active));
     configChannel.publish(firstConfig, () => alive(active));
     // A state event may have moved the revision on while the config was in flight.
-    if (configBehind(firstState.configRevision)) fetchConfig(active);
+    if (wantsConfig(active, firstState.configRevision)) fetchConfig(active);
   };
 
   const open = (): void => {
@@ -683,6 +755,9 @@ export function createHelperClient(options: HelperClientOptions): HelperClient {
       seq: null,
       invalidLines: 0,
       configFetchInFlight: false,
+      configUnreadable: false,
+      unreadableRevision: 0,
+      helperVersion: '',
       connectTimer: null,
       configRetryTimer: null,
     };
@@ -732,6 +807,8 @@ export function createHelperClient(options: HelperClientOptions): HelperClient {
       if (!started || connection !== null) return;
       clearTimer(reconnectTimer);
       reconnectTimer = null;
+      // Shown, so the user sees the attempt; a subscriber may stop the client meanwhile.
+      setStatus({ kind: 'connecting' });
       open();
     },
     request: (method, ...args) => {

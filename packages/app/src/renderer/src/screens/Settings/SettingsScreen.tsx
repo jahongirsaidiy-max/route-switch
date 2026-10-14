@@ -4,7 +4,7 @@
 // (GAP-01): it follows the rules window — page header, bordered cards.
 
 import type { Config } from '@routeswitch/shared';
-import { useCallback, useEffect, useState, type ReactElement } from 'react';
+import { useCallback, useEffect, useRef, useState, type ReactElement, type Ref } from 'react';
 
 import { Button, ROLE_LABELS, StatusDot, Toggle } from '../../components';
 import { useEngineState, type EngineStateView } from '../../hooks/useEngineState';
@@ -46,6 +46,8 @@ export interface SettingsPanelProps {
   readonly onAskUninstall: () => void;
   readonly onCancelUninstall: () => void;
   readonly onConfirmUninstall: () => void;
+  /** The "Helper'ni o'chirish" button, so the focus can return to it after the question closes. */
+  readonly uninstallRef?: Ref<HTMLButtonElement> | undefined;
 }
 
 const AUTO = '';
@@ -64,6 +66,8 @@ export function SettingsPanel(props: SettingsPanelProps): ReactElement {
   const { engine, serviceOrder, busy, feedback } = props;
   const state = engine.state;
   const connected = engine.helper === 'connected' && state !== null;
+  // The helper also removes itself when its stored config is unreadable (it answers every method but two).
+  const canUninstall = connected || engine.helper === 'config-unreadable';
   const wifiDevice = state?.interfaces.wifi.device ?? null;
   const choices = ethernetChoices(state?.adapters ?? [], wifiDevice);
   const override = props.overrides?.ethernet ?? null;
@@ -208,7 +212,14 @@ export function SettingsPanel(props: SettingsPanelProps): ReactElement {
             routing'ga ta'sir qilmay qoladi.
           </p>
           {props.confirmingUninstall ? (
-            <div className={styles['confirm']} role="alertdialog" aria-labelledby="settings-uninstall-question">
+            <div
+              className={styles['confirm']}
+              role="alertdialog"
+              aria-labelledby="settings-uninstall-question"
+              onKeyDown={(event) => {
+                if (event.key === 'Escape' && !busy.has('helper')) props.onCancelUninstall();
+              }}
+            >
               <p id="settings-uninstall-question" className={styles['confirmText']}>
                 Helper rostdan ham o'chirilsinmi?
               </p>
@@ -216,14 +227,15 @@ export function SettingsPanel(props: SettingsPanelProps): ReactElement {
                 <Button variant="primary" onClick={props.onConfirmUninstall} busy={busy.has('helper')}>
                   Ha, o'chirish
                 </Button>
-                <Button onClick={props.onCancelUninstall} disabled={busy.has('helper')}>
+                {/* The safe choice takes the focus (WAI-ARIA alertdialog); busy, not disabled, so it keeps it. */}
+                <Button autoFocus onClick={props.onCancelUninstall} busy={busy.has('helper')}>
                   Bekor qilish
                 </Button>
               </div>
             </div>
           ) : (
             <div className={styles['actions']}>
-              <Button onClick={props.onAskUninstall} disabled={!connected}>
+              <Button ref={props.uninstallRef} onClick={props.onAskUninstall} disabled={!canUninstall}>
                 Helper'ni o'chirish
               </Button>
             </div>
@@ -249,6 +261,14 @@ export function SettingsScreen({ rs: given }: SettingsScreenProps): ReactElement
   const [serviceOrder, setServiceOrder] = useState<ServiceOrderView>({ phase: 'loading', order: null, feedback: null });
   const [busy, setBusy] = useState<ReadonlySet<SettingsSection>>(new Set());
   const [confirmingUninstall, setConfirmingUninstall] = useState(false);
+  // After the question closes, the focus goes back to "Helper'ni o'chirish" (when it can take it).
+  const uninstallButton = useRef<HTMLButtonElement | null>(null);
+  const [returnFocus, setReturnFocus] = useState(false);
+  useEffect(() => {
+    if (!returnFocus) return;
+    focusUninstallButton(uninstallButton.current);
+    setReturnFocus(false);
+  }, [returnFocus]);
   const [feedback, setFeedback] = useState<Partial<Record<SettingsSection, Feedback>>>({});
 
   const mark = useCallback((section: SettingsSection, on: boolean) => {
@@ -346,15 +366,25 @@ export function SettingsScreen({ rs: given }: SettingsScreenProps): ReactElement
       }}
       onCancelUninstall={() => {
         setConfirmingUninstall(false);
+        setReturnFocus(true);
       }}
+      uninstallRef={uninstallButton}
       onConfirmUninstall={() => {
         mark('helper', true);
         void uninstallHelper(rs).then((line) => {
           say('helper', line);
           setConfirmingUninstall(false);
           mark('helper', false);
+          setReturnFocus(true);
         });
       }}
     />
   );
+}
+
+/** Gives the focus back to "Helper'ni o'chirish" when it is on the page and enabled (after an uninstall it is not). */
+export function focusUninstallButton(button: Pick<HTMLButtonElement, 'isConnected' | 'disabled' | 'focus'> | null): boolean {
+  if (button === null || !button.isConnected || button.disabled) return false;
+  button.focus();
+  return true;
 }

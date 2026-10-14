@@ -8,7 +8,8 @@ import { IDLE_CONFIG, type ConfigView } from '../../hooks/useConfig';
 import { LOADING_VIEW, type EngineStateView } from '../../hooks/useEngineState';
 import type { RsApi, RsSnapshot } from '../../rs';
 import { CONFIG, ID, NOW, ORDER_WIFI_FIRST, STATE, ruleState } from './fixtures';
-import { MenuBarPanel, MenuBarScreen, helperNotice, type MenuBarPanelProps } from './MenuBarScreen';
+import { helperNotice, INSTALL_UNAVAILABLE } from '../../text';
+import { MenuBarPanel, MenuBarScreen, type MenuBarPanelProps } from './MenuBarScreen';
 
 const connected = (state: EngineState = STATE): EngineStateView => ({
   helper: 'connected',
@@ -29,6 +30,7 @@ const props = (extra: Partial<MenuBarPanelProps> = {}): MenuBarPanelProps => ({
   onApply: vi.fn(),
   onOpenRules: vi.fn(),
   onReloadConfig: vi.fn(),
+  onReconnect: vi.fn(),
   ...extra,
 });
 const render = (extra: Partial<MenuBarPanelProps> = {}) => renderMarkup(createElement(MenuBarPanel, props(extra)));
@@ -49,6 +51,8 @@ interface AnyProps {
   readonly onClick?: () => void;
   readonly onChange?: (next: boolean) => void;
   readonly disabled?: boolean;
+  readonly busy?: boolean;
+  readonly label?: string;
 }
 function elementsOf(node: ReactNode): ReactElement<AnyProps>[] {
   if (Array.isArray(node)) return (node as ReactNode[]).flatMap(elementsOf);
@@ -190,6 +194,59 @@ describe('MenuBarPanel — connected', () => {
   });
 });
 
+describe('MenuBarPanel — network warnings and failed domains (TASK-300)', () => {
+  const ethernetDown: EngineState = {
+    ...STATE,
+    interfaces: { ...STATE.interfaces, ethernet: { device: 'en5', ip: null, gateway: null, up: false } },
+    rules: STATE.rules.map((rule) =>
+      new Set<string>([ID.subnet, ID.dnsDomain, ID.host]).has(rule.ruleId)
+        ? ruleState(rule.ruleId, { status: 'pending', reasonCode: 'interface-down' })
+        : rule,
+    ),
+  };
+
+  it('an interface that is down: its rules are pending, and a warning says how many wait', () => {
+    const html = render({ engine: connected(ethernetDown) });
+    const words = text(html);
+    expect(words).toContain('Ethernet ulanmagan');
+    expect(words).toContain("3 ta qoida kutilmoqda — interfeys ulanganda avtomatik qo'llanadi.");
+    expect(html.match(/data-status="pending"/g)).toHaveLength(3);
+    expect(html).toMatch(/role="note" aria-label="Ethernet ulanmagan"/);
+    // Waiting is not an error.
+    expect(words).not.toContain('xato');
+  });
+
+  it('both interfaces behind one gateway: a one-subnet warning', () => {
+    const state: EngineState = {
+      ...STATE,
+      interfaces: {
+        ethernet: { device: 'en5', ip: '192.168.1.20', gateway: '192.168.1.1', up: true },
+        wifi: { device: 'en0', ip: '192.168.1.30', gateway: '192.168.1.1', up: true },
+      },
+    };
+    const words = text(render({ engine: connected(state) }));
+    expect(words).toContain('Ethernet va Wi‑Fi bitta tarmoqda');
+    expect(words).toContain("gateway orqali route ishonchsiz");
+    expect(text(render())).not.toContain('bitta tarmoqda');
+  });
+
+  it('a domain rule that failed to resolve shows the reason and its last known address', () => {
+    const state: EngineState = {
+      ...STATE,
+      rules: STATE.rules.map((rule) =>
+        rule.ruleId === ID.domain ? { ...rule, status: 'error', reasonCode: 'resolve-failed', reason: 'DNS query failed' } : rule,
+      ),
+    };
+    const html = render({ engine: connected(state) });
+    const words = text(html);
+    // The row has room for the first address; the status tag's name (tooltip, screen reader) has them all.
+    expect(words).toContain('140.82.112.3 +2');
+    expect(words).toContain("DNS so'rovi bajarilmadi. Oxirgi ma'lum IP'lar (hali yo'naltirilmoqda): 140.82.112.3, 140.82.112.4, 140.82.113.3 · 2 daq oldin");
+    expect(html).toMatch(/title="DNS so&#x27;rovi bajarilmadi\. Oxirgi ma&#x27;lum IP&#x27;lar/);
+    expect(html).toContain('data-status="error"');
+  });
+});
+
 describe('MenuBarPanel — rules not ready', () => {
   it('while the config is read', () => {
     const words = text(render({ config: { ...IDLE_CONFIG, phase: 'loading', revision: 3 } }));
@@ -238,6 +295,11 @@ describe('MenuBarPanel — no live state', () => {
       'Helper versiyasi mos emas',
     ],
     ['stopped', { helper: 'stopped', connection: { kind: 'stopped' }, state: null, error: null }, "Ilova to'xtamoqda"],
+    [
+      'config-unreadable',
+      { helper: 'config-unreadable', connection: { kind: 'config-unreadable', helperVersion: '0.1.0' }, state: null, error: null },
+      "Helper config'i buzilgan",
+    ],
     ['unavailable', { helper: 'unavailable', connection: null, state: null, error: { code: 'forbidden', message: 'x' } }, "Holatni o'qib bo'lmadi"],
   ];
 
@@ -259,8 +321,43 @@ describe('MenuBarPanel — no live state', () => {
       "Helper ishlamayapti. U launchd orqali qayta ishga tushadi; bo'lmasa qayta o'rnating. Qo'llangan route'lar helper'da qoladi.",
     );
     expect(helperNotice(views[4]?.[1] ?? LOADING_VIEW)?.text).toContain('v0.0.9');
-    expect(helperNotice(views[6]?.[1] ?? LOADING_VIEW)?.text).toBe("Bu oynadan ruxsat yo'q.");
+    expect(helperNotice(views[7]?.[1] ?? LOADING_VIEW)?.text).toBe("Bu oynadan ruxsat yo'q.");
     expect(helperNotice(connected())).toBeNull();
+  });
+
+  it('helper away: "Qayta ulanish" asks for a reconnect, and is busy (not disabled) while asked', () => {
+    const away = views.find(([name]) => name === 'disconnected')?.[1] ?? LOADING_VIEW;
+    const { all, elements } = treeOf({ engine: away });
+    button(elements, 'Qayta ulanish').props.onClick?.();
+    expect(all.onReconnect).toHaveBeenCalledTimes(1);
+    expect(() => button(elements, "Helper'ni o'rnatish")).toThrow();
+    const busy = treeOf({ engine: away, busy: new Set(['reconnect']) });
+    expect(button(busy.elements, 'Qayta ulanish').props).toMatchObject({ busy: true });
+    expect(button(busy.elements, 'Qayta ulanish').props.disabled).toBeUndefined();
+  });
+
+  it('no helper, or another version: "Qayta tekshirish", and the install button disabled with its reason', () => {
+    for (const name of ['not-installed', 'incompatible']) {
+      const engine = views.find(([view]) => view === name)?.[1] ?? LOADING_VIEW;
+      const { all, elements } = treeOf({ engine });
+      button(elements, 'Qayta tekshirish').props.onClick?.();
+      expect(all.onReconnect).toHaveBeenCalledTimes(1);
+      const install = button(elements, name === 'incompatible' ? "Helper'ni qayta o'rnatish" : "Helper'ni o'rnatish");
+      expect(install.props.disabled).toBe(true);
+      expect(install.props.label).toContain(INSTALL_UNAVAILABLE);
+    }
+  });
+
+  it('nothing to press while loading, connecting, stopping, unreadable from the main process, or with a broken config', () => {
+    for (const name of ['loading', 'connecting', 'stopped', 'unavailable', 'config-unreadable']) {
+      const engine = views.find(([view]) => view === name)?.[1] ?? LOADING_VIEW;
+      const words = text(render({ engine }));
+      expect(words).not.toContain('Qayta ulanish');
+      expect(words).not.toContain('Qayta tekshirish');
+    }
+    // The broken config is repaired in the rules window, which the footer button opens.
+    const broken = views.find(([view]) => view === 'config-unreadable')?.[1] ?? LOADING_VIEW;
+    expect(text(render({ engine: broken }))).toContain("«Qoidalar» bo'limida config'ni import qiling");
   });
 
   it('a stray state outside connected is never shown', () => {
@@ -285,6 +382,7 @@ describe('MenuBarScreen', () => {
       setEnabled: vi.fn(),
       apply: vi.fn(),
       openRulesWindow: vi.fn(),
+      reconnectHelper: vi.fn(),
     } satisfies Partial<RsApi>;
     const html = renderMarkup(createElement(MenuBarScreen, { rs }));
     expect(text(html)).toContain("Holat o'qilmoqda…");

@@ -8,25 +8,28 @@
 import { useCallback, useEffect, useState, type ReactElement } from 'react';
 
 import {
+  Banner,
   Button,
   CheckIcon,
+  HelperRecovery,
   IfaceTag,
   InterfaceCard,
   RouteIcon,
   StatusBadge,
   StatusDot,
   Toggle,
+  requestReconnect,
 } from '../../components';
 import { configStoreFor, useConfig, type ConfigView } from '../../hooks/useConfig';
 import { useEngineState, type EngineStateView } from '../../hooks/useEngineState';
 import { useNow } from '../../hooks/useNow';
-import type { RsApi, RsConnection, RsServiceOrder } from '../../rs';
-import { errorText, type Feedback } from '../../text';
+import type { RsApi, RsServiceOrder } from '../../rs';
+import { errorText, helperNotice, LOADING_NOTICE, networkWarnings, type Feedback } from '../../text';
 import { openRules, reapply, setRouting, type MenuBarApi } from './actions';
 import styles from './MenuBarScreen.module.css';
 import { defaultRole, interfacesKey, menuRules, statusLine, type MenuRule, type StatusLine } from './model';
 
-export type MenuBarAction = 'enabled' | 'apply' | 'rules';
+export type MenuBarAction = 'enabled' | 'apply' | 'rules' | 'reconnect';
 
 export interface MenuBarPanelProps {
   readonly engine: EngineStateView;
@@ -41,69 +44,8 @@ export interface MenuBarPanelProps {
   readonly onApply: () => void;
   readonly onOpenRules: () => void;
   readonly onReloadConfig: () => void;
-}
-
-/** What the window says in place of the interfaces and rules while there is no live state. */
-interface HelperNotice {
-  readonly title: string;
-  readonly text: string;
-  readonly tone: 'neutral' | 'warning' | 'danger';
-}
-
-const DISCONNECTED_TEXT: Readonly<Record<Extract<RsConnection, { kind: 'disconnected' }>['reason'], string>> = {
-  'not-running': "Helper ishlamayapti. U launchd orqali qayta ishga tushadi; bo'lmasa qayta o'rnating.",
-  'permission-denied': "Helper socket'iga ruxsat yo'q (foydalanuvchi staff guruhida emas).",
-  'connection-lost': 'Aloqa uzildi — qayta ulanmoqda.',
-  'protocol-error': "Helper tushunarsiz javob berdi — qayta ulanmoqda.",
-  timeout: 'Helper javob bermadi — qayta ulanmoqda.',
-  error: "Helper'ga ulanib bo'lmadi — qayta urinilmoqda.",
-};
-
-const LOADING_NOTICE: HelperNotice = { title: "Holat o'qilmoqda…", text: '', tone: 'neutral' };
-
-/** The notice for every helper status but `connected`; where it matters it says that applied routes stay with the helper. */
-export function helperNotice(engine: EngineStateView): HelperNotice | null {
-  const connection = engine.connection;
-  switch (engine.helper) {
-    case 'connected':
-      return null;
-    case 'loading':
-      return LOADING_NOTICE;
-    case 'connecting':
-      return { title: 'Helper bilan ulanmoqda…', text: '', tone: 'neutral' };
-    case 'not-installed':
-      return {
-        title: "Helper o'rnatilmagan",
-        text: "Routing uchun helper bir marta administrator paroli bilan o'rnatiladi. Qoidalar oynasini oching.",
-        tone: 'warning',
-      };
-    case 'disconnected':
-      return {
-        title: "Helper bilan aloqa yo'q",
-        text:
-          connection?.kind === 'disconnected'
-            ? `${DISCONNECTED_TEXT[connection.reason]} Qo'llangan route'lar helper'da qoladi.`
-            : "Qo'llangan route'lar helper'da qoladi.",
-        tone: 'danger',
-      };
-    case 'incompatible':
-      return {
-        title: 'Helper versiyasi mos emas',
-        text:
-          connection?.kind === 'incompatible'
-            ? `Helper v${connection.helperVersion} boshqa protokolda (${String(connection.protocolVersion)}, kerak: ${String(connection.expectedProtocolVersion)}). Helper'ni qayta o'rnating.`
-            : "Helper'ni qayta o'rnating.",
-        tone: 'danger',
-      };
-    case 'stopped':
-      return { title: "Ilova to'xtamoqda", text: '', tone: 'neutral' };
-    case 'unavailable':
-      return {
-        title: "Holatni o'qib bo'lmadi",
-        text: engine.error === null ? '' : errorText(engine.error.code),
-        tone: 'danger',
-      };
-  }
+  /** "Qayta ulanish" of the helper notice. */
+  readonly onReconnect: () => void;
 }
 
 function AlertIcon({ size = 14 }: { readonly size?: number }): ReactElement {
@@ -189,6 +131,20 @@ function RulesSection({ config, engine, now, onReloadConfig }: Pick<MenuBarPanel
   );
 }
 
+/** Rules waiting for an interface, both interfaces on one subnet (`networkWarnings`). */
+function Warnings({ engine, config }: { readonly engine: EngineStateView; readonly config: ConfigView }): ReactElement | null {
+  const state = engine.state;
+  const warnings = state === null ? [] : networkWarnings(state, config.config);
+  if (warnings.length === 0) return null;
+  return (
+    <div className={styles['warnings']}>
+      {warnings.map((warning) => (
+        <Banner key={warning.id} tone="warning" size="compact" title={warning.title} text={warning.text} />
+      ))}
+    </div>
+  );
+}
+
 function StatusRow({ line }: { readonly line: StatusLine }): ReactElement {
   return (
     <div className={styles['status']} data-tone={line.tone} role="status">
@@ -239,6 +195,7 @@ export function MenuBarPanel(props: MenuBarPanelProps): ReactElement {
           <div className={styles['notice']} data-tone={notice?.tone} role={notice?.tone === 'danger' ? 'alert' : 'status'}>
             <p className={styles['noticeTitle']}>{notice?.title}</p>
             {notice === null || notice.text === '' ? null : <p className={styles['noticeText']}>{notice.text}</p>}
+            <HelperRecovery recovery={notice?.recovery ?? null} onReconnect={props.onReconnect} reconnecting={busy.has('reconnect')} />
           </div>
         ) : (
           <>
@@ -249,6 +206,7 @@ export function MenuBarPanel(props: MenuBarPanelProps): ReactElement {
               <InterfaceCard role="wifi" iface={state.interfaces.wifi} isDefault={preferred === 'wifi'} />
               <InterfaceCard role="ethernet" iface={state.interfaces.ethernet} isDefault={preferred === 'ethernet'} />
             </section>
+            <Warnings engine={engine} config={props.config} />
             <RulesSection config={props.config} engine={engine} now={props.now} onReloadConfig={props.onReloadConfig} />
             <StatusRow line={statusLine(state, props.now)} />
           </>
@@ -275,7 +233,7 @@ export function MenuBarPanel(props: MenuBarPanelProps): ReactElement {
 
 export interface MenuBarScreenProps {
   /** The preload API; `window.rs` in the app. */
-  readonly rs?: MenuBarApi & Pick<RsApi, 'getState' | 'onState' | 'getConfig' | 'getServiceOrder'>;
+  readonly rs?: MenuBarApi & Pick<RsApi, 'getState' | 'onState' | 'getConfig' | 'getServiceOrder' | 'reconnectHelper'>;
 }
 
 /** The screen of the menu bar window (`?view=popover`). */
@@ -350,6 +308,9 @@ export function MenuBarScreen({ rs: given }: MenuBarScreenProps): ReactElement {
       }}
       onReloadConfig={() => {
         configStoreFor(rs).reload();
+      }}
+      onReconnect={() => {
+        run('reconnect', () => requestReconnect(rs));
       }}
     />
   );

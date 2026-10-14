@@ -2,7 +2,6 @@ export { openRules, reapply, setRouting, type MenuBarApi } from './actions';
 export {
   MenuBarPanel,
   MenuBarScreen,
-  helperNotice,
   type MenuBarAction,
   type MenuBarPanelProps,
   type MenuBarScreenProps,

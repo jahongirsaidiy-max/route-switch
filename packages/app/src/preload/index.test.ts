@@ -48,6 +48,8 @@ const INVOKES = [
   ['copyServiceOrderCommand', [], 'rs:copyServiceOrderCommand'],
   ['uninstallHelper', [], 'rs:uninstall'],
   ['openRulesWindow', [], 'rs:openRulesWindow'],
+  ['reconnectHelper', [], 'rs:reconnect'],
+  ['resetConfig', [], 'rs:resetConfig'],
 ] as const;
 
 describe('preload', () => {

@@ -80,6 +80,16 @@
   font-weight: var(--rs-weight-semibold);
 }
 
+/* Why the helper is away (derived): the box's 11px, muted; a refused reconnect in the danger tone. */
+.helperText {
+  color: var(--rs-color-text-muted);
+  line-height: var(--rs-line-height);
+}
+
+.helperText[data-tone='danger'] {
+  color: var(--rs-color-danger-soft-text);
+}
+
 .main {
   flex: 1;
   min-width: 0;

@@ -30,6 +30,26 @@ export interface TrayAppearance {
 export const INITIAL_APPEARANCE: TrayAppearance = { kind: 'off', tooltip: 'RouteSwitch — ulanmoqda…' };
 
 /**
+ * Rules waiting for their interface (`pending`: `interface-down`,
+ * `no-gateway`), and whether both roles are up behind the same gateway (one
+ * subnet: which interface a gateway route leaves through is the system's
+ * choice). Neither is an error — the icon stays `active` — but the tooltip
+ * says so.
+ */
+function connectedNotes(state: EngineState): string {
+  const notes: string[] = [];
+  const waiting = state.rules.filter(
+    (rule) => rule.status === 'pending' && (rule.reasonCode === 'interface-down' || rule.reasonCode === 'no-gateway'),
+  ).length;
+  if (waiting > 0) notes.push(`${String(waiting)} ta qoida interfeysni kutmoqda`);
+  const { ethernet, wifi } = state.interfaces;
+  if (ethernet.up && wifi.up && ethernet.gateway !== null && ethernet.gateway === wifi.gateway) {
+    notes.push('Ethernet va Wi‑Fi bitta tarmoqda');
+  }
+  return notes.map((note) => ` · ${note}`).join('');
+}
+
+/**
  * The icon for a connection status and the engine state that goes with it.
  * `connecting` (and `stopped`, on the way out) keep the current look, so a
  * helper that is retried every few seconds does not make the icon flicker.
@@ -45,11 +65,14 @@ export function trayAppearance(status: HelperStatus, state: EngineState | null, 
       return { kind: 'error', tooltip: "RouteSwitch — helper bilan aloqa yo'q" };
     case 'incompatible':
       return { kind: 'error', tooltip: 'RouteSwitch — helper versiyasi mos emas' };
+    case 'config-unreadable':
+      return { kind: 'error', tooltip: "RouteSwitch — helper config'i buzilgan, qoidalar qo'llanmaydi" };
     case 'connected': {
       if (state === null || !state.enabled) return { kind: 'off', tooltip: "RouteSwitch — o'chirilgan" };
       const failing = state.rules.filter((rule) => rule.status === 'error').length;
-      if (failing > 0) return { kind: 'error', tooltip: `RouteSwitch — ${String(failing)} ta qoidada xato` };
-      return { kind: 'active', tooltip: 'RouteSwitch — faol' };
+      const notes = connectedNotes(state);
+      if (failing > 0) return { kind: 'error', tooltip: `RouteSwitch — ${String(failing)} ta qoidada xato${notes}` };
+      return { kind: 'active', tooltip: `RouteSwitch — faol${notes}` };
     }
   }
 }
@@ -99,7 +122,7 @@ export interface ShellDeps {
   readonly images: Readonly<Record<TrayIconKind, NativeImage>>;
   readonly buildMenu: (template: MenuItemConstructorOptions[]) => Menu;
   readonly ipcMain: IpcMainLike;
-  readonly helperClient: Pick<HelperClient, 'request' | 'snapshot' | 'onStatus' | 'onState' | 'onLog'>;
+  readonly helperClient: Pick<HelperClient, 'request' | 'snapshot' | 'reconnectNow' | 'onStatus' | 'onState' | 'onLog'>;
   readonly workAreaAt: WindowManagerDeps['workAreaAt'];
   readonly activateApp: () => void;
   /** Ends the app (`app.quit()`); the helper keeps running. */

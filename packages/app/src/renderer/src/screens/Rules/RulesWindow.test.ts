@@ -53,6 +53,66 @@ describe('RulesWindowFrame', () => {
   });
 });
 
+describe('RulesWindowFrame — helper away (TASK-300)', () => {
+  const AWAY: EngineStateView = { helper: 'disconnected', connection: { kind: 'disconnected', reason: 'not-running' }, state: null, error: null };
+  const withReconnect = (engine: EngineStateView, extra: { reconnecting?: boolean; reconnectFeedback?: { tone: 'danger'; text: string } | null } = {}) => {
+    const onReconnect = vi.fn();
+    const element = RulesWindowFrame({
+      section: 'log',
+      engine,
+      onSelect: vi.fn(),
+      onReconnect,
+      ...extra,
+      children: createElement('p', null, 'screen'),
+    });
+    return { onReconnect, element, html: renderMarkup(element) };
+  };
+  /** The tree with the function components expanded (they are hook-free). */
+  function expanded(node: ReactNode): ReactElement<AnyProps & { busy?: boolean; disabled?: boolean; label?: string }>[] {
+    if (Array.isArray(node)) return (node as ReactNode[]).flatMap(expanded);
+    if (!isValidElement<AnyProps>(node)) return [];
+    const own = [node, ...expanded(node.props.children)];
+    if (typeof node.type === 'function' && node.type.name !== 'Button') own.push(...expanded((node.type as (p: AnyProps) => ReactNode)(node.props)));
+    return own;
+  }
+
+  it('every section shows why the helper is away and offers "Qayta ulanish"', () => {
+    const { html, element, onReconnect } = withReconnect(AWAY);
+    expect(html).toContain('Helper ishlamayapti');
+    expect(html).toContain('U launchd orqali qayta ishga tushadi');
+    expect(html).toContain('Qayta ulanish');
+    const button = expanded(element).find((node) => node.type !== 'button' && node.props.children === 'Qayta ulanish');
+    button?.props.onClick?.();
+    expect(onReconnect).toHaveBeenCalledTimes(1);
+  });
+
+  it('no helper: "Qayta tekshirish" and the disabled install button', () => {
+    const { html } = withReconnect({ helper: 'not-installed', connection: { kind: 'not-installed' }, state: null, error: null });
+    expect(html).toContain('Qayta tekshirish');
+    expect(html).toMatch(/<button[^>]*aria-label="Helper&#x27;ni o&#x27;rnatish — Ilova ichidan o&#x27;rnatish hali qo&#x27;shilmagan" disabled=""/);
+  });
+
+  it('busy while asked; a refused request is an alert in the box', () => {
+    expect(withReconnect(AWAY, { reconnecting: true }).html).toContain('aria-busy="true"');
+    const refused = withReconnect(AWAY, { reconnectFeedback: { tone: 'danger', text: "Bu oynadan ruxsat yo'q." } }).html;
+    expect(refused).toMatch(/role="alert"[^>]*>Bu oynadan ruxsat yo&#x27;q\./);
+  });
+
+  it('connected: no reason line and no button; without a handler, no button either', () => {
+    const { html } = withReconnect(CONNECTED);
+    expect(html).not.toContain('Qayta ulanish');
+    expect(html).not.toContain('launchd');
+    expect(renderMarkup(frame('rules', AWAY))).not.toContain('Qayta ulanish');
+  });
+
+  it('a broken stored config: the box says so and how to repair it (in «Qoidalar»)', () => {
+    const { html } = withReconnect({ helper: 'config-unreadable', connection: { kind: 'config-unreadable', helperVersion: '0.1.0' }, state: null, error: null });
+    expect(html).toContain('Helper config&#x27;i buzilgan');
+    expect(html).toContain('«Qoidalar» bo&#x27;limida');
+    expect(html).not.toContain('Qayta ulanish');
+  });
+});
+
 describe('SECTION_SCREENS', () => {
   const onAddRule = vi.fn();
   const onEditRule = vi.fn();

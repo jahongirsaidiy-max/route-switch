@@ -6,7 +6,7 @@ import { Button } from '../../components';
 import { renderMarkup } from '../../components/test-utils';
 import type { EngineStateView } from '../../hooks/useEngineState';
 import type { RsServiceOrder } from '../../rs';
-import { SettingsPanel, SettingsScreen, type SettingsPanelProps } from './SettingsScreen';
+import { focusUninstallButton, SettingsPanel, SettingsScreen, type SettingsPanelProps } from './SettingsScreen';
 
 const STATE: EngineState = {
   helperVersion: '0.1.0',
@@ -66,6 +66,12 @@ interface AnyProps {
   readonly children?: ReactNode;
   readonly onClick?: () => void;
   readonly onChange?: (event: { target: { value: string } }) => void;
+  readonly autoFocus?: boolean;
+  readonly busy?: boolean;
+  readonly disabled?: boolean;
+  readonly role?: string;
+  readonly ref?: unknown;
+  readonly onKeyDown?: (event: { key: string }) => void;
 }
 function elementsOf(node: ReactNode): ReactElement<AnyProps>[] {
   if (Array.isArray(node)) return (node as ReactNode[]).flatMap(elementsOf);
@@ -196,6 +202,37 @@ describe('SettingsPanel: helper', () => {
     expect(confirming.all.onConfirmUninstall).toHaveBeenCalledTimes(1);
   });
 
+  it('the question takes the focus on its safe choice; busy (not disabled) while uninstalling; Escape cancels unless busy (TASK-300)', () => {
+    const confirming = treeOf({ confirmingUninstall: true });
+    const [cancel] = buttonsNamed(confirming.elements, 'Bekor qilish');
+    expect(cancel?.props.autoFocus).toBe(true);
+    const dialog = confirming.elements.find((element) => element.props.role === 'alertdialog');
+    dialog?.props.onKeyDown?.({ key: 'Enter' });
+    expect(confirming.all.onCancelUninstall).not.toHaveBeenCalled();
+    dialog?.props.onKeyDown?.({ key: 'Escape' });
+    expect(confirming.all.onCancelUninstall).toHaveBeenCalledTimes(1);
+
+    const busy = treeOf({ confirmingUninstall: true, busy: new Set(['helper']) });
+    const [busyCancel] = buttonsNamed(busy.elements, 'Bekor qilish');
+    expect(busyCancel?.props.busy).toBe(true);
+    expect(busyCancel?.props.disabled).toBeUndefined();
+    busy.elements.find((element) => element.props.role === 'alertdialog')?.props.onKeyDown?.({ key: 'Escape' });
+    expect(busy.all.onCancelUninstall).not.toHaveBeenCalled();
+  });
+
+  it('the uninstall button carries the ref the focus returns to', () => {
+    const ref = { current: null };
+    const [start] = buttonsNamed(treeOf({ uninstallRef: ref }).elements, "Helper'ni o'chirish");
+    expect(start?.props.ref).toBe(ref);
+  });
+
+  it('a helper whose stored config is unreadable can still be uninstalled (TASK-300)', () => {
+    const engine: EngineStateView = { helper: 'config-unreadable', connection: { kind: 'config-unreadable', helperVersion: '0.1.0' }, state: null, error: null };
+    const [start] = buttonsNamed(treeOf({ engine }).elements, "Helper'ni o'chirish");
+    expect(start?.props.disabled).toBe(false);
+    expect(render({ engine })).toContain('Helper config&#x27;i buzilgan');
+  });
+
   it('confirms, then shows the result', () => {
     const confirming = render({ confirmingUninstall: true });
     expect(confirming).toContain('role="alertdialog"');
@@ -227,5 +264,16 @@ describe('SettingsScreen', () => {
     expect(rs.setIfaceOverrides).not.toHaveBeenCalled();
     expect(rs.copyServiceOrderCommand).not.toHaveBeenCalled();
     expect(rs.uninstallHelper).not.toHaveBeenCalled();
+  });
+});
+
+describe('focusUninstallButton (TASK-300)', () => {
+  it('only an enabled button still on the page gets the focus (after an uninstall it is disabled)', () => {
+    const focus = vi.fn();
+    expect(focusUninstallButton({ isConnected: true, disabled: false, focus })).toBe(true);
+    expect(focusUninstallButton({ isConnected: true, disabled: true, focus })).toBe(false);
+    expect(focusUninstallButton({ isConnected: false, disabled: false, focus })).toBe(false);
+    expect(focusUninstallButton(null)).toBe(false);
+    expect(focus).toHaveBeenCalledTimes(1);
   });
 });

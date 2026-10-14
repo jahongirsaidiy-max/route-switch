@@ -1,4 +1,5 @@
-// "Jurnal": the helper's last 500 log lines, newest first, with a level
+// "Jurnal": the last 500 lines — the helper's, and the app's own about the
+// helper connection (tagged "Ilova") — newest first, with a level
 // filter. The design has no journal screen (GAP-01): it follows the rules
 // window — page header, toolbar, bordered table, status footer.
 
@@ -100,7 +101,8 @@ export function LogPanel({ view, filter, onFilterChange, now }: LogPanelProps): 
           Jurnal
         </h1>
         <p className={styles['subtitle']}>
-          Helper'ning oxirgi {LOG_VIEW_LIMIT} ta xabari. Ilova ishga tushgandan beri kelganlari saqlanadi.
+          Helper'ning oxirgi {LOG_VIEW_LIMIT} ta xabari va ilovaning helper bilan aloqa haqidagi yozuvlari. Ilova ishga tushgandan
+          beri kelganlari saqlanadi.
         </p>
       </header>
 
@@ -132,7 +134,14 @@ export function LogPanel({ view, filter, onFilterChange, now }: LogPanelProps): 
                 <span>
                   <LevelBadge level={entry.level} />
                 </span>
-                <span className={styles['message']}>{entry.msg}</span>
+                <span className={styles['message']}>
+                  {entry.source === 'app' ? (
+                    <span className={styles['source']} title="Ilovaning o'z yozuvi (helper emas)">
+                      Ilova
+                    </span>
+                  ) : null}
+                  {entry.msg}
+                </span>
               </li>
             ))}
           </ol>

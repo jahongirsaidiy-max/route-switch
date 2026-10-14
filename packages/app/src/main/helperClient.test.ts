@@ -282,6 +282,157 @@ describe('handshake failures', () => {
     }
   });
 
+  describe('a stored config the helper cannot load (TASK-300)', () => {
+    /** Handshake whose getConfig the helper refuses as `operation-failed` (TASK-114: broken config.json). */
+    async function unreadable(state: EngineState = engineState(4, 2)) {
+      const h = setup();
+      h.client.start();
+      const socket = h.socket();
+      socket.emit('connect');
+      await flush();
+      socket.receive(ok(0, statusResult(state)));
+      await flush();
+      socket.receive(refused(1, 'The stored config could not be loaded (invalid-json)', 'operation-failed'));
+      await flush();
+      return { ...h, live: socket };
+    }
+
+    it('stays connected as config-unreadable: no state or config, requests allowed, no retry loop', async () => {
+      const h = await unreadable();
+      expect(h.live.destroyed).toBe(false);
+      expect(h.client.snapshot()).toEqual({
+        status: { kind: 'config-unreadable', helperVersion: '1.2.3' },
+        state: null,
+        config: null,
+        configRevision: null,
+      });
+      expect(h.statuses).toEqual([{ kind: 'connecting' }, { kind: 'config-unreadable', helperVersion: '1.2.3' }]);
+      expect(h.states).toEqual([]);
+      expect(h.configs).toEqual([]);
+      expect(h.scheduler.pending()).toEqual([]);
+      expect(h.warnings().some((entry) => entry['status'] === 'config-unreadable')).toBe(true);
+      // A request goes out (the user may apply or test); getConfig is not asked again by itself.
+      void h.client.request('apply');
+      await flush();
+      expect(h.live.requests().map((request) => request.method)).toEqual(['status', 'getConfig', 'apply']);
+    });
+
+    it('states of the same config revision ask for nothing; a newer revision tries once, and a refusal does not retry', async () => {
+      const h = await unreadable(engineState(4, 2));
+      for (let seq = 5; seq < 25; seq += 1) h.live.receive({ event: 'state', state: engineState(seq, 2) });
+      await flush();
+      expect(h.live.requests().map((request) => request.method)).toEqual(['status', 'getConfig']);
+      // Kept, not published: to subscribers `state` stays null while the config is unreadable.
+      expect(h.states).toEqual([]);
+      expect(h.scheduler.pending()).toEqual([]);
+      // Another client stored a config: one getConfig …
+      h.live.receive({ event: 'state', state: engineState(30, 3) });
+      await flush();
+      expect(h.live.lastRequest().method).toBe('getConfig');
+      // … still unreadable (say, refused again): no timer, and revision 3 is not asked again.
+      h.live.receive(refused(h.live.lastRequest().id, 'still broken', 'operation-failed'));
+      await flush();
+      h.live.receive({ event: 'state', state: engineState(31, 3) });
+      await flush();
+      expect(h.live.requests().filter((request) => request.method === 'getConfig')).toHaveLength(2);
+      expect(h.scheduler.pending()).toEqual([]);
+      expect(h.client.snapshot().status.kind).toBe('config-unreadable');
+      expect(h.states).toEqual([]);
+    });
+
+    it('a getConfig that succeeds after a newer revision makes the connection connected, with its state and config', async () => {
+      const h = await unreadable(engineState(4, 2));
+      h.live.receive({ event: 'state', state: engineState(5, 3) });
+      await flush();
+      h.live.receive(ok(h.live.lastRequest().id, { config: oneRuleConfig(), configRevision: 3 }));
+      await flush();
+      expect(h.client.snapshot()).toEqual({
+        status: { kind: 'connected', helperVersion: '1.2.3' },
+        state: engineState(5, 3),
+        config: oneRuleConfig(),
+        configRevision: 3,
+      });
+      expect(h.statuses.at(-1)).toEqual({ kind: 'connected', helperVersion: '1.2.3' });
+      expect(h.configs).toEqual([oneRuleConfig()]);
+      // The state that arrived while unreadable is published once, on recovery.
+      expect(h.states).toEqual([engineState(5, 3)]);
+    });
+
+    it('a setConfig repairs it: connected with the stored config and the state of the result, without another getConfig', async () => {
+      const h = await unreadable(engineState(4, 2));
+      const seen: unknown[] = [];
+      h.client.onStatus((status) => {
+        if (status.kind === 'connected') seen.push(h.client.snapshot());
+      });
+      const result = h.client.request('setConfig', { config: emptyConfig() });
+      await flush();
+      expect(h.live.lastRequest().method).toBe('setConfig');
+      h.live.receive({ event: 'state', state: engineState(5, 2) });
+      expect(h.states).toEqual([]);
+      h.live.receive(ok(h.live.lastRequest().id, { config: emptyConfig(), state: engineState(6, 3) }));
+      expect((await result).ok).toBe(true);
+      await flush();
+      // Nothing while unreadable; the repaired state exactly once (`leaveUnreadable` is the one publish point).
+      expect(h.states).toEqual([engineState(6, 3)]);
+      const repaired = { status: { kind: 'connected', helperVersion: '1.2.3' }, state: engineState(6, 3), config: emptyConfig(), configRevision: 3 };
+      expect(h.client.snapshot()).toEqual(repaired);
+      // Subscribers of the status see the complete snapshot when it turns connected.
+      expect(seen).toEqual([repaired]);
+      expect(h.configs).toEqual([emptyConfig()]);
+      expect(h.live.requests().map((request) => request.method)).toEqual(['status', 'getConfig', 'setConfig']);
+      // From now on the usual rules: a newer state fetches the config.
+      h.live.receive({ event: 'state', state: engineState(7, 4) });
+      await flush();
+      expect(h.live.lastRequest().method).toBe('getConfig');
+    });
+
+    it('a refused setConfig leaves it config-unreadable', async () => {
+      const h = await unreadable();
+      const result = h.client.request('setConfig', { config: emptyConfig() });
+      await flush();
+      h.live.receive(refused(h.live.lastRequest().id, 'The config could not be saved (EACCES)', 'operation-failed'));
+      expect(await result).toMatchObject({ ok: false, code: 'operation-failed' });
+      expect(h.client.snapshot().status.kind).toBe('config-unreadable');
+    });
+
+    it('other getConfig failures still drop the connection; a reconnect starts over', async () => {
+      const h = await unreadable();
+      h.live.emit('close');
+      expect(h.client.snapshot().status).toEqual({ kind: 'disconnected', reason: 'connection-lost' });
+      h.scheduler.advance(RECONNECT_DELAY_MS);
+      const next = await handshake(h, engineState(1, 1), oneRuleConfig());
+      expect(next).not.toBe(h.live);
+      expect(h.client.snapshot().status).toEqual({ kind: 'connected', helperVersion: '1.2.3' });
+      expect(h.client.snapshot().config).toEqual(oneRuleConfig());
+    });
+  });
+
+  it('reconnectNow() shows the attempt as connecting; it does nothing while connected or already connecting', async () => {
+    const h = setup();
+    h.client.start();
+    h.socket().emit('error', socketError('ECONNREFUSED'));
+    expect(h.client.snapshot().status).toEqual({ kind: 'disconnected', reason: 'not-running' });
+    h.client.reconnectNow();
+    expect(h.statuses.at(-1)).toEqual({ kind: 'connecting' });
+    expect(h.sockets).toHaveLength(2);
+    h.client.reconnectNow();
+    expect(h.sockets).toHaveLength(2);
+    // The same failure again is a change again, so the user sees it.
+    h.socket().emit('error', socketError('ECONNREFUSED'));
+    expect(h.statuses.slice(-3)).toEqual([
+      { kind: 'disconnected', reason: 'not-running' },
+      { kind: 'connecting' },
+      { kind: 'disconnected', reason: 'not-running' },
+    ]);
+    h.scheduler.advance(RECONNECT_DELAY_MS);
+    await handshake(h);
+    expect(h.client.snapshot().status.kind).toBe('connected');
+    const before = h.statuses.length;
+    h.client.reconnectNow();
+    expect(h.statuses).toHaveLength(before);
+    expect(h.sockets).toHaveLength(3);
+  });
+
   it('times out a handshake the helper never answers', async () => {
     const h = setup();
     h.client.start();
@@ -1148,7 +1299,8 @@ describe('timers and bookkeeping', () => {
     }
     const statusLines = h.entries.filter((entry) => entry.msg === 'Helper connection status changed');
     expect(statusLines.length).toBe(5);
-    expect(statusLines.map((entry) => entry['status'])).toEqual(['connecting', 'connected', 'disconnected', 'connected', 'disconnected']);
+    // `reconnectNow()` shows its attempt as `connecting` (TASK-300).
+    expect(statusLines.map((entry) => entry['status'])).toEqual(['connecting', 'connected', 'disconnected', 'connecting', 'connected']);
     expect(h.entries.filter((entry) => entry['kind'] === 'helper-status')).toHaveLength(1);
     expect(h.statuses.length).toBeGreaterThan(60); // subscribers still hear every change
 
@@ -1466,8 +1618,10 @@ describe('subscribers that call back into the client', () => {
     h.live.emit('close');
     expect(h.sockets).toHaveLength(2);
     expect(h.scheduler.pending()).toEqual([DEFAULT_TIMEOUTS.connectMs]);
-    // The status is still `disconnected`, so later subscribers are told as well.
-    expect(late).toEqual([{ kind: 'disconnected', reason: 'connection-lost' }]);
+    // The reconnect made the status `connecting` (TASK-300) before the later
+    // subscriber's turn: it hears that, the current status, not the stale one.
+    expect(late).toEqual([{ kind: 'connecting' }]);
+    expect(h.client.snapshot().status).toEqual({ kind: 'connecting' });
   });
 
   it('request() from a subscriber is sent after the current line, in order, and answered', async () => {

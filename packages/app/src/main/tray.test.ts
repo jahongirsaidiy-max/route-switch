@@ -30,6 +30,15 @@ const ruleState = (status: 'active' | 'error'): RuleState => ({
   lastResolvedAt: null,
 });
 
+const waiting = (reasonCode: 'interface-down' | 'no-gateway' | 'resolving'): RuleState => ({
+  ruleId: RULE_ID,
+  status: 'pending',
+  reasonCode,
+  reason: null,
+  appliedDestinations: [],
+  lastResolvedAt: null,
+});
+
 describe('trayAppearance', () => {
   const current: TrayAppearance = { kind: 'active', tooltip: 'previous' };
   const connected: HelperStatus = { kind: 'connected', helperVersion: '1.2.3' };
@@ -44,6 +53,8 @@ describe('trayAppearance', () => {
     ['helper not running', { kind: 'disconnected', reason: 'not-running' }, null, 'error'],
     ['no permission on the socket', { kind: 'disconnected', reason: 'permission-denied' }, null, 'error'],
     ['incompatible helper', { kind: 'incompatible', helperVersion: '9.0.0', protocolVersion: 9, expectedProtocolVersion: 1 }, null, 'error'],
+    ['stored config unreadable (TASK-300)', { kind: 'config-unreadable', helperVersion: '1.2.3' }, null, 'error'],
+    ['a rule waiting for its interface is not an error', connected, engineState(1, 1, { rules: [waiting('interface-down')] }), 'active'],
   ])('%s → %s', (_name, status, state, kind) => {
     expect(trayAppearance(status, state, current).kind).toBe(kind);
   });
@@ -56,6 +67,34 @@ describe('trayAppearance', () => {
   it('says in the tooltip how many rules fail', () => {
     const state = engineState(1, 1, { rules: [ruleState('error'), ruleState('error')] });
     expect(trayAppearance(connected, state, current).tooltip).toBe('RouteSwitch — 2 ta qoidada xato');
+  });
+
+  it('says why the stored config stops everything', () => {
+    expect(trayAppearance({ kind: 'config-unreadable', helperVersion: '1.2.3' }, null, current).tooltip).toBe(
+      "RouteSwitch — helper config'i buzilgan, qoidalar qo'llanmaydi",
+    );
+  });
+
+  it('notes rules waiting for an interface (down or without a gateway) — not those resolving — and errors first', () => {
+    const state = engineState(1, 1, { rules: [waiting('interface-down'), waiting('no-gateway'), waiting('resolving')] });
+    expect(trayAppearance(connected, state, current)).toEqual({ kind: 'active', tooltip: 'RouteSwitch — faol · 2 ta qoida interfeysni kutmoqda' });
+    const failing = engineState(1, 1, { rules: [ruleState('error'), waiting('interface-down')] });
+    expect(trayAppearance(connected, failing, current).tooltip).toBe('RouteSwitch — 1 ta qoidada xato · 1 ta qoida interfeysni kutmoqda');
+  });
+
+  it('notes both interfaces on one subnet (one gateway, both up), and only then', () => {
+    const base = engineState(1);
+    const both = (ethernetGateway: string | null, wifiUp = true): EngineState => ({
+      ...base,
+      interfaces: {
+        ethernet: { device: 'en5', ip: '192.168.1.20', gateway: ethernetGateway, up: true },
+        wifi: { device: 'en0', ip: wifiUp ? '192.168.1.30' : null, gateway: wifiUp ? '192.168.1.1' : null, up: wifiUp },
+      },
+    });
+    expect(trayAppearance(connected, both('192.168.1.1'), current).tooltip).toBe('RouteSwitch — faol · Ethernet va Wi‑Fi bitta tarmoqda');
+    expect(trayAppearance(connected, both('10.0.0.1'), current).tooltip).toBe('RouteSwitch — faol');
+    expect(trayAppearance(connected, both(null), current).tooltip).toBe('RouteSwitch — faol');
+    expect(trayAppearance(connected, both('192.168.1.1', false), current).tooltip).toBe('RouteSwitch — faol');
   });
 
   it('starts in the neutral look', () => {
@@ -244,9 +283,10 @@ function shellHarness() {
   let snapshot: HelperSnapshot = { status: { kind: 'connecting' }, state: null, config: null, configRevision: null };
   const statusListeners = new Set<(status: HelperStatus) => void>();
   const stateListeners = new Set<(state: EngineState) => void>();
-  const helperClient: Pick<HelperClient, 'request' | 'snapshot' | 'onStatus' | 'onState' | 'onLog'> = {
+  const helperClient: Pick<HelperClient, 'request' | 'snapshot' | 'reconnectNow' | 'onStatus' | 'onState' | 'onLog'> = {
     request: () => Promise.reject(new Error('not used')),
     snapshot: () => snapshot,
+    reconnectNow: () => undefined,
     onStatus: (listener) => {
       statusListeners.add(listener);
       return () => statusListeners.delete(listener);
@@ -416,7 +456,11 @@ describe('startShell', () => {
     const h = shellHarness();
     h.tray().click();
     h.setHelper({ kind: 'not-installed' }, null);
-    expect(h.windows[0]?.sent).toEqual([[STATE_CHANNEL, { connection: { kind: 'not-installed' }, state: null }]]);
+    expect(h.windows[0]?.sent).toEqual([
+      [STATE_CHANNEL, { connection: { kind: 'not-installed' }, state: null }],
+      // The app's own journal line about it (TASK-300).
+      ['rs:log', { seq: 1, level: 'warn', msg: "Helper o'rnatilmagan — qoidalar qo'llanmaydi", at: expect.any(String) as string, source: 'app' }],
+    ]);
   });
 
   it('showPopover opens the popover under the tray icon', () => {

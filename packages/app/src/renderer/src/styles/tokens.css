@@ -39,6 +39,7 @@
   --rs-text-brand: 15px; /* popover header, 600 */
   --rs-text-body: 13px; /* buttons, inputs, names */
   --rs-text-mono-body: 12.5px; /* rule target in the table */
+  --rs-text-mono-small: 11.5px; /* command previews (add-rule form, settings), mono */
   --rs-text-small: 12px; /* hints, secondary columns, field labels */
   --rs-text-caption: 11px; /* section labels (uppercase), mono details */
   --rs-text-tag: 10px; /* ETH / WIFI / DEFAULT / status tags, 600 */

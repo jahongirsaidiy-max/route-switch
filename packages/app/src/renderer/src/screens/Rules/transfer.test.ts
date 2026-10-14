@@ -8,6 +8,7 @@ import type { ConfigView } from '../../hooks/useConfig';
 import type { RsResult } from '../../rs';
 import { CONFIG, ID, NOW, STATE } from '../MenuBar/fixtures';
 import type { RulesUiState } from './controller';
+import { INITIAL_RECOVERY_UI } from './recovery';
 import { RulesPanel, type RulesPanelProps } from './RulesScreen';
 import {
   createTransferController,
@@ -244,6 +245,10 @@ const panelProps = (extra: Partial<RulesPanelProps> = {}): RulesPanelProps => ({
   onExport: vi.fn(),
   onConfirmImport: vi.fn(),
   onCancelImport: vi.fn(),
+  recovery: INITIAL_RECOVERY_UI,
+  onAskReset: vi.fn(),
+  onCancelReset: vi.fn(),
+  onConfirmReset: vi.fn(),
   ...extra,
 });
 const buttonNamed = (elements: ReactElement<AnyProps>[], name: string) =>

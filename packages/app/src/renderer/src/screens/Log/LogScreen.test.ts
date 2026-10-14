@@ -108,6 +108,14 @@ describe('LogPanel', () => {
     expect(rowsOf(failed)).toHaveLength(1);
   });
 
+  it("tags the app's own entries (TASK-300); the helper's carry no tag", () => {
+    const html = render(ready([...ENTRIES, { seq: 5, level: 'warn', msg: "Helper bilan aloqa yo'q: aloqa uzildi", at: at(11, 5, 0), source: 'app' }]));
+    const rows = rowsOf(html);
+    expect(rows[0]).toContain('>Ilova</span>');
+    expect(rows[0]).toContain('Helper bilan aloqa yo&#x27;q: aloqa uzildi');
+    expect(rows.slice(1).some((row) => row.includes('>Ilova<'))).toBe(false);
+  });
+
   it('renders messages as text, never as markup', () => {
     const html = render(ready([{ seq: 1, level: 'info', msg: '<img src=x onerror=alert(1)>', at: at(10, 0, 0) }]));
     expect(html).not.toContain('<img');

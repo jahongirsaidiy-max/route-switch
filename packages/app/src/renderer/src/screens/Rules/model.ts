@@ -4,7 +4,7 @@
 import { findOverlaps, type Config, type EngineState, type IfaceRole, type RuleState } from '@routeswitch/shared';
 
 import { ROLE_TAGS } from '../../components';
-import { isActiveWarning, ruleReasonText } from '../../text';
+import { isActiveWarning, lastKnownText, ruleReasonText } from '../../text';
 
 type ConfigRule = Config['rules'][number];
 
@@ -31,6 +31,8 @@ export interface RuleRow {
   /** The note, or what a domain rule is doing ("DNS: …", "3 IP · har 10 daq"). */
   readonly detail: string;
   readonly status: RowStatus;
+  /** A domain rule in `error`: the addresses it still routes from its last answer (`lastKnownText`); null otherwise. */
+  readonly lastKnown: string | null;
 }
 
 export function kindLabel(rule: Pick<ConfigRule, 'kind' | 'dns'>): string {
@@ -57,8 +59,8 @@ export function rowStatus(state: RuleState | null): RowStatus {
   return { kind: state.status, text: text ?? '' };
 }
 
-/** Every rule of the config, in config order, with its state. */
-export function ruleRows(config: Config, state: EngineState): RuleRow[] {
+/** Every rule of the config, in config order, with its state; `now` dates the last known addresses. */
+export function ruleRows(config: Config, state: EngineState, now: number): RuleRow[] {
   const states = new Map(state.rules.map((rule) => [rule.ruleId, rule]));
   return config.rules.map((rule) => {
     const ruleState = states.get(rule.id) ?? null;
@@ -71,6 +73,7 @@ export function ruleRows(config: Config, state: EngineState): RuleRow[] {
       device: state.interfaces[rule.iface].device,
       detail: rowDetail(rule, ruleState),
       status: rowStatus(ruleState),
+      lastKnown: ruleState === null || !rule.enabled ? null : lastKnownText(rule, ruleState, now),
     };
   });
 }

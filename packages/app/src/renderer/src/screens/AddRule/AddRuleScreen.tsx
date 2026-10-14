@@ -339,10 +339,7 @@ export function AddRulePanel(props: AddRulePanelProps): ReactElement {
           if (ready) props.onSave();
         }}
         onKeyDown={(event) => {
-          if (event.key === 'Escape') {
-            event.preventDefault();
-            props.onCancel();
-          }
+          handleDialogEscape(event, ui.saving, props.onCancel);
         }}
       >
         <header className={styles['header']}>
@@ -382,7 +379,8 @@ export function AddRulePanel(props: AddRulePanelProps): ReactElement {
         )}
 
         <footer className={styles['footer']}>
-          <Button size="lg" autoFocus={!ready} onClick={props.onCancel}>
+          {/* While a save is on its way the form stays: its outcome (a refusal, say) is shown here. */}
+          <Button size="lg" autoFocus={!ready} busy={ui.saving} onClick={props.onCancel}>
             Bekor qilish
           </Button>
           {ready ? (
@@ -394,6 +392,27 @@ export function AddRulePanel(props: AddRulePanelProps): ReactElement {
       </form>
     </div>
   );
+}
+
+/** The part of a keyboard event the dialog's Escape reads. */
+export interface DialogKeyEvent {
+  readonly key: string;
+  readonly defaultPrevented: boolean;
+  preventDefault(): void;
+}
+
+/**
+ * Escape closes the dialog — unless a save is on its way (the dialog stays
+ * until its outcome is known: a late refusal must not be lost), or the event
+ * was handled already (the form's own listener and the document's both see
+ * an Escape typed inside the form). True when it closed.
+ */
+export function handleDialogEscape(event: DialogKeyEvent, saving: boolean, onCancel: () => void): boolean {
+  if (event.key !== 'Escape' || event.defaultPrevented) return false;
+  event.preventDefault();
+  if (saving) return false;
+  onCancel();
+  return true;
 }
 
 /** Why the form cannot be shown yet, from the live config. */
@@ -480,6 +499,20 @@ export function AddRuleDialog({ editor, onClose, rs: given, newId }: AddRuleDial
     controller.focusDone();
   }, [ui.focusField, controller]);
 
+  // Escape also when the focus fell to <body> (a click on the dialog's padding):
+  // the form's own listener does not hear it then.
+  useEffect(() => {
+    const onKey = (event: KeyboardEvent) => {
+      handleDialogEscape(event, latest.current.saving, () => {
+        close.current();
+      });
+    };
+    globalThis.document.addEventListener('keydown', onKey);
+    return () => {
+      globalThis.document.removeEventListener('keydown', onKey);
+    };
+  }, []);
+
   return (
     <AddRulePanel
       mode={editor.mode}
@@ -495,7 +528,10 @@ export function AddRuleDialog({ editor, onClose, rs: given, newId }: AddRuleDial
       onSave={() => {
         void controller.save(config.config);
       }}
-      onCancel={onClose}
+      onCancel={() => {
+        // Not while a save is on its way: the dialog waits for its outcome.
+        if (!latest.current.saving) onClose();
+      }}
       onTest={(address) => {
         void controller.runTest(address);
       }}

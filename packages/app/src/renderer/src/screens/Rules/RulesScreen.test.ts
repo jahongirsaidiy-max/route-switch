@@ -9,7 +9,8 @@ import { LOADING_VIEW, type EngineStateView } from '../../hooks/useEngineState';
 import type { RsApi } from '../../rs';
 import { RULE_REASON_TEXT } from '../../text';
 import { CONFIG, ID, NOW, STATE, ruleState } from '../MenuBar/fixtures';
-import { ADD_RULE_UNAVAILABLE, RulesPanel, RulesScreen, type RulesPanelProps } from './RulesScreen';
+import { ADD_RULE_UNAVAILABLE, CONFIG_UNREADABLE_REASON, RulesPanel, RulesScreen, type RulesPanelProps } from './RulesScreen';
+import { INITIAL_RECOVERY_UI } from './recovery';
 import { INITIAL_TRANSFER_UI } from './transfer';
 
 const connected = (state: EngineState = STATE): EngineStateView => ({
@@ -41,6 +42,10 @@ const props = (extra: Partial<RulesPanelProps> = {}): RulesPanelProps => ({
   onExport: vi.fn(),
   onConfirmImport: vi.fn(),
   onCancelImport: vi.fn(),
+  recovery: INITIAL_RECOVERY_UI,
+  onAskReset: vi.fn(),
+  onCancelReset: vi.fn(),
+  onConfirmReset: vi.fn(),
   ...extra,
 });
 const render = (extra: Partial<RulesPanelProps> = {}) => renderMarkup(createElement(RulesPanel, props(extra)));
@@ -294,6 +299,122 @@ describe('RulesPanel — not ready', () => {
   });
 });
 
+describe('RulesPanel — error states (TASK-300)', () => {
+  const unreadable: EngineStateView = {
+    helper: 'config-unreadable',
+    connection: { kind: 'config-unreadable', helperVersion: '0.1.0' },
+    state: null,
+    error: null,
+  };
+
+  it('a broken stored config: what happened, and two ways out — import, or an empty config', () => {
+    const { all, elements } = treeOf({ engine: unreadable, config: IDLE_CONFIG });
+    const html = renderMarkup(RulesPanel(all));
+    const words = text(html);
+    expect(words).toContain("Helper config'i buzilgan");
+    expect(words).toContain("hech bir qoida qo'llanmayapti");
+    expect(html).not.toContain('role="table"');
+    buttonsLabelled(elements, "Config'ni import qilish")[0]?.props.onClick?.();
+    expect(all.onImport).toHaveBeenCalledTimes(1);
+    buttonsLabelled(elements, "Bo'sh config bilan boshlash")[0]?.props.onClick?.();
+    expect(all.onAskReset).toHaveBeenCalledTimes(1);
+    expect(all.onConfirmReset).not.toHaveBeenCalled();
+    // No question yet.
+    expect(html).not.toContain('rules-reset-question');
+  });
+
+  it('the reset question: the safe choice has the focus, Escape cancels, "Almashtirish" confirms; busy while on its way', () => {
+    const { all, elements } = treeOf({ engine: unreadable, config: IDLE_CONFIG, recovery: { ...INITIAL_RECOVERY_UI, confirming: true } });
+    const words = text(renderMarkup(RulesPanel(all)));
+    expect(words).toContain("bo'sh config bilan almashtirilsinmi");
+    expect(words).toContain('/Library/Application Support/RouteSwitch/config.json');
+    const dialog = elements.find((element) => element.props.role === 'alertdialog');
+    dialog?.props.onKeyDown?.({ key: 'Escape' });
+    dialog?.props.onKeyDown?.({ key: 'Enter' });
+    expect(all.onCancelReset).toHaveBeenCalledTimes(1);
+    const cancel = buttonsLabelled(elements, 'Bekor qilish')[0];
+    expect(cancel?.props.autoFocus).toBe(true);
+    buttonsLabelled(elements, 'Almashtirish')[0]?.props.onClick?.();
+    expect(all.onConfirmReset).toHaveBeenCalledTimes(1);
+    // The ask button is busy while the question is open (it does not ask twice).
+    expect(buttonsLabelled(elements, "Bo'sh config bilan boshlash")[0]?.props.busy).toBe(true);
+
+    const busy = treeOf({ engine: unreadable, config: IDLE_CONFIG, recovery: { ...INITIAL_RECOVERY_UI, confirming: true, busy: true } });
+    expect(buttonsLabelled(busy.elements, 'Almashtirish')[0]?.props.busy).toBe(true);
+    expect(buttonsLabelled(busy.elements, 'Bekor qilish')[0]?.props.busy).toBe(true);
+  });
+
+  it('the reset button carries the ref the focus returns to; the outcome is shown', () => {
+    const ref = { current: null };
+    const { elements } = treeOf({ engine: unreadable, config: IDLE_CONFIG, resetRef: ref });
+    expect(buttonsLabelled(elements, "Bo'sh config bilan boshlash")[0]?.props.ref).toBe(ref);
+    const failed = render({ engine: unreadable, config: IDLE_CONFIG, recovery: { ...INITIAL_RECOVERY_UI, feedback: { tone: 'danger', text: 'Config almashtirilmadi: x' } } });
+    expect(failed).toMatch(/role="alert"[^>]*>Config almashtirilmadi: x/);
+    const done = render({ recovery: { ...INITIAL_RECOVERY_UI, feedback: { tone: 'success', text: "Bo'sh config saqlandi" } } });
+    expect(done).toMatch(/role="status"[^>]*>Bo&#x27;sh config saqlandi/);
+  });
+
+  it('"Qoida qo\'shish" and "Export" are disabled with the reason while the config is unreadable; Import stays', () => {
+    const { elements } = treeOf({ engine: unreadable, config: IDLE_CONFIG, onAddRule: vi.fn() });
+    const add = elements.find((element) => element.type === Button && typeof element.props.label === 'string' && element.props.label.startsWith("Qoida qo'shish"));
+    expect(add?.props).toMatchObject({ disabled: true, label: `Qoida qo'shish — ${CONFIG_UNREADABLE_REASON}` });
+    expect(buttonsLabelled(elements, `Config export — ${CONFIG_UNREADABLE_REASON}`)[0]?.props.disabled).toBe(true);
+    expect(buttonsLabelled(elements, 'Config import (JSON fayldan)')[0]?.props.disabled).toBeUndefined();
+    // Connected: both enabled again.
+    const fine = treeOf({ onAddRule: vi.fn() });
+    const addButton = (all: ReactElement<AnyProps>[]) => all.find((element) => element.type === Button && (element.props as { size?: string }).size === 'lg');
+    expect(addButton(fine.elements)?.props).toMatchObject({ disabled: false, label: undefined });
+    expect(addButton(elements)?.props.disabled).toBe(true);
+    expect(buttonsLabelled(fine.elements, 'Config export (JSON faylga)')[0]?.props.disabled).toBe(false);
+  });
+
+  it('no way out offered for other helper statuses', () => {
+    const away: EngineStateView = { helper: 'disconnected', connection: { kind: 'disconnected', reason: 'not-running' }, state: null, error: null };
+    expect(text(render({ engine: away, config: IDLE_CONFIG }))).not.toContain("Bo'sh config bilan boshlash");
+  });
+
+  it('an interface that is down: its rules are pending with the reason, and a warning counts them', () => {
+    const state: EngineState = {
+      ...STATE,
+      interfaces: { ...STATE.interfaces, ethernet: { device: 'en5', ip: null, gateway: null, up: false } },
+      rules: STATE.rules.map((rule) =>
+        new Set<string>([ID.subnet, ID.dnsDomain, ID.host, ID.test]).has(rule.ruleId) ? ruleState(rule.ruleId, { status: 'pending', reasonCode: 'interface-down' }) : rule,
+      ),
+    };
+    const html = render({ engine: connected(state) });
+    const words = text(html);
+    expect(words).toContain('Ethernet ulanmagan');
+    expect(words).toContain('4 ta qoida kutilmoqda');
+    // Four rows, each with its "Kutilmoqda" tag.
+    expect(html.match(/role="row" data-enabled="true" data-status="pending"/g)).toHaveLength(4);
+    expect(html.match(/data-tone="warning" data-status="pending"/g)).toHaveLength(4);
+    expect(words).toContain(RULE_REASON_TEXT['interface-down']);
+  });
+
+  it('both interfaces on one subnet: a warning', () => {
+    const state: EngineState = {
+      ...STATE,
+      interfaces: {
+        ethernet: { device: 'en5', ip: '192.168.1.20', gateway: '192.168.1.1', up: true },
+        wifi: { device: 'en0', ip: '192.168.1.30', gateway: '192.168.1.1', up: true },
+      },
+    };
+    expect(text(render({ engine: connected(state) }))).toContain('Ethernet va Wi‑Fi bitta tarmoqda');
+  });
+
+  it('a domain rule that failed to resolve: error, the reason, and the addresses it still routes', () => {
+    const state: EngineState = {
+      ...STATE,
+      rules: STATE.rules.map((rule) => (rule.ruleId === ID.domain ? { ...rule, status: 'error', reasonCode: 'resolve-failed' } : rule)),
+    };
+    const html = render({ engine: connected(state) });
+    const words = text(html);
+    expect(words).toContain(RULE_REASON_TEXT['resolve-failed']);
+    expect(words).toContain("Oxirgi ma'lum IP'lar (hali yo'naltirilmoqda): 140.82.112.3, 140.82.112.4, 140.82.113.3 · 2 daq oldin");
+    expect(html).toContain('data-status="error"');
+  });
+});
+
 describe('RulesScreen', () => {
   it('renders from window.rs-like data only, asking nothing during static rendering', () => {
     const rs = {
@@ -305,6 +426,7 @@ describe('RulesScreen', () => {
       importConfig: vi.fn(),
       applyImport: vi.fn(),
       exportConfig: vi.fn(),
+      resetConfig: vi.fn(),
     };
     const html = renderMarkup(createElement(RulesScreen, { rs }));
     expect(text(html)).toContain("Holat o'qilmoqda…");

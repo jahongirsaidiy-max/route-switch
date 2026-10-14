@@ -74,6 +74,15 @@
   padding: var(--rs-space-7) var(--rs-space-8);
 }
 
+/* Network warnings between the interfaces and the rules (derived): padding 0 16 8, gap 6. */
+.warnings {
+  display: flex;
+  flex-shrink: 0;
+  flex-direction: column;
+  gap: var(--rs-space-3);
+  padding: 0 var(--rs-space-8) var(--rs-space-4);
+}
+
 /* Active rules: padding 4 16 0, gap 6, takes the rest of the height. */
 .rules {
   display: flex;

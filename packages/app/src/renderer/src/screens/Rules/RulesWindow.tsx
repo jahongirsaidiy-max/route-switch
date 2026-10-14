@@ -9,9 +9,10 @@
 
 import { useEffect, useRef, useState, type ComponentType, type ReactElement, type ReactNode } from 'react';
 
-import { RouteIcon, StatusDot } from '../../components';
+import { HelperRecovery, requestReconnect, RouteIcon, StatusDot } from '../../components';
 import { useEngineState, type EngineStateView } from '../../hooks/useEngineState';
-import { HELPER_STATUS_TEXT } from '../../text';
+import type { RsApi } from '../../rs';
+import { HELPER_STATUS_TEXT, helperNotice, type Feedback } from '../../text';
 import { AddRuleDialog, type RuleEditorTarget } from '../AddRule';
 import { LogScreen } from '../Log';
 import { SettingsScreen } from '../Settings';
@@ -83,13 +84,29 @@ export interface RulesWindowFrameProps {
   readonly onSelect: (section: RulesSection) => void;
   /** A dialog is open over the window: nothing behind it can be focused or clicked. */
   readonly inert?: boolean;
+  /** "Qayta ulanish" of the helper box, shown in every section while the helper is away. */
+  readonly onReconnect?: () => void;
+  readonly reconnecting?: boolean;
+  /** A refused reconnect request. */
+  readonly reconnectFeedback?: Feedback | null;
   readonly children: ReactNode;
 }
 
 /** The sidebar and the section's screen, for given data. */
-export function RulesWindowFrame({ section, engine, onSelect, inert = false, children }: RulesWindowFrameProps): ReactElement {
+export function RulesWindowFrame({
+  section,
+  engine,
+  onSelect,
+  inert = false,
+  onReconnect,
+  reconnecting = false,
+  reconnectFeedback = null,
+  children,
+}: RulesWindowFrameProps): ReactElement {
   const helper = HELPER_STATUS_TEXT[engine.helper];
   const connection = engine.connection;
+  // The same words as the screens' notices, so every section says why and what to do.
+  const notice = helperNotice(engine);
   return (
     <div className={styles['window']} inert={inert || undefined}>
       <aside className={styles['sidebar']}>
@@ -115,6 +132,15 @@ export function RulesWindowFrame({ section, engine, onSelect, inert = false, chi
             <span>{helper.text}</span>
           </div>
           {connection?.kind === 'connected' ? <div>root daemon · v{connection.helperVersion}</div> : null}
+          {notice === null || notice.text === '' ? null : <p className={styles['helperText']}>{notice.text}</p>}
+          {onReconnect === undefined ? null : (
+            <HelperRecovery recovery={notice?.recovery ?? null} onReconnect={onReconnect} reconnecting={reconnecting} size="sm" />
+          )}
+          {reconnectFeedback === null ? null : (
+            <p className={styles['helperText']} data-tone={reconnectFeedback.tone} role="alert">
+              {reconnectFeedback.text}
+            </p>
+          )}
         </div>
       </aside>
       <div className={styles['main']}>{children}</div>
@@ -140,11 +166,30 @@ export interface RulesWindowProps {
   readonly initialSection?: RulesSection;
   readonly screens?: Readonly<Record<RulesSection, ComponentType<SectionScreenProps>>>;
   readonly editorScreen?: ComponentType<{ readonly editor: RuleEditorTarget; readonly onClose: () => void }>;
+  /** The preload API; `window.rs` in the app. */
+  readonly rs?: Pick<RsApi, 'getState' | 'onState' | 'reconnectHelper'>;
 }
 
 /** The screen of the rules window (`?view=rules`). */
-export function RulesWindow({ initialSection = 'rules', screens = SECTION_SCREENS, editorScreen: Editor = AddRuleDialog }: RulesWindowProps): ReactElement {
-  const engine = useEngineState();
+export function RulesWindow({
+  initialSection = 'rules',
+  screens = SECTION_SCREENS,
+  editorScreen: Editor = AddRuleDialog,
+  rs: given,
+}: RulesWindowProps): ReactElement {
+  const rs = given ?? window.rs;
+  const engine = useEngineState(rs);
+  const [reconnecting, setReconnecting] = useState(false);
+  const [reconnectFeedback, setReconnectFeedback] = useState<Feedback | null>(null);
+  const reconnect = () => {
+    if (reconnecting) return;
+    setReconnecting(true);
+    setReconnectFeedback(null);
+    void requestReconnect(rs).then((line) => {
+      setReconnectFeedback(line);
+      setReconnecting(false);
+    });
+  };
   const [section, setSection] = useState<RulesSection>(initialSection);
   const [editor, setEditor] = useState<RuleEditorTarget | null>(null);
   // The button that opened the form; it gets the focus back once the window is no longer inert.
@@ -168,7 +213,15 @@ export function RulesWindow({ initialSection = 'rules', screens = SECTION_SCREEN
   const Screen = screens[section];
   return (
     <>
-      <RulesWindowFrame section={section} engine={engine} onSelect={setSection} inert={editor !== null}>
+      <RulesWindowFrame
+        section={section}
+        engine={engine}
+        onSelect={setSection}
+        inert={editor !== null}
+        onReconnect={reconnect}
+        reconnecting={reconnecting}
+        reconnectFeedback={reconnectFeedback}
+      >
         <Screen
           onAddRule={() => {
             open({ mode: 'add' });

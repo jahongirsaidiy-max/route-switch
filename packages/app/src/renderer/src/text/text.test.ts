@@ -1,8 +1,13 @@
 import { RECONCILE_REASONS, RULE_REASON_CODES } from '@routeswitch/shared';
 import { describe, expect, it } from 'vitest';
 
+import type { EngineStateView } from '../hooks/useEngineState';
+import type { RsConnection } from '../rs';
 import {
   configIssueText,
+  helperNotice,
+  INSTALL_UNAVAILABLE,
+  type HelperRecovery,
   HELPER_STATUS_TEXT,
   isValidationCode,
   VALIDATION_TEXT,
@@ -84,10 +89,48 @@ describe('errorText', () => {
 
 describe('HELPER_STATUS_TEXT', () => {
   it('has words for every helper status of the UI', () => {
-    for (const status of ['loading', 'connected', 'connecting', 'not-installed', 'disconnected', 'incompatible', 'stopped', 'unavailable'] as const) {
+    for (const status of ['loading', 'connected', 'connecting', 'not-installed', 'disconnected', 'config-unreadable', 'incompatible', 'stopped', 'unavailable'] as const) {
       expect(HELPER_STATUS_TEXT[status].text.length).toBeGreaterThan(0);
     }
     expect(HELPER_STATUS_TEXT.connected).toEqual({ text: 'Helper ishlayapti', tone: 'success' });
+    expect(HELPER_STATUS_TEXT['config-unreadable']).toEqual({ text: "Helper config'i buzilgan", tone: 'danger' });
+  });
+});
+
+describe('helperNotice — the way out of each helper status (TASK-300)', () => {
+  const view = (connection: RsConnection | null, helper: EngineStateView['helper'] = connection?.kind ?? 'loading'): EngineStateView => ({
+    helper,
+    connection,
+    state: null,
+    error: helper === 'unavailable' ? { code: 'forbidden', message: 'x' } : null,
+  });
+
+  it.each<[string, EngineStateView, HelperRecovery | null, string]>([
+    ['disconnected', view({ kind: 'disconnected', reason: 'connection-lost' }), 'reconnect', "Helper bilan aloqa yo'q"],
+    ['not-installed', view({ kind: 'not-installed' }), 'install', "Helper o'rnatilmagan"],
+    ['incompatible', view({ kind: 'incompatible', helperVersion: '0.0.9', protocolVersion: 1, expectedProtocolVersion: 2 }), 'reinstall', 'Helper versiyasi mos emas'],
+    ['config-unreadable', view({ kind: 'config-unreadable', helperVersion: '0.1.0' }), 'repair-config', "Helper config'i buzilgan"],
+    ['connecting', view({ kind: 'connecting' }), null, 'Helper bilan ulanmoqda…'],
+    ['stopped', view({ kind: 'stopped' }), null, "Ilova to'xtamoqda"],
+    ['loading', view(null), null, "Holat o'qilmoqda…"],
+    ['unavailable', view(null, 'unavailable'), null, "Holatni o'qib bo'lmadi"],
+  ])('%s → %s', (_name, engine, recovery, title) => {
+    expect(helperNotice(engine)).toMatchObject({ recovery, title });
+  });
+
+  it('connected: no notice', () => {
+    expect(helperNotice(view({ kind: 'connected', helperVersion: '0.1.0' }))).toBeNull();
+  });
+
+  it('a broken config says that nothing is applied and how to repair it', () => {
+    const text = helperNotice(view({ kind: 'config-unreadable', helperVersion: '0.1.0' }))?.text ?? '';
+    expect(text).toContain("hech bir qoida qo'llanmayapti");
+    expect(text).toContain('import');
+    expect(text).toContain("bo'sh config");
+  });
+
+  it('the install button says why it is disabled', () => {
+    expect(INSTALL_UNAVAILABLE).toBe("Ilova ichidan o'rnatish hali qo'shilmagan");
   });
 });
 

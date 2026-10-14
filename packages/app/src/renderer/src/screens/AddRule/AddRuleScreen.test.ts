@@ -11,6 +11,7 @@ import {
   AddRulePanel,
   focusField,
   formStatus,
+  handleDialogEscape,
   refreshText,
   visibleErrors,
   type AddRulePanelProps,
@@ -242,6 +243,16 @@ describe('AddRulePanel — wiring', () => {
     expect(all.onSave).not.toHaveBeenCalled();
   });
 
+  it('while saving, "Bekor qilish" is busy and Escape does not close: a late refusal is not lost (TASK-300)', () => {
+    const { all, elements } = treeOf({ ui: ui({ target: '10.0.0.0/8' }, { saving: true }) });
+    const cancel = buttonsNamed(elements, 'Bekor qilish')[0];
+    expect(cancel?.props.busy).toBe(true);
+    expect(cancel?.props.disabled).toBeUndefined();
+    const form = elements.find((element) => element.type === 'form');
+    form?.props.onKeyDown?.({ key: 'Escape', preventDefault: vi.fn() });
+    expect(all.onCancel).not.toHaveBeenCalled();
+  });
+
   it('the kind segment, interface options and inputs report to their callbacks', () => {
     const { all, elements } = treeOf({ ui: ui({ kind: 'domain', target: 'corp.local', useDns: true }) });
     const segment = elements.find((element) => element.type === Segment);
@@ -345,4 +356,34 @@ it('focusField moves the focus to a field on the page', () => {
   expect(focus).toHaveBeenCalledTimes(1);
   expect(focusField(inputs, 'target')).toBe(false);
   expect(focusField(inputs, null)).toBe(false);
+});
+
+describe('handleDialogEscape (TASK-300)', () => {
+  const event = (key: string, defaultPrevented = false) => ({ key, defaultPrevented, preventDefault: vi.fn() });
+
+  it('Escape closes and is marked handled; other keys do nothing', () => {
+    const onCancel = vi.fn();
+    const escape = event('Escape');
+    expect(handleDialogEscape(escape, false, onCancel)).toBe(true);
+    expect(onCancel).toHaveBeenCalledTimes(1);
+    expect(escape.preventDefault).toHaveBeenCalledTimes(1);
+    const enter = event('Enter');
+    expect(handleDialogEscape(enter, false, onCancel)).toBe(false);
+    expect(enter.preventDefault).not.toHaveBeenCalled();
+    expect(onCancel).toHaveBeenCalledTimes(1);
+  });
+
+  it("an Escape the form's own listener handled is not handled again at the document", () => {
+    const onCancel = vi.fn();
+    expect(handleDialogEscape(event('Escape', true), false, onCancel)).toBe(false);
+    expect(onCancel).not.toHaveBeenCalled();
+  });
+
+  it('while a save is on its way Escape is swallowed, not a close', () => {
+    const onCancel = vi.fn();
+    const escape = event('Escape');
+    expect(handleDialogEscape(escape, true, onCancel)).toBe(false);
+    expect(escape.preventDefault).toHaveBeenCalledTimes(1);
+    expect(onCancel).not.toHaveBeenCalled();
+  });
 });

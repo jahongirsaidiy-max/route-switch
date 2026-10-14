@@ -1,0 +1,13 @@
+/* Helper recovery buttons (not in the design — derived): a row that wraps, centred like the notice it sits in. */
+.actions {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: center;
+  gap: var(--rs-space-4);
+}
+
+.actions[data-size='sm'] {
+  flex-direction: column;
+  align-items: stretch;
+  gap: var(--rs-space-2);
+}

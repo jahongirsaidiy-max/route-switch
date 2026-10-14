@@ -100,4 +100,14 @@ describe('createLogBuffer', () => {
     expect(after).toHaveBeenCalledTimes(1);
     expect(buffer.entries()).toHaveLength(1);
   });
+
+  it("keeps the app's mark on its own entries and nothing else of an event", () => {
+    const buffer = createLogBuffer({ onListenerError: () => undefined });
+    buffer.push({ level: 'warn', msg: 'app line', at: '2026-01-01T00:00:00.000Z', source: 'app' });
+    buffer.push({ level: 'info', msg: 'helper line', at: '2026-01-01T00:00:00.000Z', extra: 'dropped' } as never);
+    expect(buffer.entries()).toEqual([
+      { seq: 1, level: 'warn', msg: 'app line', at: '2026-01-01T00:00:00.000Z', source: 'app' },
+      { seq: 2, level: 'info', msg: 'helper line', at: '2026-01-01T00:00:00.000Z' },
+    ]);
+  });
 });

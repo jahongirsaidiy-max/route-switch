@@ -132,6 +132,20 @@
   color: var(--rs-color-danger-soft-text);
 }
 
+/* The app's own entries (derived): a neutral tag before the message. */
+.source {
+  display: inline-block;
+  margin-right: var(--rs-space-3);
+  padding: var(--rs-space-1) var(--rs-space-3);
+  border-radius: var(--rs-radius-tag);
+  background: var(--rs-color-neutral-soft);
+  color: var(--rs-color-neutral-soft-text);
+  font-size: var(--rs-text-tag);
+  font-weight: var(--rs-weight-semibold);
+  line-height: 1.4;
+  white-space: nowrap;
+}
+
 .notice {
   display: flex;
   flex: 1;

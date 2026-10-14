@@ -97,6 +97,11 @@ describe('viewOfSnapshot', () => {
 
   it('never shows a state next to a connection that is not live', () => {
     expect(viewOfSnapshot({ connection: { kind: 'connecting' }, state: STATE }).state).toBeNull();
+    // A helper whose stored config is unreadable (TASK-300): its own status, no state.
+    expect(viewOfSnapshot({ connection: { kind: 'config-unreadable', helperVersion: '0.1.0' }, state: STATE })).toMatchObject({
+      helper: 'config-unreadable',
+      state: null,
+    });
   });
 });
 

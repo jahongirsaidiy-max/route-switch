@@ -6,7 +6,7 @@ import path from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import type { RsApi, RsLogEntry, RsResult, RsSnapshot } from '../renderer/src/rs';
-import { createHelperClient, type HelperClient } from './helperClient';
+import { createHelperClient, DEFAULT_TIMEOUTS, type HelperClient } from './helperClient';
 import {
   engineState,
   FakeSocket,
@@ -21,6 +21,7 @@ import {
 } from './helperClient.fixtures';
 import type { ConfigFileSystem } from './configFile';
 import {
+  EMPTY_CONFIG,
   IMPORT_TTL_MS,
   INVOKE_CHANNELS,
   LOG_CHANNEL,
@@ -107,6 +108,8 @@ interface FakeHelper {
   readonly answerOnce: Map<string, (request: { id: number; [key: string]: unknown }) => unknown>;
   /** Methods whose requests are left unanswered. */
   readonly silent: Set<string>;
+  /** The stored config cannot be loaded (TASK-114): getConfig / setEnabled fail until a setConfig. */
+  broken?: boolean;
 }
 
 function attachHelper(socket: FakeSocket, helper: FakeHelper): void {
@@ -131,9 +134,14 @@ function attachHelper(socket: FakeSocket, helper: FakeHelper): void {
           socket.receive(ok(request.id, statusResult(state())));
           return;
         case 'getConfig':
+          if (helper.broken === true) {
+            socket.receive(refused(request.id, 'The stored config could not be loaded (invalid-json)', 'operation-failed'));
+            return;
+          }
           socket.receive(ok(request.id, { config: helper.config, configRevision: helper.configRevision }));
           return;
         case 'setConfig':
+          helper.broken = false;
           helper.config = request['config'] as Config;
           helper.configRevision += 1;
           socket.receive(ok(request.id, { config: helper.config, state: state() }));
@@ -178,7 +186,7 @@ const unusedSettings = (logger: Parameters<typeof createSettings>[0]['logger']):
 interface SetupOptions {
   readonly connect?: boolean;
   readonly config?: Config;
-  readonly client?: Pick<HelperClient, 'request' | 'snapshot' | 'onStatus' | 'onState' | 'onLog'>;
+  readonly client?: Pick<HelperClient, 'request' | 'snapshot' | 'reconnectNow' | 'onStatus' | 'onState' | 'onLog'>;
   readonly recipients?: StateRecipient[];
   readonly logBuffer?: LogBuffer;
   readonly settings?: Settings;
@@ -186,6 +194,8 @@ interface SetupOptions {
   readonly configDialogs?: ConfigDialogs;
   readonly configFs?: ConfigFileSystem;
   readonly now?: () => number;
+  /** The helper's stored config cannot be loaded: the handshake ends `config-unreadable`. */
+  readonly brokenConfig?: boolean;
 }
 
 /** File dialogs the user always cancels. */
@@ -201,6 +211,7 @@ async function setup(options: SetupOptions = {}) {
     seq: 0,
     answerOnce: new Map(),
     silent: new Set(),
+    broken: options.brokenConfig === true,
   };
   const realClient = createHelperClient({
     socketPath: '/tmp/routeswitch-test/helper.sock',
@@ -236,7 +247,7 @@ async function setup(options: SetupOptions = {}) {
       sockets[0]?.emit('connect');
       // status, then getConfig.
       for (let i = 0; i < 6; i += 1) await flush();
-      expect(realClient.snapshot().status.kind).toBe('connected');
+      expect(realClient.snapshot().status.kind).toBe(options.brokenConfig === true ? 'config-unreadable' : 'connected');
     }
   }
 
@@ -276,10 +287,10 @@ const newRule = (extra: Partial<RuleInput> = {}): RuleInput => ({
 // ---------------------------------------------------------------------------
 
 describe('registration', () => {
-  it('handles exactly the nineteen invoke channels of the renderer API', async () => {
+  it('handles exactly the twenty-one invoke channels of the renderer API', async () => {
     const h = await setup({ connect: false });
     expect([...h.ipcMain.handlers.keys()].sort()).toEqual([...INVOKE_CHANNELS].sort());
-    expect(INVOKE_CHANNELS).toHaveLength(19);
+    expect(INVOKE_CHANNELS).toHaveLength(21);
   });
 
   it('dispose removes every handler and stops the state pushes; a second dispose does nothing', async () => {
@@ -290,7 +301,7 @@ describe('registration', () => {
     h.registration.dispose();
     h.registration.dispose();
     expect(h.ipcMain.handlers.size).toBe(0);
-    expect(h.ipcMain.removeHandler).toHaveBeenCalledTimes(19);
+    expect(h.ipcMain.removeHandler).toHaveBeenCalledTimes(21);
     h.sockets[0]?.emit('connect');
     for (let i = 0; i < 6; i += 1) await flush();
     expect(sent).toEqual([]);
@@ -496,7 +507,8 @@ describe('failures reach the renderer as values', () => {
   });
 
   it('a call that throws inside the main process answers internal and is logged', async () => {
-    const client: Pick<HelperClient, 'request' | 'snapshot' | 'onStatus' | 'onState' | 'onLog'> = {
+    const client: Pick<HelperClient, 'request' | 'snapshot' | 'reconnectNow' | 'onStatus' | 'onState' | 'onLog'> = {
+      reconnectNow: () => undefined,
       request: () => Promise.reject(new Error('unexpected')),
       snapshot: () => ({ status: { kind: 'stopped' }, state: null, config: null, configRevision: null }),
       onStatus: () => () => undefined,
@@ -539,6 +551,38 @@ describe('config import / export (main-process dialogs and files only)', () => {
     await writeFile(file, content);
     return file;
   };
+
+  it('resetConfig queued behind an import that repairs the config is refused there: the unreadable check runs in the queue (TASK-300)', async () => {
+    const file = await fileWith(JSON.stringify(importedConfig()));
+    const h = await setup({ brokenConfig: true, configDialogs: dialogsFor(file) });
+    const preview = valueOf(await h.call('rs:import')) as { token: string };
+    // The import's setConfig is held by the helper; the reset is asked for meanwhile, while the status is still unreadable.
+    h.helper.silent.add('setConfig');
+    const applying = h.ipcMain.handlers.get('rs:applyImport')?.(TRUSTED, preview.token);
+    for (let i = 0; i < 8; i += 1) await flush();
+    const resetting = h.ipcMain.handlers.get('rs:resetConfig')?.(TRUSTED);
+    for (let i = 0; i < 8; i += 1) await flush();
+    expect(h.client.snapshot().status.kind).toBe('config-unreadable');
+    expect(h.sentAfterHandshake()).toEqual(['setConfig']);
+
+    // The helper stores the imported config and answers: the connection is repaired before the reset's turn.
+    const request = h.sockets[0]?.requests().find((sent) => sent.method === 'setConfig');
+    if (request === undefined) throw new Error('no setConfig was sent');
+    h.helper.broken = false;
+    h.helper.config = importedConfig();
+    h.helper.configRevision += 1;
+    h.helper.seq += 1;
+    h.sockets[0]?.receive(ok(request['id'], { config: importedConfig(), state: engineState(h.helper.seq, h.helper.configRevision, { enabled: false }) }));
+    for (let i = 0; i < 8; i += 1) await flush();
+
+    expect(await applying).toMatchObject({ ok: true });
+    expect(await resetting).toMatchObject({ ok: false, code: 'operation-failed' });
+    // Exactly one setConfig, the import's: the empty config was never sent.
+    expect(h.sentAfterHandshake()).toEqual(['setConfig']);
+    expect(h.sent().filter((sent) => sent.method === 'setConfig').map((sent) => sent['config'])).toEqual([importedConfig()]);
+    expect(h.helper.config).toEqual(importedConfig());
+    expect(h.client.snapshot().status.kind).toBe('connected');
+  });
 
   it('import reads, checks and returns the config with a token; nothing reaches the helper until it is applied', async () => {
     const file = await fileWith(JSON.stringify(importedConfig()));
@@ -835,14 +879,18 @@ describe('rs:state', () => {
     const scheduler = fakeScheduler();
     const { logger, entries } = memoryLogger(() => scheduler.now);
     let statusListener: (() => void) | null = null;
+    const statusListeners: ((status: { kind: 'not-installed' }) => void)[] = [];
     registerIpcHandlers({
       ipcMain: fakeIpcMain(),
       helperClient: {
         request: () => Promise.reject(new Error('unused')),
         snapshot: () => ({ status: { kind: 'not-installed' }, state: null, config: null, configRevision: null }),
+        reconnectNow: () => undefined,
         onStatus: (listener) => {
+          // The push and the app's journal line (TASK-300) both subscribe.
+          statusListeners.push(listener);
           statusListener = () => {
-            listener({ kind: 'not-installed' });
+            for (const each of statusListeners) each({ kind: 'not-installed' });
           };
           return () => undefined;
         },
@@ -880,6 +928,9 @@ describe('journal: rs:getLog and rs:log', () => {
     };
     return { target, entries };
   };
+  /** The app's own line for the handshake of `setup()` (TASK-300): always the first entry. */
+  const CONNECTED_LINE = { seq: 1, level: 'info', msg: "Helper bilan aloqa o'rnatildi (v1.2.3)", at: expect.any(String) as string, source: 'app' };
+  const helperEntries = (log: unknown) => (log as RsLogEntry[]).filter((entry) => entry.source === undefined);
 
   it('keeps every log event of the helper, numbered, oldest first', async () => {
     const h = await setup();
@@ -887,9 +938,10 @@ describe('journal: rs:getLog and rs:log', () => {
     h.sockets[0]?.receive(logLine('Route add failed', 'error'));
     h.sockets[0]?.receive(logLine('Interface down', 'warn'));
     expect(valueOf(await h.call('rs:getLog'))).toEqual([
-      { seq: 1, level: 'info', msg: 'Reconcile finished', at: AT },
-      { seq: 2, level: 'error', msg: 'Route add failed', at: AT },
-      { seq: 3, level: 'warn', msg: 'Interface down', at: AT },
+      CONNECTED_LINE,
+      { seq: 2, level: 'info', msg: 'Reconcile finished', at: AT },
+      { seq: 3, level: 'error', msg: 'Route add failed', at: AT },
+      { seq: 4, level: 'warn', msg: 'Interface down', at: AT },
     ]);
   });
 
@@ -899,7 +951,12 @@ describe('journal: rs:getLog and rs:log', () => {
     h.sockets[0]?.emit('close');
     await flush();
     expect(h.client.snapshot().status.kind).not.toBe('connected');
-    expect(valueOf(await h.call('rs:getLog'))).toMatchObject([{ msg: 'before the drop' }]);
+    expect(valueOf(await h.call('rs:getLog'))).toMatchObject([
+      { source: 'app', msg: "Helper bilan aloqa o'rnatildi (v1.2.3)" },
+      { msg: 'before the drop' },
+      // The app's own line: the helper cannot say that it is gone.
+      { source: 'app', level: 'warn', msg: "Helper bilan aloqa yo'q: aloqa uzildi" },
+    ]);
   });
 
   it('is empty before the first event', async () => {
@@ -911,16 +968,17 @@ describe('journal: rs:getLog and rs:log', () => {
     const h = await setup();
     for (let i = 1; i <= 501; i += 1) h.sockets[0]?.receive(logLine(`line ${String(i)}`));
     const log = valueOf(await h.call('rs:getLog')) as RsLogEntry[];
+    // 502 entries with the app's connected line (seq 1): the first two are gone.
     expect(log).toHaveLength(500);
-    expect(log[0]).toMatchObject({ seq: 2, msg: 'line 2' });
-    expect(log.at(-1)).toMatchObject({ seq: 501, msg: 'line 501' });
+    expect(log[0]).toMatchObject({ seq: 3, msg: 'line 2' });
+    expect(log.at(-1)).toMatchObject({ seq: 502, msg: 'line 501' });
   });
 
   it('a log line the client refuses never reaches the journal', async () => {
     const h = await setup();
     h.sockets[0]?.receive({ event: 'log', level: 'fatal', msg: 'x', at: AT });
     h.sockets[0]?.receive({ event: 'log', level: 'info', msg: 'x', at: 'yesterday' });
-    expect(valueOf(await h.call('rs:getLog'))).toEqual([]);
+    expect(helperEntries(valueOf(await h.call('rs:getLog')))).toEqual([]);
   });
 
   it('sends each new entry to the app windows only', async () => {
@@ -930,7 +988,7 @@ describe('journal: rs:getLog and rs:log', () => {
     gone.target.destroyed = true;
     const h = await setup({ recipients: [app.target, foreign.target, gone.target] });
     h.sockets[0]?.receive(logLine('Reconcile finished'));
-    expect(app.entries).toEqual([{ seq: 1, level: 'info', msg: 'Reconcile finished', at: AT }]);
+    expect(app.entries).toEqual([CONNECTED_LINE, { seq: 2, level: 'info', msg: 'Reconcile finished', at: AT }]);
     expect(foreign.entries).toEqual([]);
     expect(gone.entries).toEqual([]);
   });
@@ -946,7 +1004,8 @@ describe('journal: rs:getLog and rs:log', () => {
     };
     const h = await setup({ recipients: [broken, app.target] });
     h.sockets[0]?.receive(logLine('x'));
-    expect(app.entries).toHaveLength(1);
+    // The app's connected line and the helper's.
+    expect(app.entries).toHaveLength(2);
     expect(h.entries.some((entry) => entry.level === 'error' && entry.msg === 'Could not send a journal entry to a window')).toBe(
       true,
     );
@@ -967,9 +1026,96 @@ describe('journal: rs:getLog and rs:log', () => {
     const h = await setup({ recipients: [app.target], logBuffer });
     h.registration.dispose();
     h.sockets[0]?.receive(logLine('after dispose'));
-    expect(logBuffer.entries()).toEqual([]);
+    h.sockets[0]?.emit('close');
+    // Only the app's connected line from before the dispose; neither the helper's line nor the drop after it.
+    expect(logBuffer.entries()).toEqual([CONNECTED_LINE]);
     logBuffer.push({ level: 'info', msg: 'pushed directly', at: AT });
-    expect(app.entries).toEqual([]);
+    expect(app.entries).toEqual([CONNECTED_LINE]);
+  });
+});
+
+describe('helper away and a broken stored config (TASK-300)', () => {
+  it('rs:reconnect asks the client to connect now; it takes no arguments and is answered null', async () => {
+    const reconnectNow = vi.fn();
+    const client: Pick<HelperClient, 'request' | 'snapshot' | 'reconnectNow' | 'onStatus' | 'onState' | 'onLog'> = {
+      request: () => Promise.reject(new Error('not used')),
+      snapshot: () => ({ status: { kind: 'disconnected', reason: 'not-running' }, state: null, config: null, configRevision: null }),
+      reconnectNow,
+      onStatus: () => () => undefined,
+      onState: () => () => undefined,
+      onLog: () => () => undefined,
+    };
+    const h = await setup({ client });
+    expect(await h.call('rs:reconnect')).toEqual({ ok: true, value: null });
+    expect(reconnectNow).toHaveBeenCalledTimes(1);
+    expect(await h.call('rs:reconnect', true)).toMatchObject({ ok: false, code: 'invalid-input' });
+    expect(reconnectNow).toHaveBeenCalledTimes(1);
+    const foreign: InvokeEvent = { senderFrame: { url: 'https://example.com/', parent: null } };
+    expect(await h.callAs(foreign, 'rs:reconnect')).toMatchObject({ ok: false, code: 'forbidden' });
+    expect(reconnectNow).toHaveBeenCalledTimes(1);
+  });
+
+  it('rs:reconnect on a lost connection opens a new socket at once, and the state comes back', async () => {
+    const h = await setup();
+    h.sockets[0]?.emit('close');
+    expect(h.client.snapshot().status).toEqual({ kind: 'disconnected', reason: 'connection-lost' });
+    expect(await h.call('rs:reconnect')).toEqual({ ok: true, value: null });
+    expect(h.sockets).toHaveLength(2);
+    h.sockets[1]?.emit('connect');
+    for (let i = 0; i < 6; i += 1) await flush();
+    expect(h.client.snapshot().status.kind).toBe('connected');
+  });
+
+  it('a broken stored config: the snapshot says config-unreadable; edits fail; resetConfig stores an empty config and connects', async () => {
+    const h = await setup({ brokenConfig: true });
+    expect(valueOf(await h.call('rs:getState'))).toEqual({ connection: { kind: 'config-unreadable', helperVersion: '1.2.3' }, state: null });
+    expect(await h.call('rs:saveRule', newRule())).toMatchObject({ ok: false, code: 'operation-failed' });
+    const reset = await h.call('rs:resetConfig');
+    expect(reset).toMatchObject({ ok: true, value: { config: EMPTY_CONFIG } });
+    expect(h.helper.config).toEqual({ version: 1, enabled: true, rules: [] });
+    expect(h.sentAfterHandshake()).toEqual(['getConfig', 'setConfig']);
+    expect(h.client.snapshot().status.kind).toBe('connected');
+    // Readable now: a second reset is refused and sends nothing.
+    expect(await h.call('rs:resetConfig')).toMatchObject({ ok: false, code: 'operation-failed' });
+    expect(h.sentAfterHandshake()).toEqual(['getConfig', 'setConfig']);
+    expect(h.entries.some((entry) => entry.msg === 'Unreadable config replaced with an empty one' && entry['ok'] === true)).toBe(true);
+  });
+
+  it('resetConfig is refused without a connection and while connected; nothing is sent', async () => {
+    const away = await setup({ connect: false });
+    expect(await away.call('rs:resetConfig')).toMatchObject({ ok: false, code: 'operation-failed' });
+    expect(away.sent()).toEqual([]);
+    const fine = await setup();
+    expect(await fine.call('rs:resetConfig')).toMatchObject({ ok: false, code: 'operation-failed' });
+    expect(fine.sentAfterHandshake()).toEqual([]);
+    expect(fine.helper.config).toEqual(oneRuleConfig());
+  });
+
+  it('resetConfig waits in the queue of changes, behind a running edit', async () => {
+    const h = await setup({ brokenConfig: true });
+    h.helper.silent.add('getConfig');
+    const edit = h.ipcMain.handlers.get('rs:saveRule')?.(TRUSTED, newRule());
+    const reset = h.ipcMain.handlers.get('rs:resetConfig')?.(TRUSTED);
+    for (let i = 0; i < 8; i += 1) await flush();
+    // The edit's getConfig is unanswered: the reset has not been sent.
+    expect(h.sentAfterHandshake()).toEqual(['getConfig']);
+    h.scheduler.advance(DEFAULT_TIMEOUTS.readMs);
+    for (let i = 0; i < 8; i += 1) await flush();
+    expect(await edit).toMatchObject({ ok: false, code: 'timeout' });
+    expect(await reset).toMatchObject({ ok: true });
+    expect(h.sentAfterHandshake()).toEqual(['getConfig', 'setConfig']);
+  });
+
+  it("the journal holds the app's own lines about the connection, in the UI's words", async () => {
+    const h = await setup({ brokenConfig: true });
+    await h.call('rs:resetConfig');
+    h.sockets[0]?.emit('close');
+    const log = valueOf(await h.call('rs:getLog')) as RsLogEntry[];
+    expect(log.map((entry) => [entry.level, entry.msg, entry.source])).toEqual([
+      ['error', "Helper saqlangan config'ni o'qiy olmadi — hech bir qoida qo'llanmaydi. Import yoki bo'sh config bilan tiklang", 'app'],
+      ['info', "Helper bilan aloqa o'rnatildi (v1.2.3)", 'app'],
+      ['warn', "Helper bilan aloqa yo'q: aloqa uzildi", 'app'],
+    ]);
   });
 });
 
@@ -1121,7 +1267,8 @@ describe('settings: Wi-Fi first (shown, never run)', () => {
       ...base,
       interfaces: { ...base.interfaces, wifi: { device: 'en8', ip: '192.168.8.2', gateway: '192.168.8.1', up: true } },
     };
-    const client: Pick<HelperClient, 'request' | 'snapshot' | 'onStatus' | 'onState' | 'onLog'> = {
+    const client: Pick<HelperClient, 'request' | 'snapshot' | 'reconnectNow' | 'onStatus' | 'onState' | 'onLog'> = {
+      reconnectNow: () => undefined,
       request: () => Promise.reject(new Error('not used')),
       snapshot: () => ({ status: { kind: 'connected', helperVersion: '0.1.0' }, state, config: null, configRevision: null }),
       onStatus: () => () => undefined,
@@ -1237,7 +1384,7 @@ describe('rs:openRulesWindow (main process only)', () => {
 });
 
 describe('the preload against the main process (window.rs)', () => {
-  it('exposes exactly the twenty-one methods of the renderer API, each wired to a handled channel', async () => {
+  it('exposes exactly the twenty-three methods of the renderer API, each wired to a handled channel', async () => {
     const openRulesWindow = vi.fn();
     const h = await setup({ settings: fakeSettings().settings, openRulesWindow });
     bridge.setInvokeTarget((channel, ...args) => {
@@ -1263,6 +1410,8 @@ describe('the preload against the main process (window.rs)', () => {
         'onLog',
         'onState',
         'openRulesWindow',
+        'reconnectHelper',
+        'resetConfig',
         'saveRule',
         'setEnabled',
         'setIfaceOverrides',
@@ -1289,7 +1438,8 @@ describe('the preload against the main process (window.rs)', () => {
     expect(await settle(rs.importConfig())).toEqual({ ok: true, value: null });
     expect(await settle(rs.applyImport(NEW_ID))).toMatchObject({ ok: false, code: 'import-expired' });
     expect(await settle(rs.exportConfig())).toEqual({ ok: true, value: null });
-    expect(await settle(rs.getLog())).toEqual({ ok: true, value: [] });
+    // Only the app's own line about the connection (TASK-300).
+    expect(await settle(rs.getLog())).toMatchObject({ ok: true, value: [{ seq: 1, source: 'app' }] });
     expect(await settle(rs.getSettings())).toEqual({ ok: true, value: { openAtLogin: false } });
     expect(await settle(rs.setOpenAtLogin(true))).toEqual({ ok: true, value: { openAtLogin: true } });
     expect((await settle(rs.setIfaceOverrides({ ethernet: 'en7' }))).ok).toBe(true);
@@ -1298,6 +1448,9 @@ describe('the preload against the main process (window.rs)', () => {
     expect(await settle(rs.uninstallHelper())).toMatchObject({ ok: false, code: 'not-implemented' });
     expect(await settle(rs.openRulesWindow())).toEqual({ ok: true, value: null });
     expect(openRulesWindow).toHaveBeenCalledTimes(1);
+    // Connected: nothing to reconnect, and a readable config is never reset.
+    expect(await settle(rs.reconnectHelper())).toEqual({ ok: true, value: null });
+    expect(await settle(rs.resetConfig())).toMatchObject({ ok: false, code: 'operation-failed' });
     expect(h.sentAfterHandshake().filter((method) => method !== 'getConfig')).toEqual([
       'setConfig',
       'setConfig',

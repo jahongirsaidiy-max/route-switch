@@ -131,6 +131,15 @@
 
 /* Delete confirmation and overlap warning: bars above the table (derived — not in the design). */
 .confirm,
+/* Network warnings (derived): the overlap banner's margins, one banner each, gap 6. */
+.warnings {
+  display: flex;
+  flex-shrink: 0;
+  flex-direction: column;
+  gap: var(--rs-space-3);
+  margin: 0 var(--rs-space-12) var(--rs-space-5);
+}
+
 .overlaps {
   flex-shrink: 0;
   margin: 0 var(--rs-space-12) var(--rs-space-5);
@@ -261,6 +270,23 @@
 
 .reason[data-tone='error'] {
   color: var(--rs-color-danger-soft-text);
+}
+
+/* A failed domain rule's last known addresses: mono 11px, muted (derived). */
+.lastKnown {
+  color: var(--rs-color-text-muted);
+  font-family: var(--rs-font-mono);
+  font-size: var(--rs-text-caption);
+  overflow-wrap: anywhere;
+}
+
+/* Unreadable stored config: the two ways out, centred under the notice (derived). */
+.recoveryActions {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: center;
+  gap: var(--rs-space-4);
+  margin-top: var(--rs-space-3);
 }
 
 .reason[data-tone='pending'],

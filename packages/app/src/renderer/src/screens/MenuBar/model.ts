@@ -5,7 +5,7 @@
 import type { Config, EngineState, IfaceRole, RuleState, RuleStatus } from '@routeswitch/shared';
 
 import type { RsServiceOrder } from '../../rs';
-import { formatAgo, formatClock, isActiveWarning, RECONCILE_REASON_TEXT, ruleReasonText } from '../../text';
+import { formatAgo, formatClock, isActiveWarning, lastKnownShort, lastKnownText, RECONCILE_REASON_TEXT, ruleReasonText } from '../../text';
 
 /** How many rules the window lists; the rest are counted (RouteSwitch.md §Renderer ekranlari). */
 export const MENU_RULE_LIMIT = 4;
@@ -39,8 +39,15 @@ export interface MenuRules {
 
 type ConfigRule = Config['rules'][number];
 
-/** The row text: the note when there is one; for a domain, its DNS server or how many addresses it resolved to. */
+/**
+ * The row text: for a domain rule in `error` that still routes its last known
+ * addresses, those (they outrank the note: they say what still works); else
+ * the note when there is one; for a domain, its DNS server or how many
+ * addresses it resolved to.
+ */
 export function ruleDetail(rule: ConfigRule, state: RuleState | null, now: number): string {
+  const lastKnown = state === null ? null : lastKnownShort(rule, state);
+  if (lastKnown !== null) return lastKnown;
   const note = rule.note?.trim() ?? '';
   if (note !== '') return note;
   if (rule.kind !== 'domain') return '';
@@ -49,10 +56,17 @@ export function ruleDetail(rule: ConfigRule, state: RuleState | null, now: numbe
   return `${String(state.appliedDestinations.length)} IP · ${formatAgo(state.lastResolvedAt, now)}`;
 }
 
-export function ruleNotice(state: RuleState | null): RuleNotice | null {
+/**
+ * The status tag's words. With the rule given, a domain rule in `error` adds
+ * what it still routes (`lastKnownText`): the row itself only has room for
+ * the first address.
+ */
+export function ruleNotice(state: RuleState | null, rule?: ConfigRule, now = 0): RuleNotice | null {
   if (state === null) return null;
-  const text = ruleReasonText(state);
-  if (text === null) return null;
+  const reason = ruleReasonText(state);
+  if (reason === null) return null;
+  const lastKnown = rule === undefined ? null : lastKnownText(rule, state, now);
+  const text = lastKnown === null ? reason : `${reason}. ${lastKnown}`;
   if (state.status === 'pending' || state.status === 'error') return { kind: 'status', status: state.status, text };
   if (isActiveWarning(state)) return { kind: 'warning', text };
   // `disabled`: the whole list is off (the global toggle says so), or the config is newer than the state.
@@ -71,7 +85,7 @@ export function menuRules(config: Config, state: EngineState, now: number, limit
       iface: rule.iface,
       target: rule.target,
       detail: ruleDetail(rule, ruleState, now),
-      notice: ruleNotice(ruleState),
+      notice: ruleNotice(ruleState, rule, now),
     };
   });
   const routes = state.rules.reduce((sum, rule) => sum + rule.appliedDestinations.length, 0);

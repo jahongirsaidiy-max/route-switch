@@ -34,6 +34,7 @@ import type {
   RsStateChannel,
 } from '../renderer/src/rs';
 import { readConfigFile, writeConfigFile, type ConfigFileSystem } from './configFile';
+import { createConnectionJournal } from './connectionJournal';
 import type { HelperClient, HelperStatus } from './helperClient';
 import { createLogBuffer, type LogBuffer } from './logBuffer';
 import type { Logger } from './logger';
@@ -68,7 +69,12 @@ export const INVOKE_CHANNELS = [
   'rs:copyServiceOrderCommand',
   'rs:uninstall',
   'rs:openRulesWindow',
+  'rs:reconnect',
+  'rs:resetConfig',
 ] as const satisfies readonly RsInvokeChannel[];
+
+/** What "Bo'sh config bilan boshlash" stores in place of a config the helper cannot load. */
+export const EMPTY_CONFIG: Config = { version: 1, enabled: true, rules: [] };
 
 /** The part of a `WebFrameMain` a call is checked against. */
 export interface SenderFrame {
@@ -96,13 +102,13 @@ export interface StateRecipient {
 
 export interface IpcDeps {
   readonly ipcMain: IpcMainLike;
-  readonly helperClient: Pick<HelperClient, 'request' | 'snapshot' | 'onStatus' | 'onState' | 'onLog'>;
+  readonly helperClient: Pick<HelperClient, 'request' | 'snapshot' | 'reconnectNow' | 'onStatus' | 'onState' | 'onLog'>;
   /** The app's page (`Runtime.entryUrl`): the only document whose calls are answered. */
   readonly entryUrl: string;
   readonly logger: Logger;
   /** The renderers to send `rs:state` and `rs:log` to. Each is sent to only while it shows the app's page. */
   readonly listRecipients: () => readonly StateRecipient[];
-  /** Where the helper's `log` events are kept for the journal; a new 500-entry buffer by default. */
+  /** Where the helper's `log` events (and the app's own connection events) are kept for the journal; a new 500-entry buffer by default. */
   readonly logBuffer?: LogBuffer;
   /** The login item and the network service order (settings screen). */
   readonly settings: Settings;
@@ -114,7 +120,7 @@ export interface IpcDeps {
   readonly configFs?: ConfigFileSystem;
   /** Token of an import waiting for confirmation; `crypto.randomUUID` by default. */
   readonly newToken?: () => string;
-  /** Milliseconds, for the age of a waiting import; `Date.now` by default. */
+  /** Milliseconds since the epoch, for the age of a waiting import and the time of the app's journal lines; `Date.now` by default. */
   readonly now?: () => number;
 }
 
@@ -204,6 +210,8 @@ const ARGUMENTS = {
   'rs:copyServiceOrderCommand': argumentsOf(),
   'rs:uninstall': argumentsOf(),
   'rs:openRulesWindow': argumentsOf(),
+  'rs:reconnect': argumentsOf(),
+  'rs:resetConfig': argumentsOf(),
 } as const satisfies Readonly<Record<RsInvokeChannel, ArgsParser<readonly unknown[]>>>;
 
 type ParsedArgs<C extends RsInvokeChannel> = (typeof ARGUMENTS)[C] extends ArgsParser<infer A> ? A : never;
@@ -233,6 +241,7 @@ export function registerIpcHandlers(deps: IpcDeps): IpcRegistration {
   const failureLog = logger.limited('ipc-call-failed');
   const changeLog = logger.limited('ipc-change');
   const windowLog = logger.limited('ipc-window');
+  const reconnectLog = logger.limited('ipc-reconnect');
   const internalLog = logger.limited('ipc-internal');
   const pushLog = logger.limited('ipc-push-failed');
   const journalLog = logger.limited('ipc-journal-failed');
@@ -405,6 +414,22 @@ export function registerIpcHandlers(deps: IpcDeps): IpcRegistration {
       windowLog.info('Rules window requested', { channel: 'rs:openRulesWindow' });
       return Promise.resolve({ ok: true, value: null });
     },
+    // "Qayta ulanish": the client ignores it while a connection is open or being opened.
+    'rs:reconnect': () => {
+      reconnectLog.info('Reconnect to the helper requested', { channel: 'rs:reconnect', status: helperClient.snapshot().status.kind });
+      helperClient.reconnectNow();
+      return Promise.resolve({ ok: true, value: null });
+    },
+    // Only while the stored config cannot be loaded: then it replaces nothing the user could still read.
+    'rs:resetConfig': () =>
+      serially(async (): Promise<RsResult<RsInvokeChannels['rs:resetConfig']['value']>> => {
+        if (helperClient.snapshot().status.kind !== 'config-unreadable') {
+          return failure('operation-failed', 'The stored config is not unreadable; nothing was reset');
+        }
+        const saved = await helperClient.request('setConfig', { config: EMPTY_CONFIG });
+        changeLog.info('Unreadable config replaced with an empty one', { channel: 'rs:resetConfig', ok: saved.ok });
+        return saved;
+      }),
   };
 
   const register = (channel: RsInvokeChannel): void => {
@@ -479,8 +504,12 @@ export function registerIpcHandlers(deps: IpcDeps): IpcRegistration {
     broadcast(STATE_CHANNEL, snapshot);
   };
 
+  // The app's own journal lines: the helper cannot report that it is gone.
+  const connectionJournal = createConnectionJournal({ logBuffer, now });
+
   const unsubscribes = [
     helperClient.onStatus(push),
+    helperClient.onStatus(connectionJournal.record),
     helperClient.onState(push),
     // Every `log` event of the helper goes into the journal, and from there to the open windows.
     helperClient.onLog((event) => {

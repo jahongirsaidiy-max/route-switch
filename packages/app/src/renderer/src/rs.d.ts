@@ -22,6 +22,9 @@ import type {
  * - `connected`     — requests can be made, `state` is present;
  * - `not-installed` — there is no helper socket: the helper was never installed (or was removed);
  * - `disconnected`  — installed, but there is no connection right now (`reason` says why);
+ * - `config-unreadable` — the helper runs, but its stored config cannot be loaded: it applies
+ *                     nothing until a new config replaces it (`applyImport`, `resetConfig`);
+ *                     calls can be made, `state` is null;
  * - `incompatible`  — the helper speaks another protocol version and must be reinstalled;
  * - `stopped`       — the app is shutting down.
  */
@@ -34,6 +37,7 @@ export type RsConnection =
       readonly kind: 'disconnected';
       readonly reason: 'not-running' | 'permission-denied' | 'connection-lost' | 'protocol-error' | 'timeout' | 'error';
     }
+  | { readonly kind: 'config-unreadable'; readonly helperVersion: string }
   | {
       readonly kind: 'incompatible';
       readonly helperVersion: string;
@@ -47,14 +51,20 @@ export interface RsSnapshot {
   readonly state: EngineState | null;
 }
 
-/** One line of the journal: a `log` event of the helper, numbered by the main process. */
+/**
+ * One line of the journal, numbered by the main process: a `log` event of the
+ * helper, or an event of the app itself (`source: 'app'` — the helper
+ * connection was lost, came back, …), written in the UI's words.
+ */
 export interface RsLogEntry {
   /** 1 for the first entry of this app run, then +1 for each; never reused. Newer entries have higher numbers. */
   readonly seq: number;
   readonly level: EventLogLevel;
   readonly msg: string;
-  /** When the helper logged it (ISO 8601, UTC). */
+  /** When the helper (or the app) logged it (ISO 8601, UTC). */
   readonly at: string;
+  /** Present on the app's own entries only; an entry without it came from the helper. */
+  readonly source?: 'app';
 }
 
 /** The app's own settings, kept by macOS rather than in the helper's config. */
@@ -208,9 +218,9 @@ export interface RsApi {
    */
   onState(listener: (snapshot: RsSnapshot) => void): RsUnsubscribe;
   /**
-   * The journal: the last 500 `log` events of the helper that the app received
-   * during this run, oldest first. Kept by the main process, so it includes
-   * events from before the window was opened.
+   * The journal: the last 500 entries of this run, oldest first — `log` events
+   * of the helper and the app's own events about the helper connection. Kept by
+   * the main process, so it includes events from before the window was opened.
    */
   getLog(): Promise<RsResult<readonly RsLogEntry[]>>;
   /**
@@ -247,6 +257,19 @@ export interface RsApi {
    * the helper. The value is null.
    */
   openRulesWindow(): Promise<RsResult<null>>;
+  /**
+   * Tries to connect to the helper now instead of waiting for the next
+   * automatic attempt ("Qayta ulanish"). The value is null; the outcome
+   * arrives as a new connection in `onState`. Does nothing while connected.
+   */
+  reconnectHelper(): Promise<RsResult<null>>;
+  /**
+   * Replaces a stored config the helper cannot load with an empty one
+   * (`setConfig` of `{version: 1, enabled: true, rules: []}`), queued with
+   * the other changes. Refused (`operation-failed`, nothing sent) unless the
+   * connection is `config-unreadable`.
+   */
+  resetConfig(): Promise<RsResult<SetConfigResult>>;
 }
 
 /** Channel -> arguments and value of the call behind it. Main and preload are typed against this table. */
@@ -270,6 +293,8 @@ export interface RsInvokeChannels {
   'rs:copyServiceOrderCommand': { readonly args: readonly []; readonly value: RsServiceOrder };
   'rs:uninstall': { readonly args: readonly []; readonly value: UninstallResult };
   'rs:openRulesWindow': { readonly args: readonly []; readonly value: null };
+  'rs:reconnect': { readonly args: readonly []; readonly value: null };
+  'rs:resetConfig': { readonly args: readonly []; readonly value: SetConfigResult };
 }
 
 export type RsInvokeChannel = keyof RsInvokeChannels;

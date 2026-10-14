@@ -119,7 +119,7 @@
   background: var(--rs-color-code);
   color: var(--rs-color-text-strong-secondary);
   font-family: var(--rs-font-mono);
-  font-size: 11.5px;
+  font-size: var(--rs-text-mono-small);
   white-space: pre-wrap;
   overflow-wrap: anywhere;
   -webkit-user-select: text;

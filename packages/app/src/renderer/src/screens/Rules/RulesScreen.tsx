@@ -5,9 +5,11 @@
 // switch shows what the config holds, never the click (it changes once the
 // helper has stored it and the new revision has been read).
 
+import { PATHS } from '@routeswitch/shared';
 import { useEffect, useMemo, useRef, useState, type ReactElement, type Ref } from 'react';
 
 import {
+  Banner,
   Button,
   EditIcon,
   IfaceTag,
@@ -22,8 +24,8 @@ import { configStoreFor, useConfig, type ConfigView } from '../../hooks/useConfi
 import { useEngineState, type EngineStateView } from '../../hooks/useEngineState';
 import { useNow } from '../../hooks/useNow';
 import type { RsApi } from '../../rs';
-import { errorText, type Feedback } from '../../text';
-import { helperNotice, statusLine } from '../MenuBar';
+import { errorText, helperNotice, networkWarnings, type Feedback } from '../../text';
+import { statusLine } from '../MenuBar';
 import type { RulesApi } from './actions';
 import { createRulesController, focusTrashButton, INITIAL_RULES_UI, rulesHandlers, type RulesUiState } from './controller';
 import {
@@ -36,6 +38,14 @@ import {
   type RowFilter,
   type RuleRow,
 } from './model';
+import {
+  createRecoveryController,
+  focusResetButton,
+  INITIAL_RECOVERY_UI,
+  recoveryHandlers,
+  type RecoveryApi,
+  type RecoveryUiState,
+} from './recovery';
 import styles from './RulesScreen.module.css';
 import {
   createTransferController,
@@ -47,6 +57,9 @@ import {
   type TransferApi,
   type TransferUiState,
 } from './transfer';
+
+/** Why "Qoida qo'shish" and "Export" are off while the helper cannot load its stored config (TASK-300). */
+export const CONFIG_UNREADABLE_REASON = "Helper config'i buzilgan — avval import qiling yoki bo'sh config bilan boshlang";
 
 /** Why "Qoida qo'shish" / "Tahrirlash" are off until the add-rule form exists. */
 export const ADD_RULE_UNAVAILABLE = "Qoida qo'shish oynasi hali tayyor emas";
@@ -84,6 +97,13 @@ export interface RulesPanelProps {
   readonly onCancelImport: () => void;
   /** The "Import" button, so the focus can return to it after the confirmation closes. */
   readonly importRef?: Ref<HTMLButtonElement> | undefined;
+  /** The way out of an unreadable stored config: "Bo'sh config bilan boshlash" and its question. */
+  readonly recovery: RecoveryUiState;
+  readonly onAskReset: () => void;
+  readonly onCancelReset: () => void;
+  readonly onConfirmReset: () => void;
+  /** The "Bo'sh config bilan boshlash" button, so the focus can return to it after a cancelled question. */
+  readonly resetRef?: Ref<HTMLButtonElement> | undefined;
 }
 
 const COLUMNS = ['Holat', 'Manzil', 'Turi', 'Interfeys', 'Izoh', ''] as const;
@@ -92,10 +112,56 @@ function ReasonLine({ row }: { readonly row: RuleRow }): ReactElement | null {
   const status = row.status;
   if (status.kind === 'ok' || status.kind === 'none') return null;
   return (
-    <span className={styles['reason']} data-tone={status.kind}>
-      {status.kind === 'warning' ? <StatusDot tone="warning" size="sm" label="Ogohlantirish" /> : null}
-      {status.text}
-    </span>
+    <>
+      <span className={styles['reason']} data-tone={status.kind}>
+        {status.kind === 'warning' ? <StatusDot tone="warning" size="sm" label="Ogohlantirish" /> : null}
+        {status.text}
+      </span>
+      {row.lastKnown === null ? null : <span className={styles['lastKnown']}>{row.lastKnown}</span>}
+    </>
+  );
+}
+
+/**
+ * The helper runs but cannot load its stored config: what happened, and the
+ * two ways out — the toolbar's "Import" (here too), or an empty config after
+ * a confirmation.
+ */
+function ConfigRecovery(props: RulesPanelProps): ReactElement {
+  const { recovery } = props;
+  return (
+    <>
+      <div className={styles['recoveryActions']}>
+        <Button variant="primary" busy={props.transfer.phase !== 'idle'} onClick={props.onImport}>
+          Config'ni import qilish
+        </Button>
+        <Button ref={props.resetRef} busy={recovery.busy || recovery.confirming} onClick={props.onAskReset}>
+          Bo'sh config bilan boshlash
+        </Button>
+      </div>
+      {recovery.confirming ? (
+        <div
+          className={styles['confirm']}
+          role="alertdialog"
+          aria-labelledby="rules-reset-question"
+          onKeyDown={(event) => {
+            if (event.key === 'Escape') props.onCancelReset();
+          }}
+        >
+          <p id="rules-reset-question" className={styles['confirmText']}>
+            Saqlangan (o'qib bo'lmaydigan) config bo'sh config bilan almashtirilsinmi? Undagi qoidalar qaytmaydi — qo'lda
+            tiklamoqchi bo'lsangiz, avval {PATHS.config} nusxasini oling.
+          </p>
+          <Button variant="primary" busy={recovery.busy} onClick={props.onConfirmReset}>
+            Almashtirish
+          </Button>
+          {/* The safe choice takes the focus (WAI-ARIA alertdialog). */}
+          <Button autoFocus busy={recovery.busy} onClick={props.onCancelReset}>
+            Bekor qilish
+          </Button>
+        </div>
+      ) : null}
+    </>
   );
 }
 
@@ -217,12 +283,15 @@ export function RulesPanel(props: RulesPanelProps): ReactElement {
   const { engine, config } = props;
   const state = engine.helper === 'connected' ? engine.state : null;
   const loaded = state !== null && config.config !== null ? { state, config: config.config } : null;
-  const rows = loaded === null ? [] : ruleRows(loaded.config, loaded.state);
+  const rows = loaded === null ? [] : ruleRows(loaded.config, loaded.state, props.now);
+  const warnings = state === null ? [] : networkWarnings(state, config.config);
   const visible = loaded === null ? [] : visibleRows(rows, notesById(loaded.config), props.query, props.filter);
   const overlaps = loaded === null ? [] : overlapWarnings(loaded.config);
   const confirming = rows.find((row) => row.id === props.confirmingDelete) ?? null;
   const importing = props.transfer.preview;
   const notice = state === null ? helperNotice(engine) : null;
+  const configBroken = engine.helper === 'config-unreadable';
+  const addRuleOff = props.onAddRule === undefined ? ADD_RULE_UNAVAILABLE : configBroken ? CONFIG_UNREADABLE_REASON : null;
   const line = loaded === null ? null : statusLine(loaded.state, props.now);
 
   return (
@@ -236,15 +305,15 @@ export function RulesPanel(props: RulesPanelProps): ReactElement {
             Qaysi manzil qaysi interfeys orqali borishini belgilang. Qolgan trafik default kanal orqali ketadi.
           </p>
         </div>
-        <span className={styles['addRule']} title={props.onAddRule === undefined ? ADD_RULE_UNAVAILABLE : undefined}>
+        <span className={styles['addRule']} title={addRuleOff ?? undefined}>
           <Button
             variant="primary"
             size="lg"
             onClick={() => {
               props.onAddRule?.();
             }}
-            disabled={props.onAddRule === undefined}
-            label={props.onAddRule === undefined ? `Qoida qo'shish — ${ADD_RULE_UNAVAILABLE}` : undefined}
+            disabled={addRuleOff !== null}
+            label={addRuleOff === null ? undefined : `Qoida qo'shish — ${addRuleOff}`}
           >
             <PlusIcon size={14} />
             Qoida qo'shish
@@ -291,14 +360,28 @@ export function RulesPanel(props: RulesPanelProps): ReactElement {
         >
           Import
         </Button>
-        <Button busy={props.transfer.phase !== 'idle'} label="Config export (JSON faylga)" onClick={props.onExport}>
-          Export
-        </Button>
+        {/* Nothing to export while the stored config cannot be read; the reason is in the name (a disabled button is not focusable). */}
+        <span title={configBroken ? CONFIG_UNREADABLE_REASON : undefined}>
+          <Button
+            busy={props.transfer.phase !== 'idle'}
+            disabled={configBroken}
+            label={configBroken ? `Config export — ${CONFIG_UNREADABLE_REASON}` : 'Config export (JSON faylga)'}
+            onClick={props.onExport}
+          >
+            Export
+          </Button>
+        </span>
       </div>
 
       {props.feedback === null ? null : (
         <p className={styles['feedback']} data-tone={props.feedback.tone} role="alert">
           {props.feedback.text}
+        </p>
+      )}
+
+      {props.recovery.feedback === null ? null : (
+        <p className={styles['feedback']} data-tone={props.recovery.feedback.tone} role={props.recovery.feedback.tone === 'danger' ? 'alert' : 'status'}>
+          {props.recovery.feedback.text}
         </p>
       )}
 
@@ -368,6 +451,14 @@ export function RulesPanel(props: RulesPanelProps): ReactElement {
         </div>
       )}
 
+      {warnings.length === 0 ? null : (
+        <div className={styles['warnings']}>
+          {warnings.map((warning) => (
+            <Banner key={warning.id} tone="warning" title={warning.title} text={warning.text} />
+          ))}
+        </div>
+      )}
+
       {overlaps.length === 0 ? null : (
         <div className={styles['overlaps']} role="note" aria-label="Ustma-ust manzillar">
           <p className={styles['overlapsTitle']}>Ustma-ust manzillar — aniqrog'i (uzunroq prefiks) ustun keladi:</p>
@@ -389,6 +480,7 @@ export function RulesPanel(props: RulesPanelProps): ReactElement {
             <>
               <p className={styles['emptyTitle']}>{notice.title}</p>
               {notice.text === '' ? null : <p>{notice.text}</p>}
+              {notice.recovery === 'repair-config' ? <ConfigRecovery {...props} /> : null}
             </>
           ) : config.phase === 'failed' ? (
             <>
@@ -440,7 +532,7 @@ export function RulesPanel(props: RulesPanelProps): ReactElement {
 
 export interface RulesScreenProps {
   /** The preload API; `window.rs` in the app. */
-  readonly rs?: RulesApi & TransferApi & Pick<RsApi, 'getState' | 'onState' | 'getConfig'>;
+  readonly rs?: RulesApi & TransferApi & RecoveryApi & Pick<RsApi, 'getState' | 'onState' | 'getConfig'>;
   /** Opens the add-rule form (TASK-213). */
   readonly onAddRule?: () => void;
   readonly onEditRule?: (id: string) => void;
@@ -514,6 +606,28 @@ export function RulesScreen({ rs: given, onAddRule, onEditRule }: RulesScreenPro
   }, [transfer, transferController]);
   const handlers = rulesHandlers(controller);
 
+  const [recovery, setRecovery] = useState<RecoveryUiState>(INITIAL_RECOVERY_UI);
+  const latestRecovery = useRef(recovery);
+  latestRecovery.current = recovery;
+  const recoveryController = useMemo(
+    () =>
+      createRecoveryController(
+        rs,
+        (change) => {
+          latestRecovery.current = change(latestRecovery.current);
+          setRecovery(latestRecovery.current);
+        },
+        () => latestRecovery.current,
+      ),
+    [rs],
+  );
+  const resetButton = useRef<HTMLButtonElement | null>(null);
+  useEffect(() => {
+    if (!recovery.focusReset) return;
+    focusResetButton(resetButton.current);
+    recoveryController.focusDone();
+  }, [recovery.focusReset, recoveryController]);
+
   return (
     <RulesPanel
       engine={engine}
@@ -534,6 +648,9 @@ export function RulesScreen({ rs: given, onAddRule, onEditRule }: RulesScreenPro
       onAddRule={onAddRule}
       onEditRule={onEditRule}
       trashRef={trashRef}
+      recovery={recovery}
+      {...recoveryHandlers(recoveryController)}
+      resetRef={resetButton}
     />
   );
 }

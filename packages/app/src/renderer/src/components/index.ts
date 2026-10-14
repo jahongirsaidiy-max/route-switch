@@ -1,4 +1,6 @@
+export { Banner, type BannerProps } from './Banner';
 export { Button, type ButtonProps } from './Button';
+export { HelperRecovery, requestReconnect, type HelperRecoveryProps } from './HelperRecovery';
 export * from './icons';
 export {
   IfaceTag,

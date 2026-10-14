@@ -2,7 +2,7 @@ import type { Config, EngineState } from '@routeswitch/shared';
 import { describe, expect, it } from 'vitest';
 
 import { RULE_REASON_TEXT } from '../../text';
-import { CONFIG, ID, STATE, ruleState } from '../MenuBar/fixtures';
+import { CONFIG, ID, NOW, STATE, ruleState } from '../MenuBar/fixtures';
 import {
   activeCount,
   kindLabel,
@@ -74,7 +74,7 @@ describe('rowStatus', () => {
 
 describe('ruleRows', () => {
   it('every rule of the config in order, joined with its state and the role device', () => {
-    const rows = ruleRows(CONFIG, STATE);
+    const rows = ruleRows(CONFIG, STATE, NOW);
     expect(rows.map((row) => row.target)).toEqual([
       '10.0.0.0/8',
       '10.9.9.9',
@@ -87,14 +87,23 @@ describe('ruleRows', () => {
     expect(rows[4]).toMatchObject({ iface: 'wifi', device: 'en0', kindLabel: 'Domen', detail: '3 IP · har 10 daq' });
   });
 
+  it('a failed domain rule carries its last known addresses; others, and switched-off rules, none', () => {
+    const failed = withRules(STATE.rules.map((rule) => (rule.ruleId === ID.domain ? { ...rule, status: 'error' as const, reasonCode: 'resolve-failed' as const } : rule)));
+    const rows = ruleRows(CONFIG, failed, NOW);
+    expect(rows[4]?.lastKnown).toBe("Oxirgi ma'lum IP'lar (hali yo'naltirilmoqda): 140.82.112.3, 140.82.112.4, 140.82.113.3 · 2 daq oldin");
+    expect(rows.filter((row) => row.lastKnown !== null)).toHaveLength(1);
+    const off = ruleRows({ ...CONFIG, rules: CONFIG.rules.map((rule) => (rule.id === ID.domain ? { ...rule, enabled: false } : rule)) }, failed, NOW);
+    expect(off[4]?.lastKnown).toBeNull();
+  });
+
   it('a role without a device shows none', () => {
     const state = { ...STATE, interfaces: { ...STATE.interfaces, wifi: { device: null, ip: null, gateway: null, up: false } } };
-    expect(ruleRows(CONFIG, state)[4]?.device).toBeNull();
+    expect(ruleRows(CONFIG, state, NOW)[4]?.device).toBeNull();
   });
 });
 
 describe('visibleRows', () => {
-  const rows = ruleRows(CONFIG, withRules([...STATE.rules.slice(0, 3), ruleState(ID.host, { status: 'error', reasonCode: 'route-failed' }), ruleState(ID.domain, { reasonCode: 'overridden-by-rule' }), ruleState(ID.test)]));
+  const rows = ruleRows(CONFIG, withRules([...STATE.rules.slice(0, 3), ruleState(ID.host, { status: 'error', reasonCode: 'route-failed' }), ruleState(ID.domain, { reasonCode: 'overridden-by-rule' }), ruleState(ID.test)]), NOW);
   const notes = notesById(CONFIG);
   const targets = (list: RuleRow[]) => list.map((row) => row.target);
 
@@ -122,7 +131,7 @@ describe('visibleRows', () => {
 
   it('a rule switched off in the config whose state still says error (revision in between) is not a problem', () => {
     const config: Config = { ...CONFIG, rules: CONFIG.rules.map((rule) => (rule.id === ID.host ? { ...rule, enabled: false } : rule)) };
-    const stale = ruleRows(config, withRules([ruleState(ID.host, { status: 'error', reasonCode: 'route-failed' }), ruleState(ID.subnet, { status: 'pending', reasonCode: 'interface-down' })]));
+    const stale = ruleRows(config, withRules([ruleState(ID.host, { status: 'error', reasonCode: 'route-failed' }), ruleState(ID.subnet, { status: 'pending', reasonCode: 'interface-down' })]), NOW);
     expect(stale.find((row) => row.id === ID.host)).toMatchObject({ enabled: false, status: { kind: 'error' } });
     expect(targets(visibleRows(stale, notes, '', 'problems'))).toEqual(['10.0.0.0/8']);
     expect(targets(visibleRows(stale, notes, '', 'off'))).toEqual(['10.9.9.9', '172.16.12.40']);
