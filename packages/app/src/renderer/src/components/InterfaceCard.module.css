@@ -1,0 +1,120 @@
+/* Menu bar interface card: padding 10 12, gap 12, white, border #E2E4E7, radius 8. */
+.card {
+  display: flex;
+  align-items: center;
+  gap: var(--rs-space-6);
+  padding: var(--rs-space-5) var(--rs-space-6);
+  border: 1px solid var(--rs-color-border);
+  border-radius: var(--rs-radius-card);
+  background: var(--rs-color-raised);
+}
+
+.icon {
+  flex-shrink: 0;
+  color: var(--rs-color-ethernet);
+}
+
+.card[data-role='wifi'] .icon {
+  color: var(--rs-color-wifi);
+}
+
+.card[data-tone='neutral'] .icon {
+  color: var(--rs-color-text-disabled);
+}
+
+.body {
+  display: flex;
+  flex: 1;
+  flex-direction: column;
+  gap: var(--rs-space-1);
+  min-width: 0;
+}
+
+.title {
+  display: flex;
+  align-items: center;
+  gap: var(--rs-space-4);
+}
+
+.name {
+  color: var(--rs-color-text);
+  font-size: var(--rs-text-body);
+  font-weight: var(--rs-weight-medium);
+}
+
+.detail {
+  overflow: hidden;
+  color: var(--rs-color-text-muted);
+  font-family: var(--rs-font-mono);
+  font-size: var(--rs-text-caption);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.defaultTag {
+  padding: var(--rs-space-1) var(--rs-space-3);
+  border-radius: var(--rs-radius-tag);
+  background: var(--rs-color-wifi-soft);
+  color: var(--rs-color-wifi-soft-text);
+  font-size: var(--rs-text-tag);
+  font-weight: var(--rs-weight-semibold);
+}
+
+/* ETH / WIFI tag: 10px / 600, white on the role colour, 2px 6px, radius 4. */
+.tag {
+  flex-shrink: 0;
+  min-width: 38px;
+  padding: var(--rs-space-1) var(--rs-space-3);
+  border-radius: var(--rs-radius-tag);
+  background: var(--rs-color-ethernet);
+  color: var(--rs-color-on-accent);
+  font-size: var(--rs-text-tag);
+  font-weight: var(--rs-weight-semibold);
+  line-height: 1.4;
+  text-align: center;
+}
+
+.tag[data-role='wifi'] {
+  background: var(--rs-color-wifi);
+}
+
+/* Add-rule interface option: padding 12, 2px border, radius 9; selected: accent border, tint fill. */
+.option {
+  display: flex;
+  align-items: center;
+  gap: var(--rs-space-5);
+  padding: var(--rs-space-6);
+  border: 2px solid var(--rs-color-border);
+  border-radius: var(--rs-radius-option);
+  background: var(--rs-color-raised);
+  font-family: inherit;
+  text-align: left;
+  cursor: pointer;
+  transition:
+    border-color var(--rs-transition),
+    background-color var(--rs-transition);
+}
+
+.option .tag {
+  padding-block: 3px; /* the add-rule option tag is 3px 6px */
+}
+
+.option:hover:not(:disabled) {
+  border-color: var(--rs-color-border-strong);
+}
+
+.option[data-selected='true'],
+.option[data-selected='true']:hover:not(:disabled) {
+  border-color: var(--rs-color-accent);
+  background: var(--rs-color-accent-tint);
+}
+
+.option:focus-visible {
+  outline: none;
+  box-shadow: var(--rs-shadow-focus);
+}
+
+.option:disabled {
+  cursor: default;
+  opacity: 0.5;
+}

@@ -1,0 +1,142 @@
+/*
+ * Design tokens of the RouteSwitch UI, taken from the design source
+ * (route-switch-docs/RouteSwitch UI.html: "Menu bar oynasi", "Qoidalar oynasi",
+ * "Qoida qo'shish"). Components read only these variables, never raw values.
+ *
+ * Values the design does not show (the `pending` / `error` / `disabled`
+ * status tones, hover of a secondary button) are derived from the design's
+ * own palette and marked "derived".
+ *
+ * Fonts are bundled (the page's CSP allows `font-src 'self'` only): IBM Plex
+ * Sans (variable, 400–600) and IBM Plex Mono 400, latin subsets, exactly the
+ * files the design ships. License: ./fonts/OFL.txt.
+ */
+
+@font-face {
+  font-family: 'IBM Plex Sans';
+  font-style: normal;
+  font-weight: 400 600;
+  font-display: swap;
+  src: url('./fonts/IBMPlexSans-latin.woff2') format('woff2');
+}
+
+@font-face {
+  font-family: 'IBM Plex Mono';
+  font-style: normal;
+  font-weight: 400;
+  font-display: swap;
+  src: url('./fonts/IBMPlexMono-Regular-latin.woff2') format('woff2');
+}
+
+:root {
+  /* Typefaces */
+  --rs-font-sans: 'IBM Plex Sans', system-ui, -apple-system, sans-serif;
+  --rs-font-mono: 'IBM Plex Mono', ui-monospace, monospace;
+
+  /* Type scale (size / weight as used in the design) */
+  --rs-text-title: 22px; /* rules window h1, 600 */
+  --rs-text-dialog-title: 18px; /* add-rule h1, 600 */
+  --rs-text-brand: 15px; /* popover header, 600 */
+  --rs-text-body: 13px; /* buttons, inputs, names */
+  --rs-text-mono-body: 12.5px; /* rule target in the table */
+  --rs-text-small: 12px; /* hints, secondary columns, field labels */
+  --rs-text-caption: 11px; /* section labels (uppercase), mono details */
+  --rs-text-tag: 10px; /* ETH / WIFI / DEFAULT / status tags, 600 */
+  --rs-weight-regular: 400;
+  --rs-weight-medium: 500;
+  --rs-weight-semibold: 600;
+  --rs-tracking-label: 0.06em;
+  --rs-line-height: 1.4;
+
+  /* Surfaces */
+  --rs-color-canvas: #e7e8ea; /* behind the window panel */
+  --rs-color-surface: #fbfbfc; /* window panel */
+  --rs-color-raised: #ffffff; /* cards, inputs, table */
+  --rs-color-sidebar: #f1f2f4;
+  --rs-color-subtle: #f3f4f6; /* popover status row */
+  --rs-color-muted-surface: #f6f7f8; /* table header, rules footer */
+  --rs-color-track: #eeeff1; /* segment track */
+  --rs-color-code: #f1f2f4; /* command preview */
+
+  /* Borders */
+  --rs-color-border-strong: #d4d6da; /* panel, inputs, secondary buttons */
+  --rs-color-border: #e2e4e7; /* cards, table */
+  --rs-color-divider: #ecedef; /* header / footer rules */
+  --rs-color-row-divider: #f0f1f3;
+
+  /* Text */
+  --rs-color-text: #1b1d21;
+  --rs-color-text-strong-secondary: #3a3e46; /* field labels, sidebar links */
+  --rs-color-text-secondary: #4a4e57;
+  --rs-color-text-muted: #5b5f68;
+  --rs-color-text-caption: #6b6f78;
+  --rs-color-text-disabled: #8a8e96;
+  --rs-color-on-accent: #ffffff;
+
+  /* Accent (the design's default `accent` prop) */
+  --rs-color-accent: #1d5fd1;
+  --rs-color-accent-hover: #164aa6;
+  --rs-color-accent-soft: #dde6f7; /* selected sidebar item */
+  --rs-color-accent-soft-text: #123e8c;
+  --rs-color-accent-tint: #f3f7fe; /* selected interface option */
+  --rs-color-focus-ring: #d7e3f8;
+
+  /* Interface roles */
+  --rs-color-ethernet: #1d5fd1;
+  --rs-color-wifi: #c2620a;
+  --rs-color-wifi-soft: #fcebd9; /* DEFAULT tag */
+  --rs-color-wifi-soft-text: #8a4407;
+
+  /* Toggle */
+  --rs-color-toggle-off: #c9ccd1;
+  --rs-color-knob: #ffffff;
+
+  /* Status */
+  --rs-color-success: #1e8a4c; /* connected dot, enabled rule toggle, check icon */
+  --rs-color-success-soft: #e3f3ea; /* derived */
+  --rs-color-success-soft-text: #17673a; /* derived */
+  --rs-color-warning: #c2620a; /* derived (wifi orange) */
+  --rs-color-warning-soft: #fcebd9;
+  --rs-color-warning-soft-text: #8a4407;
+  --rs-color-danger: #e5554f; /* window close dot */
+  --rs-color-danger-soft: #fde8e7; /* derived */
+  --rs-color-danger-soft-text: #a3261f; /* derived */
+  --rs-color-neutral-soft: #eeeff1;
+  --rs-color-neutral-soft-text: #5b5f68;
+  --rs-color-hover: #f3f4f6; /* derived: secondary / ghost button hover */
+
+  /* Radii */
+  --rs-radius-tag: 4px;
+  --rs-radius-sm: 6px; /* sidebar item, icon button, segment item */
+  --rs-radius-control: 7px; /* buttons, inputs */
+  --rs-radius-card: 8px; /* interface card, segment track */
+  --rs-radius-option: 9px; /* selectable interface card */
+  --rs-radius-table: 10px;
+  --rs-radius-window: 12px;
+  --rs-radius-pill: 999px;
+
+  /* Spacing */
+  --rs-space-1: 2px;
+  --rs-space-2: 4px;
+  --rs-space-3: 6px;
+  --rs-space-4: 8px;
+  --rs-space-5: 10px;
+  --rs-space-6: 12px;
+  --rs-space-7: 14px;
+  --rs-space-8: 16px;
+  --rs-space-9: 18px;
+  --rs-space-10: 20px;
+  --rs-space-11: 24px;
+  --rs-space-12: 28px;
+
+  /* Control heights */
+  --rs-control-sm: 28px; /* icon button */
+  --rs-control-md: 34px; /* popover buttons, toolbar, search */
+  --rs-control-lg: 36px; /* primary actions of the rules window and the dialog */
+  --rs-control-input: 38px;
+
+  /* Effects */
+  --rs-shadow-raised: 0 1px 2px rgba(0, 0, 0, 0.12); /* selected segment */
+  --rs-shadow-focus: 0 0 0 3px var(--rs-color-focus-ring);
+  --rs-transition: 120ms ease;
+}

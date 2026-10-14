@@ -1,0 +1,61 @@
+/* Menu bar header switch: 38×22, knob 18, accent when on (design "Faol"). */
+.toggle {
+  --toggle-width: 38px;
+  --toggle-height: 22px;
+  --toggle-knob: 18px;
+  --toggle-on: var(--rs-color-accent);
+
+  position: relative;
+  flex-shrink: 0;
+  width: var(--toggle-width);
+  height: var(--toggle-height);
+  padding: 0;
+  border: none;
+  border-radius: var(--rs-radius-pill);
+  background: var(--rs-color-toggle-off);
+  cursor: pointer;
+  transition: background-color var(--rs-transition);
+}
+
+/* Rules table switch: 32×18, knob 14, green when on. */
+.toggle[data-size='sm'] {
+  --toggle-width: 32px;
+  --toggle-height: 18px;
+  --toggle-knob: 14px;
+  --toggle-on: var(--rs-color-success);
+}
+
+.toggle[data-checked='true'] {
+  background: var(--toggle-on);
+}
+
+.knob {
+  position: absolute;
+  top: 2px;
+  left: 2px;
+  display: block;
+  width: var(--toggle-knob);
+  height: var(--toggle-knob);
+  border-radius: var(--rs-radius-pill);
+  background: var(--rs-color-knob);
+  transition: transform var(--rs-transition);
+}
+
+.toggle[data-checked='true'] .knob {
+  transform: translateX(calc(var(--toggle-width) - var(--toggle-knob) - 4px));
+}
+
+.toggle:focus-visible {
+  outline: none;
+  box-shadow: var(--rs-shadow-focus);
+}
+
+.toggle:disabled {
+  cursor: default;
+  opacity: 0.5;
+}
+
+.toggle[data-busy] {
+  opacity: 0.7;
+  cursor: progress;
+}
