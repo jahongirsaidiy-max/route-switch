@@ -8,7 +8,6 @@ export {
 } from './SettingsScreen';
 export {
   copyServiceOrderCommand,
-  errorText,
   ethernetChoices,
   saveEthernetOverride,
   setOpenAtLogin,

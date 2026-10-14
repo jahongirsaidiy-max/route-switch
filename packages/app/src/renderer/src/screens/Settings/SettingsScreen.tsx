@@ -11,7 +11,6 @@ import { useEngineState, type EngineStateView } from '../../hooks/useEngineState
 import type { RsApi, RsServiceOrder } from '../../rs';
 import {
   copyServiceOrderCommand,
-  errorText,
   ethernetChoices,
   saveEthernetOverride,
   setOpenAtLogin,
@@ -19,6 +18,7 @@ import {
   type Feedback,
   type SettingsApi,
 } from './actions';
+import { errorText, HELPER_STATUS_TEXT } from '../../text';
 import styles from './SettingsScreen.module.css';
 
 export type SettingsSection = 'login' | 'ethernet' | 'wifi' | 'helper';
@@ -59,17 +59,6 @@ function FeedbackLine({ feedback }: { readonly feedback: Feedback | null | undef
   );
 }
 
-const HELPER_STATUS: Readonly<Record<EngineStateView['helper'], { readonly text: string; readonly tone: 'success' | 'warning' | 'danger' | 'neutral' }>> = {
-  loading: { text: 'Tekshirilmoqda…', tone: 'neutral' },
-  connected: { text: 'Helper ishlayapti', tone: 'success' },
-  connecting: { text: 'Helper bilan ulanmoqda…', tone: 'warning' },
-  'not-installed': { text: "Helper o'rnatilmagan", tone: 'neutral' },
-  disconnected: { text: 'Helper ishlamayapti', tone: 'danger' },
-  incompatible: { text: 'Helper versiyasi mos emas', tone: 'danger' },
-  stopped: { text: "Ilova to'xtamoqda", tone: 'neutral' },
-  unavailable: { text: "Holatni o'qib bo'lmadi", tone: 'danger' },
-};
-
 /** The settings for given data; `SettingsScreen` supplies the live data and the actions. */
 export function SettingsPanel(props: SettingsPanelProps): ReactElement {
   const { engine, serviceOrder, busy, feedback } = props;
@@ -85,7 +74,7 @@ export function SettingsPanel(props: SettingsPanelProps): ReactElement {
   const ethernetBusy = busy.has('ethernet');
   // An override naming an adapter that is not plugged in stays selectable, so the select shows the truth.
   const missingOverride = override !== null && !choices.some((adapter) => adapter.device === override);
-  const helperStatus = HELPER_STATUS[engine.helper];
+  const helperStatus = HELPER_STATUS_TEXT[engine.helper];
   const order = serviceOrder.order;
 
   return (

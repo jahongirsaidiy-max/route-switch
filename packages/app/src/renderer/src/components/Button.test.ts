@@ -17,6 +17,14 @@ describe('Button', () => {
     expect(html).not.toContain('aria-busy');
   });
 
+  it('passes autoFocus and the ref to the <button> (focus management of a confirmation)', () => {
+    const ref = vi.fn();
+    const element = Button({ children: 'Bekor qilish', autoFocus: true, ref });
+    expect(element.type).toBe('button');
+    expect(element.props).toMatchObject({ autoFocus: true, ref });
+    expect(Button({ children: 'x' }).props).toMatchObject({ autoFocus: undefined, ref: undefined });
+  });
+
   it('renders each variant and size', () => {
     for (const variant of ['primary', 'secondary', 'ghost'] as const) {
       expect(render({ children: 'x', variant })).toContain(`data-variant="${variant}"`);

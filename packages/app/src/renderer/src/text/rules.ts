@@ -1,6 +1,6 @@
 // The words for what the engine reports about rules and reconciles. The
-// helper sends codes (and an English `reason` for the log); the UI shows
-// these instead. The rules window (TASK-212) reads the same table.
+// helper sends codes (and an English `reason` for the log); every screen
+// shows these instead.
 
 import type { ReconcileReason, RuleReasonCode, RuleState } from '@routeswitch/shared';
 

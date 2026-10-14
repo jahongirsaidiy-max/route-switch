@@ -11,8 +11,6 @@ export {
   MENU_RULE_LIMIT,
   defaultRole,
   errorCount,
-  formatAgo,
-  formatClock,
   interfacesKey,
   menuRules,
   ruleDetail,
@@ -23,4 +21,3 @@ export {
   type RuleNotice,
   type StatusLine,
 } from './model';
-export { RECONCILE_REASON_TEXT, RULE_REASON_TEXT, isActiveWarning, ruleReasonText } from './ruleText';

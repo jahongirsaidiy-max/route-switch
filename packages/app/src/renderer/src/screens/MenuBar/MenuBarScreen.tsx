@@ -19,8 +19,9 @@ import {
 } from '../../components';
 import { configStoreFor, useConfig, type ConfigView } from '../../hooks/useConfig';
 import { useEngineState, type EngineStateView } from '../../hooks/useEngineState';
+import { useNow } from '../../hooks/useNow';
 import type { RsApi, RsConnection, RsServiceOrder } from '../../rs';
-import { errorText, type Feedback } from '../Settings/actions';
+import { errorText, type Feedback } from '../../text';
 import { openRules, reapply, setRouting, type MenuBarApi } from './actions';
 import styles from './MenuBarScreen.module.css';
 import { defaultRole, interfacesKey, menuRules, statusLine, type MenuRule, type StatusLine } from './model';
@@ -282,6 +283,8 @@ export function MenuBarScreen({ rs: given }: MenuBarScreenProps): ReactElement {
   const rs = given ?? window.rs;
   const engine = useEngineState(rs);
   const config = useConfig(rs);
+  // Ticks, and refreshes when the popover is shown again (it is hidden, not closed).
+  const now = useNow();
   const [serviceOrder, setServiceOrder] = useState<RsServiceOrder | null>(null);
   const [busy, setBusy] = useState<ReadonlySet<MenuBarAction>>(new Set());
   const [feedback, setFeedback] = useState<Feedback | null>(null);
@@ -333,7 +336,7 @@ export function MenuBarScreen({ rs: given }: MenuBarScreenProps): ReactElement {
       engine={engine}
       config={config}
       serviceOrder={serviceOrder}
-      now={Date.now()}
+      now={now}
       busy={busy}
       feedback={feedback}
       onToggle={(next) => {

@@ -1,4 +1,4 @@
-import type { ReactElement, ReactNode } from 'react';
+import type { ReactElement, ReactNode, Ref } from 'react';
 
 import styles from './Button.module.css';
 
@@ -16,11 +16,15 @@ export interface ButtonProps {
   /** Stretch to share the row equally with its siblings (menu bar footer). */
   readonly grow?: boolean;
   /** Required when the button shows only an icon. */
-  readonly label?: string;
+  readonly label?: string | undefined;
   readonly disabled?: boolean;
   /** The action is under way: the button is inert and announces it. */
   readonly busy?: boolean;
   readonly type?: 'button' | 'submit';
+  /** Takes the focus when it appears (the safe choice of a confirmation that just opened). */
+  readonly autoFocus?: boolean;
+  /** The `<button>` element, for a caller that moves the focus back to it. */
+  readonly ref?: Ref<HTMLButtonElement> | undefined;
 }
 
 export function Button({
@@ -33,11 +37,15 @@ export function Button({
   disabled = false,
   busy = false,
   type = 'button',
+  autoFocus,
+  ref,
 }: ButtonProps): ReactElement {
   const inert = disabled || busy;
   return (
     <button
+      ref={ref}
       type={type}
+      autoFocus={autoFocus}
       className={styles['button']}
       data-variant={variant}
       data-size={size}

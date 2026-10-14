@@ -2,9 +2,9 @@ import type { AdapterInfo, Config, SetConfigResult } from '@routeswitch/shared';
 import { describe, expect, it, vi } from 'vitest';
 
 import type { RsResult, RsServiceOrder } from '../../rs';
+import { errorText } from '../../text';
 import {
   copyServiceOrderCommand,
-  errorText,
   ethernetChoices,
   saveEthernetOverride,
   setOpenAtLogin,
@@ -37,16 +37,6 @@ function fakeApi(overrides: Partial<SettingsApi> = {}): SettingsApi {
     ...overrides,
   };
 }
-
-describe('errorText', () => {
-  it('words every failure without the English detail', () => {
-    expect(errorText('not-connected')).toContain("aloqa yo'q");
-    expect(errorText('timeout')).toContain("noma'lum");
-    expect(errorText('disconnected')).toBe(errorText('timeout'));
-    expect(errorText('not-implemented')).toContain('hali bajara olmaydi');
-    expect(errorText('internal')).toBe('Kutilmagan xato (internal).');
-  });
-});
 
 describe('ethernetChoices', () => {
   const adapters: AdapterInfo[] = [

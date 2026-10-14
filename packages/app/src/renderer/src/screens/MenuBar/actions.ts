@@ -4,7 +4,7 @@
 // window; none throws.
 
 import type { RsApi, RsResult } from '../../rs';
-import { errorText, type Feedback } from '../Settings/actions';
+import { errorText, type Feedback } from '../../text';
 
 export type MenuBarApi = Pick<RsApi, 'setEnabled' | 'apply' | 'openRulesWindow'>;
 

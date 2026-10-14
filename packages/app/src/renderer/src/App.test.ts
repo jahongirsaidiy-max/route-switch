@@ -4,6 +4,7 @@ import { describe, expect, it } from 'vitest';
 import { App, SCREENS, VIEWS, VIEW_TITLES, parseView, type View } from './App';
 import { renderMarkup } from './components/test-utils';
 import { MenuBarScreen } from './screens/MenuBar';
+import { RulesWindow } from './screens/Rules';
 
 describe('parseView', () => {
   it('reads the view the main process puts in the query', () => {
@@ -45,9 +46,11 @@ describe('App', () => {
     expect(SCREENS.popover).toBe(MenuBarScreen);
   });
 
-  it('has a placeholder for the rules view until its screen lands', () => {
-    const html = renderMarkup(createElement(App, { search: '?view=rules' }));
-    expect(html).toContain(VIEW_TITLES.rules);
-    expect(SCREENS.rules).toBeTypeOf('function');
+  it('the rules view is the rules window (sidebar + sections)', () => {
+    expect(SCREENS.rules).toBe(RulesWindow);
+  });
+
+  it('every view has a title', () => {
+    for (const view of VIEWS) expect(VIEW_TITLES[view].length).toBeGreaterThan(0);
   });
 });

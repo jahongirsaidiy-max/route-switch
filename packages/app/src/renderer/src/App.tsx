@@ -8,6 +8,7 @@ import type { ComponentType, ReactElement } from 'react';
 
 import styles from './App.module.css';
 import { MenuBarScreen } from './screens/MenuBar';
+import { RulesWindow } from './screens/Rules';
 
 /** The screens a window can show; the same values as `WindowView` in the main process. */
 export const VIEWS = ['popover', 'rules'] as const;
@@ -33,22 +34,10 @@ export const VIEW_TITLES: Readonly<Record<View, string>> = {
   rules: 'Qoidalar oynasi',
 };
 
-function ScreenPlaceholder({ view }: { readonly view: View }): ReactElement {
-  return (
-    <div className={styles['placeholder']}>
-      <h1 className={styles['title']}>RouteSwitch</h1>
-      <p className={styles['subtitle']}>{VIEW_TITLES[view]}</p>
-    </div>
-  );
-}
-
-/**
- * The screen component of each view. TASK-212 replaces the rules placeholder
- * with `screens/Rules`.
- */
+/** The screen component of each view. */
 export const SCREENS: Readonly<Record<View, ComponentType>> = {
   popover: MenuBarScreen,
-  rules: () => <ScreenPlaceholder view="rules" />,
+  rules: RulesWindow,
 };
 
 export interface AppProps {

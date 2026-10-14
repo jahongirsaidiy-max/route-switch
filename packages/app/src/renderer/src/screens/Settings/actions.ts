@@ -3,41 +3,15 @@
 
 import type { AdapterInfo, Config } from '@routeswitch/shared';
 
-import type { RsApi, RsErrorCode, RsIfaceOverrides, RsResult, RsServiceOrder } from '../../rs';
+import type { RsApi, RsIfaceOverrides, RsResult, RsServiceOrder } from '../../rs';
+import { errorText, type Feedback } from '../../text';
+
+export type { Feedback };
 
 export type SettingsApi = Pick<
   RsApi,
   'getSettings' | 'setOpenAtLogin' | 'getConfig' | 'setIfaceOverrides' | 'getServiceOrder' | 'copyServiceOrderCommand' | 'uninstallHelper'
 >;
-
-export interface Feedback {
-  readonly tone: 'success' | 'danger';
-  readonly text: string;
-}
-
-/** The words for a failed call. `error` (English, for the log) is never shown. */
-export function errorText(code: RsErrorCode): string {
-  switch (code) {
-    case 'not-connected':
-      return "Helper bilan aloqa yo'q — hech narsa yuborilmadi.";
-    case 'disconnected':
-    case 'timeout':
-      return "Javob kelmadi: natija noma'lum. Helper qayta ulanganda holat yangilanadi.";
-    case 'busy':
-      return "Helper band — birozdan keyin qayta urinib ko'ring.";
-    case 'not-implemented':
-      return "O'rnatilgan helper bu amalni hali bajara olmaydi.";
-    case 'invalid-config':
-    case 'invalid-input':
-      return 'Qiymat qabul qilinmadi.';
-    case 'operation-failed':
-      return 'Amal bajarilmadi.';
-    case 'forbidden':
-      return "Bu oynadan ruxsat yo'q.";
-    default:
-      return `Kutilmagan xato (${code}).`;
-  }
-}
 
 const failed = (result: Extract<RsResult<unknown>, { ok: false }>): Feedback => ({
   tone: 'danger',
