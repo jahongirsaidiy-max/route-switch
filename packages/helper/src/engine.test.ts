@@ -2,6 +2,7 @@ import { Config, EngineState, RECONCILE_REASONS, parseIpv4Destination, type Reco
 import { describe, expect, it } from 'vitest';
 
 import {
+  CLEAR_CONCURRENCY,
   DEGRADED_ACCEPT_AFTER,
   DNS_LOSS_GRACE,
   FAILURE_BACKOFF_AFTER,
@@ -4664,5 +4665,177 @@ describe('merged passes keep the urgency of an event reason', () => {
     gate.open();
     await Promise.all(passes);
     expect(h.take()).toEqual([]);
+  });
+});
+
+describe('merged passes: retryRefused given on a later merged call (TASK-112 QA follow-up)', () => {
+  it('keeps retryRefused passed on the second of two merged periodic calls', async () => {
+    const LAN = rule(1, 'subnet', '10.20.4.0/24', 'ethernet');
+    const netinfo = createFakeNetInfo(network({ ethernet: iface('ethernet', { subnet: null, netmask: null }) }));
+    const h = setup(config([LAN]), { netinfo });
+    h.routes.onAdd = () => inspectFailed('connected-route', 'connected route in the way');
+    await h.run('startup');
+    h.take();
+    const gate = deferred();
+    netinfo.gate = gate;
+    const passes = [
+      h.engine.reconcile('dns-refresh'),
+      h.engine.reconcile('drift-check'),
+      h.engine.reconcile('drift-check', { retryRefused: true }),
+      h.engine.reconcile('dns-refresh'),
+    ];
+    gate.open();
+    await Promise.all(passes);
+    // The first pass skips the refused add; the merged follow-up runs it once.
+    expect(h.take()).toEqual([add('10.20.4.0/24', ETH_GW)]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// clear() (TASK-113)
+// ---------------------------------------------------------------------------
+
+describe('clear', () => {
+  const hosts = (count: number): Rule[] =>
+    Array.from({ length: count }, (_unused, index) => rule(20 + index, 'ip', `172.16.13.${String(index + 1)}`, 'ethernet'));
+
+  it('deletes every applied route through routeDelete, without detecting the interfaces', async () => {
+    const snapshots: (readonly AppliedRoute[])[] = [];
+    const h = setup(config([HOST, NET]), { deps: { onApplied: (routes) => void snapshots.push(routes) } });
+    await h.run('startup');
+    h.take();
+    const detections = h.netinfo.calls.length;
+
+    const result = await h.engine.clear();
+
+    expect(result).toEqual({ removed: 2, forgotten: 0, failed: 0 });
+    expect(h.take()).toEqual([del('172.16.12.40', ETH_GW), del('172.16.0.0/12', ETH_GW)]);
+    expect(h.netinfo.calls).toHaveLength(detections);
+    expect(h.engine.getApplied()).toEqual([]);
+    expect(snapshots.at(-1)).toEqual([]);
+    const state = h.engine.getState();
+    expectValid(state);
+    expect(state.rules.every((entry) => entry.appliedDestinations.length === 0)).toBe(true);
+  });
+
+  it('forgets a route found through another gateway, keeps one whose delete failed, and reports both', async () => {
+    const h = setup(config([HOST, NET, HOST_B]));
+    await h.run('startup');
+    h.take();
+    h.routes.onDelete = (request) =>
+      request.dst === '172.16.12.40' ? notOurs(request, 'other-gateway') : request.dst === '172.16.12.41' ? deleteFailed() : deleted(request);
+
+    const result = await h.engine.clear();
+
+    expect(result).toEqual({ removed: 1, forgotten: 1, failed: 1 });
+    expect(h.engine.getApplied().map((route) => route.dst)).toEqual(['172.16.12.41']);
+    expect(engineLogs(h.entries, 'warn', 'applied route is no longer ours; forgotten, nothing was deleted')[0]?.context).toMatchObject({
+      reason: 'cleanup',
+      dst: '172.16.12.40',
+    });
+    expect(engineLogs(h.entries, 'error', 'route delete failed during cleanup; the route stays applied')).toHaveLength(1);
+  });
+
+  it('removes routes restored from state.json; one now through another gateway is forgotten, not deleted', async () => {
+    const h = setup(config([]));
+    h.engine.restoreApplied([
+      { dst: '198.51.100.0/24', gateway: ETH_GW, ruleIds: [ruleId(1)] },
+      { dst: '192.0.2.7', gateway: ETH_GW, ruleIds: [] },
+    ]);
+    h.routes.onDelete = (request) => (request.dst === '192.0.2.7' ? notOurs(request, 'other-gateway') : deleted(request));
+    expect(await h.engine.clear()).toEqual({ removed: 1, forgotten: 1, failed: 0 });
+    expect(h.take()).toEqual([del('198.51.100.0/24', ETH_GW), del('192.0.2.7', ETH_GW)]);
+    expect(h.netinfo.calls).toEqual([]);
+  });
+
+  it(`runs at most ${String(CLEAR_CONCURRENCY)} deletes at a time`, async () => {
+    const h = setup(config(hosts(30)));
+    await h.run('startup');
+    let inFlight = 0;
+    let most = 0;
+    const gates: Deferred[] = [];
+    h.routes.onDelete = async (request) => {
+      inFlight += 1;
+      most = Math.max(most, inFlight);
+      const gate = deferred();
+      gates.push(gate);
+      await gate.promise;
+      inFlight -= 1;
+      return deleted(request);
+    };
+    const clearing = h.engine.clear();
+    for (let round = 0; round < 100 && gates.length < 30; round += 1) {
+      await Promise.resolve();
+      for (const gate of gates) gate.open();
+    }
+    for (const gate of gates) gate.open();
+    expect(await clearing).toEqual({ removed: 30, forgotten: 0, failed: 0 });
+    expect(CLEAR_CONCURRENCY).toBe(8);
+    expect(most).toBe(CLEAR_CONCURRENCY);
+  });
+
+  it('waits for a running pass (and one queued behind it); a reconcile asked for during the deletes runs after them', async () => {
+    const netinfo = createFakeNetInfo();
+    const h = setup(config([HOST]), { netinfo });
+    await h.run('startup');
+    h.take();
+    const gate = deferred();
+    netinfo.gate = gate;
+    const running = h.engine.reconcile('manual');
+    const queuedBefore = h.engine.reconcile('config-change');
+    const clearing = h.engine.clear();
+    const during: Promise<ReconcileOutcome>[] = [];
+    h.routes.onDelete = (request) => {
+      during.push(h.engine.reconcile('config-change'));
+      return deleted(request);
+    };
+    expect(h.engine.isReconciling()).toBe(true);
+    gate.open();
+    await Promise.all([running, queuedBefore, clearing]);
+    expect(during).toHaveLength(1);
+    await Promise.all(during);
+    // Both passes before the clear found the route in place; the clear removed it; the pass after it added it again.
+    expect(h.take()).toEqual([del('172.16.12.40', ETH_GW), add('172.16.12.40', ETH_GW)]);
+    expect(h.engine.getApplied()).toHaveLength(1);
+  });
+
+  it('final: nothing reconciles afterwards, also a pass queued while it ran', async () => {
+    const h = setup(config([HOST]));
+    await h.run('startup');
+    h.take();
+    const queued: Promise<ReconcileOutcome>[] = [];
+    h.routes.onDelete = (request) => {
+      queued.push(h.engine.reconcile('dns-refresh'));
+      return deleted(request);
+    };
+    await h.engine.clear({ final: true });
+    const late = await h.engine.reconcile('network-change');
+    expect(queued).toHaveLength(1);
+    await Promise.all(queued);
+
+    expect(h.take()).toEqual([del('172.16.12.40', ETH_GW)]);
+    expect(late.summary).toEqual({ added: 0, removed: 0, failed: 0, kept: 0, deferred: 0 });
+    expect(h.engine.getApplied()).toEqual([]);
+    expect(h.engine.isReconciling()).toBe(false);
+  });
+
+  it('with nothing applied runs no command and still publishes a valid state', async () => {
+    const h = setup(config([HOST], { enabled: false }));
+    const seq = h.engine.getState().seq;
+    expect(await h.engine.clear()).toEqual({ removed: 0, forgotten: 0, failed: 0 });
+    expect(h.take()).toEqual([]);
+    expect(h.engine.getState().seq).toBe(seq + 1);
+    expectValid(h.engine.getState());
+    expect(h.engine.getState().rules[0]).toMatchObject({ status: 'disabled', reasonCode: 'globally-disabled' });
+  });
+
+  it('turns a delete that throws into a failure that stays applied', async () => {
+    const h = setup(config([HOST]));
+    await h.run('startup');
+    h.routes.onDelete = () => {
+      throw new Error('runner gone');
+    };
+    expect(await h.engine.clear()).toEqual({ removed: 0, forgotten: 0, failed: 1 });
+    expect(h.engine.getApplied()).toHaveLength(1);
   });
 });

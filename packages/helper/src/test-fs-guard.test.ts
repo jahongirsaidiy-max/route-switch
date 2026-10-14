@@ -10,7 +10,8 @@ import { createLogger } from './logger';
 import { createResolverFiles } from './resolver';
 import { createFakeCommandRunner } from './test-utils';
 import { assertFsGuardInstalled, fsGuardActive } from './test-fs-guard-check';
-import { FS_GUARD_CODE, fsGuardHits, fsGuardInstalled, isGuardedPath } from './test-fs-guard-core';
+import { FS_GUARD_CODE, FS_GUARD_ROOTS, fsGuardHits, fsGuardInstalled, isGuardedPath } from './test-fs-guard-core';
+import { createStateStore } from './state-store';
 
 // Control tests of the vitest setup file: they aim at the real resolver directory on purpose and
 // must be refused before any real file-system call. They never run as root (nothing here would
@@ -40,7 +41,19 @@ describe('test file-system guard', () => {
     expect(isGuardedPath(path)).toBe(true);
   });
 
-  it.each(['/etc/resolverx', '/etc/hosts', '/private/etc', tmpdir(), 'resolver/x'])('leaves %s alone', (path) => {
+  it.each([PATHS.supportDir, PATHS.state, PATHS.config, '/Library/Application Support/RouteSwitch/.state.json.routeswitch.tmp', '/library/application support/routeswitch/x'])(
+    'guards the support directory: %s',
+    (path) => {
+      expect(isGuardedPath(path)).toBe(true);
+    },
+  );
+
+  it('names PATHS.supportDir and the resolver directory among its roots', () => {
+    expect(FS_GUARD_ROOTS).toContain(PATHS.supportDir.toLowerCase());
+    expect(FS_GUARD_ROOTS).toContain(PATHS.resolverDir.toLowerCase());
+  });
+
+  it.each(['/etc/resolverx', '/etc/hosts', '/private/etc', tmpdir(), 'resolver/x', '/Library/Application Support', '/Library/Application Support/RouteSwitchX'])('leaves %s alone', (path) => {
     expect(isGuardedPath(path)).toBe(false);
   });
 
@@ -89,5 +102,18 @@ describe('test file-system guard', () => {
     });
     expect(fsGuardHits() - before).toBeGreaterThan(0);
     expect(runner.calls).toEqual([]);
+  });
+
+  it('turns the state store with its default path into "unusable" / not saved, before any real call', async () => {
+    const before = fsGuardHits();
+    const store = createStateStore({ logger: createLogger({ sinks: [] }) });
+
+    expect(await store.load()).toEqual({ source: 'unusable', routes: [] });
+    expect(await store.save([{ dst: '198.51.100.0/24', gateway: '192.0.2.1', ruleIds: [] }])).toBe(false);
+
+    // load: open; save: unlink of the temporary name, then the best-effort unlink after the failure.
+    expect(fsGuardHits() - before).toBeGreaterThanOrEqual(2);
+    // Even a look at the real file is refused.
+    expect(() => fs.existsSync(PATHS.state)).toThrow(FS_GUARD_CODE);
   });
 });

@@ -3,13 +3,15 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 import { Config, EngineState, PATHS } from '@routeswitch/shared';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import type { ConfigFileRead, ConfigFileReader } from './config-store';
 import { LOOKUP_TIMEOUT_MS } from './dns';
 import { createFakeDns, createFakeScheduler, dnsError, flush, type FakeDns, type FakeScheduler } from './dns-test-utils';
 import { createLogger } from './logger';
-import { EXIT_CODES, HELPER_VERSION, ONE_SHOT_DNS_WAIT_MS, USAGE, createCore, parseArgs, run, type RunDeps } from './main';
+import { EXIT_CODES, HELPER_VERSION, ONE_SHOT_DNS_WAIT_MS, SHUTDOWN_EXIT_TIMEOUT_SEC, USAGE, cleanupAll, createCore, parseArgs, run, type RunDeps } from './main';
+import type { ProcessSpawner } from './exec';
+import { createStateStore } from './state-store';
 import { createFakeCommandRunner, type FakeCommandResponse, type FakeCommandRunner } from './test-utils';
 import { assertFsGuardInstalled } from './test-fs-guard-check';
 
@@ -135,6 +137,8 @@ const harness = (file: unknown = CONFIG, extra: Partial<RunDeps> = {}): Harness 
       resolverDir: newResolverDir(),
       setTimer: scheduler.setTimer,
       clearTimer: scheduler.clearTimer,
+      wallNow: () => scheduler.now().getTime(),
+      monotonicNow: () => scheduler.now().getTime() - NOW.getTime(),
       ...extra,
     },
     runner,
@@ -214,19 +218,6 @@ describe('run: flags that do no work', () => {
 
     expect(h.out).toEqual([]);
     expect(h.err.join('')).toBe(`Unknown argument at position 2\n\n${USAGE}`);
-    expect(h.runner.calls).toEqual([]);
-    expect(h.configPaths).toEqual([]);
-  });
-
-  it('says that the daemon mode does not exist yet when --once is missing', async () => {
-    const h = harness();
-
-    expect(await run([], h.deps)).toBe(EXIT_CODES.notImplemented);
-    expect(await run(['--config', '/tmp/rules.json'], h.deps)).toBe(EXIT_CODES.notImplemented);
-
-    expect(h.err.join('')).toContain('Daemon mode is not implemented yet');
-    expect(h.err.join('')).toContain('TASK-114');
-    expect(h.out).toEqual([]);
     expect(h.runner.calls).toEqual([]);
     expect(h.configPaths).toEqual([]);
   });
@@ -986,5 +977,404 @@ describe('run --once: scoped DNS files (TASK-111)', () => {
     const h = harness(WITH_DNS);
     const core = createCore(Config.parse(WITH_DNS), h.deps, createLogger({ sinks: [] }));
     expect(typeof core.resolverFiles.removeAll).toBe('function');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Daemon: state.json, cleanup, shutdown (TASK-113)
+// ---------------------------------------------------------------------------
+
+describe('run without --once (daemon): state.json and cleanup', () => {
+  const MARKER = '# managed-by: routeswitch';
+  const OTHER_GW = '10.20.4.99';
+  const METRICS = ' recvpipe  sendpipe  ssthresh  rtt,msec    rttvar  hopcount      mtu     expire\n       0         0         0         0         0         0      1500         0\n';
+
+  /** A routing table the fake `route` acts on: `add`, `get` and `delete`, for hosts and /24 networks. */
+  interface Table {
+    readonly routes: Map<string, string>;
+    /** Destinations whose delete fails (exit 1, "Operation not permitted"). */
+    readonly failDelete: Set<string>;
+  }
+
+  const getBlock = (dst: string, gateway: string | null): string => {
+    if (gateway === null) {
+      return `   route to: ${dst.split('/')[0] ?? dst}\ndestination: default\n       mask: default\n    gateway: 192.168.1.1\n  interface: en0\n      flags: <UP,GATEWAY,DONE,STATIC,PRCLONING,GLOBAL>\n${METRICS}`;
+    }
+    const [address = dst, prefix] = dst.split('/');
+    return prefix === undefined
+      ? `   route to: ${address}\ndestination: ${address}\n    gateway: ${gateway}\n  interface: en5\n      flags: <UP,GATEWAY,HOST,DONE,STATIC>\n${METRICS}`
+      : `   route to: ${address}\ndestination: ${address}\n       mask: 255.255.255.0\n    gateway: ${gateway}\n  interface: en5\n      flags: <UP,GATEWAY,DONE,STATIC,PRCLONING>\n${METRICS}`;
+  };
+
+  const withTable = (runner: FakeCommandRunner, table: Table): void => {
+    runner.whenMatching((bin, args) => {
+      if (bin !== ROUTE) return undefined;
+      const [, op, kind, dst = '', gateway = ''] = args;
+      const key = kind === '-net' ? dst : dst;
+      if (op === 'add') {
+        if (table.routes.has(key)) return { exitCode: 1, stderr: `route: writing to routing socket: File exists\n`, stdout: `add ${kind === '-net' ? 'net' : 'host'} ${dst}: gateway ${gateway}: File exists\n` };
+        table.routes.set(key, gateway);
+        return { stdout: `add ${kind === '-net' ? 'net' : 'host'} ${dst}: gateway ${gateway}\n` };
+      }
+      if (op === 'get') return { stdout: getBlock(dst, table.routes.get(key) ?? null) };
+      if (op === 'delete') {
+        if (table.failDelete.has(key)) return { exitCode: 1, stderr: 'route: writing to routing socket: Operation not permitted\n' };
+        if (!table.routes.delete(key)) return { exitCode: 1, stdout: `delete net ${dst}: not in table\n`, stderr: 'route: writing to routing socket: not in table\n' };
+        return { stdout: `delete ${kind === '-net' ? 'net' : 'host'} ${dst}\n` };
+      }
+      return undefined;
+    });
+  };
+
+  interface FakeProcess {
+    readonly bin: string;
+    readonly args: readonly string[];
+    stopped: boolean;
+  }
+
+  interface Daemon {
+    readonly h: Harness;
+    readonly table: Table;
+    readonly statePath: string;
+    readonly resolverDir: string;
+    readonly processes: FakeProcess[];
+    /** Sends the signal the daemon waits for. */
+    signal(name?: string): void;
+    readonly exit: Promise<number>;
+    state(): unknown;
+    commands(): string[];
+  }
+
+  const startDaemon = (
+    options: {
+      file?: unknown;
+      table?: Table;
+      statePath?: string;
+      resolverDir?: string;
+      signalAtOnce?: string;
+      /** While `gate` is set, every `networksetup` call waits for it. */
+      hold?: { gate: Promise<void> | null };
+    } = {},
+  ): Daemon => {
+    const table = options.table ?? { routes: new Map<string, string>(), failDelete: new Set<string>() };
+    const resolverDir = options.resolverDir ?? newResolverDir();
+    const statePath = options.statePath ?? join(newResolverDir(), 'state.json');
+    const processes: FakeProcess[] = [];
+    const spawner: ProcessSpawner = {
+      spawn: (bin, args) => {
+        const process: FakeProcess = { bin, args: [...args], stopped: false };
+        processes.push(process);
+        return {
+          stop: () => {
+            process.stopped = true;
+          },
+        };
+      },
+    };
+    let fire: (name: string) => void = () => undefined;
+    const signalled = new Promise<string>((resolve) => {
+      fire = resolve;
+    });
+    if (options.signalAtOnce !== undefined) fire(options.signalAtOnce);
+    const holder: { runner: FakeCommandRunner | null } = { runner: null };
+    const hold = options.hold;
+    const h = harness(options.file ?? CONFIG, {
+      resolverDir,
+      statePath,
+      createSpawner: () => spawner,
+      waitForSignal: () => signalled,
+      ...(hold === undefined
+        ? {}
+        : {
+            createRunner: () => ({
+              run: async (bin, args, runOptions) => {
+                if (bin === NETWORKSETUP && hold.gate !== null) await hold.gate;
+                if (holder.runner === null) throw new Error('runner not ready');
+                return holder.runner.run(bin, args, runOptions);
+              },
+            }),
+          }),
+    });
+    holder.runner = h.runner;
+    withTable(h.runner, table);
+    const exit = run([], h.deps);
+    return {
+      h,
+      table,
+      statePath,
+      resolverDir,
+      processes,
+      signal: (name = 'SIGTERM') => {
+        fire(name);
+      },
+      exit,
+      state: () => JSON.parse(readFileSync(statePath, 'utf8')) as unknown,
+      commands: () => h.runner.calls.map((call) => `${call.bin === ROUTE ? 'route' : call.bin.split('/').at(-1) ?? ''} ${call.args.join(' ')}`),
+    };
+  };
+
+  const startDaemonStatePath = (): string => join(newResolverDir(), 'state.json');
+
+  const running = async (daemon: Daemon): Promise<void> => {
+    await vi.waitFor(() => {
+      expect(daemon.processes).toHaveLength(1);
+    });
+  };
+
+  it('applies, writes state.json, starts the monitor, and on SIGTERM removes everything and exits 0 with nothing left running', async () => {
+    const daemon = startDaemon();
+    await running(daemon);
+
+    expect(daemon.processes[0]).toMatchObject({ bin: '/sbin/route', args: ['-n', 'monitor'] });
+    expect([...daemon.table.routes]).toEqual([
+      ['198.51.100.0/24', ETH_GW],
+      ['203.0.113.7', '192.168.1.1'],
+    ]);
+    await vi.waitFor(() => {
+      expect(daemon.state()).toEqual({
+        version: 1,
+        routes: [
+          { dst: '198.51.100.0/24', gateway: ETH_GW, ruleIds: [ID_A] },
+          { dst: '203.0.113.7', gateway: '192.168.1.1', ruleIds: [ID_B] },
+        ],
+      });
+    });
+
+    const before = daemon.h.runner.calls.length;
+    daemon.signal('SIGTERM');
+    expect(await daemon.exit).toBe(EXIT_CODES.ok);
+
+    expect(daemon.table.routes.size).toBe(0);
+    expect(daemon.state()).toEqual({ version: 1, routes: [] });
+    expect(daemon.processes[0]?.stopped).toBe(true);
+    // No interface detection during the cleanup: only route get / delete.
+    expect(daemon.commands().slice(before).every((command) => /^route -n (get|delete) /.test(command))).toBe(true);
+    // Nothing is left that would keep the process alive or reconcile later.
+    expect(daemon.h.scheduler.pending()).toBe(0);
+    const logs = daemon.h.logs();
+    expect(logs.find((entry) => entry['msg'] === 'shutting down')).toMatchObject({ signal: 'SIGTERM' });
+    // The second cleanup of the run (the first one was the startup's, with nothing left over).
+    expect(logs.filter((entry) => entry['msg'] === 'cleanup finished').at(-1)).toMatchObject({ removed: 2, failed: 0, stateSaved: true });
+  });
+
+  it('SIGINT does the same', async () => {
+    const daemon = startDaemon();
+    await running(daemon);
+    daemon.signal('SIGINT');
+    expect(await daemon.exit).toBe(EXIT_CODES.ok);
+    expect(daemon.table.routes.size).toBe(0);
+  });
+
+  it('after a crash: removes what state.json lists and every managed resolver file first, then reconciles', async () => {
+    const table: Table = {
+      routes: new Map([
+        ['192.0.2.0/24', ETH_GW],
+        ['198.51.100.0/24', ETH_GW],
+        // Listed in state.json through ETH_GW, but someone routed it through another gateway since.
+        ['192.0.2.77', OTHER_GW],
+      ]),
+      failDelete: new Set(),
+    };
+    const statePath = join(newResolverDir(), 'state.json');
+    writeFileSync(
+      statePath,
+      JSON.stringify({
+        version: 1,
+        routes: [
+          { dst: '192.0.2.0/24', gateway: ETH_GW, ruleIds: [] },
+          { dst: '198.51.100.0/24', gateway: ETH_GW, ruleIds: [ID_A] },
+          { dst: '192.0.2.77', gateway: ETH_GW, ruleIds: [] },
+          { dst: '0.0.0.0/0', gateway: ETH_GW, ruleIds: [] },
+        ],
+      }),
+    );
+    const resolverDir = newResolverDir();
+    writeFileSync(join(resolverDir, 'old.corp.local'), `nameserver 10.30.0.53\n${MARKER}\n`);
+    writeFileSync(join(resolverDir, 'user.example'), 'nameserver 10.30.0.54\n');
+
+    const daemon = startDaemon({ table, statePath, resolverDir });
+    await running(daemon);
+
+    const commands = daemon.commands();
+    const firstDetection = commands.findIndex((command) => command.startsWith('networksetup'));
+    expect(firstDetection).toBeGreaterThan(0);
+    // Before any detection: only the checked deletes of the leftovers (up to 8 at a time, so interleaved; each
+    // `get` before its own `delete`), never the forbidden one, and nothing deleted through another gateway.
+    const cleanup = commands.slice(0, firstDetection).filter((command) => command.startsWith('route'));
+    expect([...cleanup].sort()).toEqual([
+      'route -n delete -net 192.0.2.0/24',
+      'route -n delete -net 198.51.100.0/24',
+      'route -n get -host 192.0.2.77',
+      'route -n get -net 192.0.2.0/24',
+      'route -n get -net 198.51.100.0/24',
+    ]);
+    for (const dst of ['192.0.2.0/24', '198.51.100.0/24']) {
+      expect(cleanup.indexOf(`route -n get -net ${dst}`)).toBeLessThan(cleanup.indexOf(`route -n delete -net ${dst}`));
+    }
+    // The route through another gateway is forgotten, not deleted; the config's routes are back.
+    expect([...daemon.table.routes].sort()).toEqual([
+      ['192.0.2.77', OTHER_GW],
+      ['198.51.100.0/24', ETH_GW],
+      ['203.0.113.7', '192.168.1.1'],
+    ]);
+    expect(readdirSync(resolverDir)).toEqual(['user.example']);
+    expect(daemon.h.logs().find((entry) => entry['msg'] === 'cleaning up what the previous run left behind')).toMatchObject({
+      source: 'file',
+      restored: 3,
+      dropped: 1,
+    });
+
+    daemon.signal();
+    expect(await daemon.exit).toBe(EXIT_CODES.ok);
+    expect([...daemon.table.routes]).toEqual([['192.0.2.77', OTHER_GW]]);
+  });
+
+  it.each([
+    ['garbage', 'not json at all'],
+    ['the wrong shape', '{"version":7}'],
+  ])('starts normally with a state.json that is %s', async (_name, content) => {
+    const statePath = join(newResolverDir(), 'state.json');
+    writeFileSync(statePath, content);
+    const daemon = startDaemon({ statePath });
+    await running(daemon);
+    expect(daemon.table.routes.size).toBe(2);
+    expect(daemon.h.logs().some((entry) => entry['level'] === 'error' && String(entry['msg']).startsWith('state file'))).toBe(true);
+    daemon.signal();
+    expect(await daemon.exit).toBe(EXIT_CODES.ok);
+  });
+
+  it('keeps a route whose delete failed in state.json, exits 1, and removes it at the next start', async () => {
+    const table: Table = { routes: new Map(), failDelete: new Set(['203.0.113.7']) };
+    const statePath = join(newResolverDir(), 'state.json');
+    const first = startDaemon({ table, statePath });
+    await running(first);
+    first.signal();
+    expect(await first.exit).toBe(EXIT_CODES.ruleError);
+    expect(first.state()).toEqual({ version: 1, routes: [{ dst: '203.0.113.7', gateway: '192.168.1.1', ruleIds: [ID_B] }] });
+
+    table.failDelete.clear();
+    const second = startDaemon({ table, statePath, file: { version: 1, rules: [] } });
+    await running(second);
+    expect(table.routes.size).toBe(0);
+    expect(second.state()).toEqual({ version: 1, routes: [] });
+    second.signal();
+    expect(await second.exit).toBe(EXIT_CODES.ok);
+  });
+
+  it('a signal during the startup: the startup adds nothing, the cleanup still runs, the monitor never starts', async () => {
+    const table: Table = { routes: new Map([['192.0.2.0/24', ETH_GW]]), failDelete: new Set() };
+    const statePath = join(newResolverDir(), 'state.json');
+    writeFileSync(statePath, JSON.stringify({ version: 1, routes: [{ dst: '192.0.2.0/24', gateway: ETH_GW, ruleIds: [] }] }));
+    const daemon = startDaemon({ table, statePath, signalAtOnce: 'SIGTERM' });
+    expect(await daemon.exit).toBe(EXIT_CODES.ok);
+    expect(daemon.processes).toEqual([]);
+    expect(daemon.table.routes.size).toBe(0);
+    expect(daemon.commands().some((command) => command.includes(' add '))).toBe(false);
+    expect(daemon.state()).toEqual({ version: 1, routes: [] });
+    // The startup's cleanup finished before the final one began.
+    const cleanups = daemon.h.logs().filter((entry) => entry['msg'] === 'cleanup finished');
+    expect(cleanups.map((entry) => [entry['final'], entry['removed']])).toEqual([
+      [false, 1],
+      [true, 0],
+    ]);
+  });
+
+  it('stops the DNS lookups and their timers too: nothing is left pending after the exit', async () => {
+    const daemon = startDaemon({
+      file: { version: 1, rules: [{ id: ID_A, kind: 'domain', target: 'corp.local', iface: 'ethernet', dns: '10.30.0.53' }] },
+    });
+    daemon.h.dns.auto = () => ['198.51.100.20'];
+    await running(daemon);
+    expect(daemon.h.scheduler.pending()).toBeGreaterThan(1);
+    daemon.signal();
+    expect(await daemon.exit).toBe(EXIT_CODES.ok);
+    expect(daemon.h.scheduler.pending()).toBe(0);
+    expect(daemon.table.routes.size).toBe(0);
+  });
+
+  it('leaves no retry timer behind when a pass running at SIGTERM asks for one (detection keeps failing)', async () => {
+    const hold: { gate: Promise<void> | null } = { gate: null };
+    const daemon = startDaemon({ hold });
+    // Every interface detection fails: each pass asks the daemon for a retry timer.
+    daemon.h.runner.when(NETWORKSETUP, ['-listallhardwareports'], { exitCode: 1, stderr: 'networksetup failed\n' });
+    await running(daemon);
+    expect(daemon.h.scheduler.delays()).toContain(2000);
+
+    // The retry fires; its pass hangs in the detection.
+    let open: () => void = () => undefined;
+    hold.gate = new Promise<void>((resolve) => {
+      open = resolve;
+    });
+    daemon.h.scheduler.advance(2000);
+    await flush();
+    const scheduledBefore = daemon.h.scheduler.scheduled.length;
+
+    daemon.signal('SIGTERM');
+    await flush();
+    hold.gate = null;
+    open();
+    expect(await daemon.exit).toBe(EXIT_CODES.ok);
+
+    expect(daemon.h.scheduler.pending()).toBe(0);
+    // Not even scheduled and cleared again: once stopping, the hook sets no timer.
+    expect(daemon.h.scheduler.scheduled.slice(scheduledBefore)).toEqual([]);
+    expect(daemon.h.logs().some((entry) => entry['msg'] === 'interface detection is degraded; no route is added, and none is removed because of interface state, in this reconcile' || entry['msg'] === 'interface detection threw')).toBe(true);
+  });
+
+  it('with a config that cannot be loaded: cleans up the leftovers, touches nothing else, exits 3', async () => {
+    const table: Table = { routes: new Map([['192.0.2.0/24', ETH_GW]]), failDelete: new Set() };
+    const statePath = join(newResolverDir(), 'state.json');
+    writeFileSync(statePath, JSON.stringify({ version: 1, routes: [{ dst: '192.0.2.0/24', gateway: ETH_GW, ruleIds: [] }] }));
+    const daemon = startDaemon({ table, statePath, file: { kind: 'unreadable', detail: 'EACCES' } });
+    expect(await daemon.exit).toBe(EXIT_CODES.configError);
+    expect(daemon.table.routes.size).toBe(0);
+    expect(daemon.processes).toEqual([]);
+    expect(daemon.commands().every((command) => /^route -n (get|delete) /.test(command))).toBe(true);
+  });
+
+  it('cleanupAll (global toggle off): routes and resolver files go, the engine keeps working', async () => {
+    const WITH_DNS = {
+      version: 1,
+      rules: [{ id: ID_A, kind: 'domain', target: 'corp.local', iface: 'ethernet', dns: '10.30.0.53' }],
+    };
+    const h = harness(WITH_DNS);
+    const table: Table = { routes: new Map(), failDelete: new Set() };
+    withTable(h.runner, table);
+    h.dns.auto = () => ['198.51.100.20'];
+    const statePath = join(newResolverDir(), 'state.json');
+    const root = createLogger({ sinks: [] });
+    const store = createStateStore({ logger: root, path: statePath });
+    const core = createCore(Config.parse(WITH_DNS), h.deps, root, undefined, {
+      onApplied: async (routes) => {
+        await store.save(routes);
+      },
+    });
+    await core.engine.reconcile('startup');
+    await core.dns.whenIdle();
+    await core.engine.reconcile('dns-refresh');
+    const dir = h.deps.resolverDir ?? '';
+    expect(readdirSync(dir)).not.toEqual([]);
+    expect(table.routes.size).toBeGreaterThan(0);
+
+    const result = await cleanupAll(core, store, root);
+
+    expect(result).toMatchObject({ failed: 0, stateSaved: true });
+    expect(table.routes.size).toBe(0);
+    expect(readdirSync(dir)).toEqual([]);
+    expect(JSON.parse(readFileSync(statePath, 'utf8'))).toEqual({ version: 1, routes: [] });
+    // Not final: a later pass applies again.
+    await core.engine.reconcile('manual');
+    expect(table.routes.size).toBeGreaterThan(0);
+    core.dns.stop();
+  });
+
+  it('documents the launchd exit timeout the cleanup is sized for', () => {
+    expect(SHUTDOWN_EXIT_TIMEOUT_SEC).toBe(60);
+  });
+
+  it('never points a daemon test at the real state file', () => {
+    const daemonDeps = harness().deps;
+    expect(daemonDeps.statePath).toBeUndefined();
+    expect(startDaemonStatePath()).not.toBe(PATHS.state);
   });
 });

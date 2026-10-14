@@ -44,6 +44,8 @@ import { createFakeCommandRunner, type FakeCommandResponse, type FakeCommandRunn
 // ---------------------------------------------------------------------------
 
 const NOW = new Date('2026-10-14T08:00:00.000Z');
+/** Where the fake monotonic clock starts (milliseconds since the process started, as `performance.now()`). */
+const MONOTONIC_START = 5_000;
 const ETH_GW = '10.20.4.1';
 const WIFI_GW = '192.168.1.1';
 
@@ -273,7 +275,8 @@ const setup = (options: { dns?: boolean } = {}): Harness => {
     clearTimer: scheduler.clearTimer,
     now: () => scheduler.now().getTime() + clock.jump,
     // A real monotonic clock never jumps; `monotonicJump` exists to prove a backward step is harmless anyway.
-    monotonicNow: () => scheduler.now().getTime() + clock.monotonicJump,
+    // It starts near zero like `performance.now()`, far from the wall clock: mixing the two up shows.
+    monotonicNow: () => scheduler.now().getTime() - NOW.getTime() + MONOTONIC_START + clock.monotonicJump,
   });
   return {
     monitor,
@@ -535,6 +538,19 @@ describe('network monitor: network changes', () => {
     expect(h.engine.calls).toHaveLength(1);
   });
 
+  it('debounces on the monotonic clock: a wall clock jump between two messages changes nothing', async () => {
+    const h = setup();
+    h.monitor.start();
+    h.spawner.current().print(IFINFO);
+    await h.pass(500);
+    h.clock.jump += 3_600_000;
+    h.spawner.current().print(NEWADDR);
+    await h.pass(DEBOUNCE_MS - 250);
+    expect(h.engine.calls).toEqual([]);
+    await h.pass(250);
+    expect(reasons(h)).toEqual(['network-change']);
+  });
+
   it('reconciles a stream that never pauses at the latest 10 s after its first message', async () => {
     const h = setup();
     h.monitor.start();
@@ -625,7 +641,7 @@ describe('network monitor: network changes', () => {
       setTimer: scheduler.setTimer,
       clearTimer: scheduler.clearTimer,
       now: () => scheduler.now().getTime(),
-      monotonicNow: () => scheduler.now().getTime(),
+      monotonicNow: () => scheduler.now().getTime() - NOW.getTime() + MONOTONIC_START,
     });
     monitor.start();
     spawner.current().print(IFINFO);
@@ -817,7 +833,7 @@ describe('network monitor: dns.refreshAll() at most every LOOKUP_TIMEOUT_MS', ()
       setTimer: scheduler.setTimer,
       clearTimer: scheduler.clearTimer,
       now: () => scheduler.now().getTime(),
-      monotonicNow: () => scheduler.now().getTime(),
+      monotonicNow: () => scheduler.now().getTime() - NOW.getTime() + MONOTONIC_START,
     });
     monitor.start();
 
@@ -989,7 +1005,7 @@ describe('network monitor: drift check', () => {
       setTimer: scheduler.setTimer,
       clearTimer: scheduler.clearTimer,
       now: () => scheduler.now().getTime(),
-      monotonicNow: () => scheduler.now().getTime(),
+      monotonicNow: () => scheduler.now().getTime() - NOW.getTime() + MONOTONIC_START,
     });
     monitor.start();
     const advance = async (ms: number): Promise<void> => {

@@ -56,7 +56,8 @@ import type { RouteAddResult, RouteDeleteResult, RouteOperations } from './route
  *   back and when a periodic pass is worth running.
  * - `state.json`: `onApplied` receives the applied routes whenever the set
  *   changed, `getApplied()` reads them and `restoreApplied()` seeds them after
- *   a restart.
+ *   a restart. `clear()` removes every applied route without detecting the
+ *   interfaces (shutdown, uninstall, global toggle off, recovery at start).
  * - socket server: `subscribe`, `getState`, `getConfig`, `setConfig`,
  *   `setEnabled`.
  */
@@ -201,6 +202,25 @@ export interface RetryRequest {
   readonly attempt: number;
 }
 
+/** What `Engine.clear` did. */
+export interface ClearResult {
+  /** Routes deleted, or already gone from the table. */
+  readonly removed: number;
+  /** Routes forgotten because the entry at the destination is no longer ours (nothing deleted). */
+  readonly forgotten: number;
+  /** Routes whose delete failed; they stay applied (and in `state.json`) for a later attempt. */
+  readonly failed: number;
+}
+
+export interface ClearOptions {
+  /**
+   * The engine is shutting down (SIGTERM, uninstall): after this clear no pass
+   * runs any more. A pass queued meanwhile and every later `reconcile` resolve
+   * at once with the current state, so nothing adds a route after the cleanup.
+   */
+  readonly final?: boolean | undefined;
+}
+
 export interface RestoreResult {
   readonly restored: number;
   /** Entries that were invalid, forbidden, duplicated or already applied. */
@@ -284,6 +304,15 @@ export interface Engine {
   /** What a periodic pass could make progress on; the monitor reads it every drift check. */
   getRetryNeeds(): RetryNeeds;
   /**
+   * Removes every applied route through `routes.routeDelete` (which checks the
+   * table entry first and deletes only our own route), at most
+   * `CLEAR_CONCURRENCY` at a time. Runs no interface detection and never
+   * adds. Waits for a running pass and keeps the next one waiting until it is
+   * done. Routes whose delete fails stay applied. Publishes a state and tells
+   * `onApplied` when something changed. Never rejects.
+   */
+  clear(options?: ClearOptions): Promise<ClearResult>;
+  /**
    * Seeds `applied` with routes a previous process left behind, so the next
    * reconcile removes or adopts them. Every entry is validated again.
    */
@@ -349,6 +378,8 @@ export const REFUSAL_RETRY_REASONS: ReadonlySet<ReconcileReason> = new Set<Recon
  * `retryRefused`, always try. A lookup that never works would otherwise run,
  * and log an error, in every pass forever.
  */
+/** Route deletes `clear()` runs at the same time; each one's `route get` -> `route delete` stays in order. */
+export const CLEAR_CONCURRENCY = 8;
 export const FAILURE_BACKOFF_AFTER = 3;
 export const FAILURE_BACKOFF_BASE_MS = 60_000;
 export const FAILURE_BACKOFF_MAX_MS = 15 * 60_000;
@@ -1576,6 +1607,16 @@ export const createEngine = (deps: EngineDeps): Engine => {
 
   let running = false;
   let queued: Pending | null = null;
+  /** Set by a final `clear()`: no pass runs any more. */
+  let shutDown = false;
+  /** Resolved when no pass runs and none is queued (`clear()` waits for that). */
+  let idleWaiters: (() => void)[] = [];
+
+  const releaseIdleWaiters = (): void => {
+    const waiters = idleWaiters;
+    idleWaiters = [];
+    for (const waiter of waiters) waiter();
+  };
 
   const newPending = (reason: ReconcileReason, force: boolean, retryRefused: boolean): Pending => {
     let resolve: (outcome: ReconcileOutcome) => void = () => undefined;
@@ -1606,13 +1647,24 @@ export const createEngine = (deps: EngineDeps): Engine => {
       queued = null;
       request.resolve(outcome);
       if (next !== null) start(next);
+      else releaseIdleWaiters();
     };
     guardedPass(request.reason, request.force, request.retryRefused).then(settle, (error: unknown) => {
       settle(lastResort(request.reason, error));
     });
   };
 
+  const idleOutcome = (): ReconcileOutcome => ({
+    state,
+    retryRequested: false,
+    summary: { added: 0, removed: 0, failed: 0, kept: applied.size, deferred: 0 },
+  });
+
   const reconcile = (reason: ReconcileReason, options?: ReconcileOptions): Promise<ReconcileOutcome> => {
+    if (shutDown) {
+      logger.debug('reconcile ignored: the engine has shut down', { reason });
+      return Promise.resolve(idleOutcome());
+    }
     const force = options?.force === true;
     const retryRefused = options?.retryRefused === true;
     if (!running) {
@@ -1685,6 +1737,125 @@ export const createEngine = (deps: EngineDeps): Engine => {
     return forgotten;
   };
 
+  /** One delete of `clear()`; the same verdicts as a stale route in a pass, without the rule bookkeeping. */
+  const clearOne = async (key: string, entry: AppliedEntry): Promise<'removed' | 'forgotten' | 'failed'> => {
+    const result = await safeDelete(entry);
+    if ('thrown' in result) return 'failed';
+    if (result.ok && result.outcome === 'not-ours') {
+      applied.delete(key);
+      logger.warn('applied route is no longer ours; forgotten, nothing was deleted', {
+        reason: 'cleanup',
+        dst: entry.dst,
+        gateway: entry.gateway,
+        ruleIds: entry.ruleIds,
+        found: result.reason,
+        detail: result.message,
+      });
+      return 'forgotten';
+    }
+    if (result.ok) {
+      applied.delete(key);
+      return 'removed';
+    }
+    if (result.outcome === 'rejected') {
+      applied.delete(key);
+      logger.error('applied route refused by the route wrapper; forgotten', {
+        reason: 'cleanup',
+        dst: entry.dst,
+        gateway: entry.gateway,
+        rejection: result.reason,
+      });
+      return 'forgotten';
+    }
+    logger.error('route delete failed during cleanup; the route stays applied', {
+      reason: 'cleanup',
+      dst: entry.dst,
+      gateway: entry.gateway,
+      ruleIds: entry.ruleIds,
+      error: result.message,
+    });
+    return 'failed';
+  };
+
+  const runClear = async (): Promise<ClearResult> => {
+    const startedAt = now().getTime();
+    const counts = { removed: 0, forgotten: 0, failed: 0 };
+    const work = [...applied];
+    let next = 0;
+    const worker = async (): Promise<void> => {
+      for (let index = next; index < work.length; index = next) {
+        next += 1;
+        const item = work[index];
+        if (item === undefined) continue;
+        counts[await clearOne(item[0], item[1])] += 1;
+      }
+    };
+    await Promise.all(Array.from({ length: Math.min(CLEAR_CONCURRENCY, work.length) }, worker));
+    refusedAdds.clear();
+    failing.clear();
+    if (counts.removed + counts.forgotten > 0 || appliedDirty) {
+      appliedDirty = false;
+      await notifyApplied();
+    }
+    // The rules keep their verdicts (a disabled config shows them disabled); only what is applied changed.
+    const snapshot = config;
+    const previous = new Map(state.rules.map((rule) => [rule.ruleId, rule]));
+    seq += 1;
+    const finishedAt = now();
+    publish(
+      buildEngineState({
+        helperVersion,
+        seq,
+        configRevision,
+        config: snapshot,
+        wire,
+        verdicts: new Map(
+          snapshot.rules.map((rule) => {
+            const before = previous.get(rule.id);
+            const verdict: Verdict = disabledVerdict(snapshot, rule) ??
+              (before === undefined
+                ? { status: 'pending', reasonCode: 'interface-down', reason: 'Waiting for the first reconcile' }
+                : { status: before.status, reasonCode: before.reasonCode, reason: before.reason });
+            return [rule.id, { ...verdict, lastResolvedAt: before?.lastResolvedAt ?? null }];
+          }),
+        ),
+        applied: appliedSnapshot(),
+        lastApplyAt: finishedAt.toISOString(),
+        lastReconcileReason: state.lastReconcileReason,
+      }),
+    );
+    logger.info('applied routes cleared', { ...counts, left: applied.size, durationMs: Math.max(0, finishedAt.getTime() - startedAt) });
+    return counts;
+  };
+
+  const clear = async (options?: ClearOptions): Promise<ClearResult> => {
+    const final = options?.final === true;
+    // Exclusive with the passes: wait until none runs or is queued, then hold the slot.
+    while (running) {
+      await new Promise<void>((resolve) => {
+        idleWaiters.push(resolve);
+      });
+    }
+    running = true;
+    // Set before the deletes: a `reconcile` that comes in meanwhile must not run after them.
+    if (final) shutDown = true;
+    try {
+      return await runClear();
+    } catch (error) {
+      logger.error('clearing the applied routes failed unexpectedly', { error: describeThrown(error) });
+      return { removed: 0, forgotten: 0, failed: applied.size };
+    } finally {
+      running = false;
+      const waiting = queued;
+      queued = null;
+      if (waiting !== null && !shutDown) start(waiting);
+      else {
+        waiting?.resolve(idleOutcome());
+        releaseIdleWaiters();
+      }
+    }
+  };
+
   const restoreApplied = (restored: readonly AppliedRoute[]): RestoreResult => {
     let accepted = 0;
     let dropped = 0;
@@ -1739,6 +1910,7 @@ export const createEngine = (deps: EngineDeps): Engine => {
     forgetApplied,
     isReconciling: () => running,
     getRetryNeeds: () => ({ deferred: lastDeferred, refused: refusedAdds.size, failing: failing.size }),
+    clear,
     restoreApplied,
   };
 };

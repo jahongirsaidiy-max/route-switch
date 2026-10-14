@@ -1,6 +1,6 @@
 import { PATHS, type Config, type EngineState } from '@routeswitch/shared';
 
-import { loadConfig, type ConfigFileReader } from './config-store';
+import { emptyConfig, loadConfig, type ConfigFileReader } from './config-store';
 import {
   createDomainResolver,
   realClearTimer,
@@ -10,24 +10,33 @@ import {
   type DomainResolverService,
   type SetTimer,
 } from './dns';
-import { DEGRADED_ACCEPT_AFTER, createEngine, type Engine } from './engine';
-import { createCommandRunner, type CommandRunner } from './exec';
+import { DEGRADED_ACCEPT_AFTER, createEngine, type AppliedRoute, type ClearResult, type Engine } from './engine';
+import { createCommandRunner, createProcessSpawner, type CommandRunner, type ProcessSpawner } from './exec';
 import { createJsonLinesSink, createLogger, type LineWritable, type Logger } from './logger';
-import { createNetInfo } from './netinfo';
+import { createNetworkMonitor, type NetworkMonitor } from './monitor';
+import { createNetInfo, type NetInfo } from './netinfo';
 import { createResolverFiles, type ResolverFiles, type ResolverFs } from './resolver';
 import { createRouteOperations } from './route';
+import { createStateStore, type StateFs, type StateStore } from './state-store';
 
 /**
  * Entry point of the helper.
  *
- * For now it has one mode, `--once`: load the config, run a single reconcile
- * and print the resulting `EngineState` as JSON on stdout. The daemon mode
- * (socket server, monitor, cleanup on SIGTERM) does not exist yet; starting
- * without `--once` says so and exits with a non-zero code.
+ * `--once`: load the config, run a single reconcile and print the resulting
+ * `EngineState` as JSON on stdout. It does not read or write `state.json`.
  *
- * In `--once` mode the log goes to stderr as JSON lines, so stdout carries
- * nothing but the state. The log file at `PATHS.log` belongs to the daemon
- * mode.
+ * Without `--once`, the daemon (the socket server arrives with TASK-114):
+ * 1. clean up what a previous run left behind: the routes of `state.json`
+ *    (restored into the engine, then removed through `routeDelete`, which
+ *    deletes only routes that are still ours) and every managed resolver file;
+ * 2. reconcile (`startup`), start the network monitor;
+ * 3. on SIGTERM or SIGINT: stop the DNS module, then the monitor, then
+ *    `cleanupAll` (every applied route and resolver file), and exit.
+ * Every change of the applied routes is written to `state.json`, so a crash
+ * at any point is cleaned up by step 1 of the next start.
+ *
+ * The log goes to stderr as JSON lines in both modes, so stdout carries
+ * nothing but the state.
  *
  * Domain rules in `--once` mode: the first pass only starts their DNS lookups
  * (a pass never waits for DNS), so when it leaves a rule `resolving` the run
@@ -56,6 +65,16 @@ export const EXIT_CODES = {
 } as const;
 
 /**
+ * Seconds launchd waits after SIGTERM before it sends SIGKILL (`ExitTimeOut`
+ * of the LaunchDaemon plist, written by the install script). Enough for the
+ * cleanup of a large config (≈ 16 500 routes, 8 deletes at a time); what is
+ * left when it runs out stays in `state.json` and is removed at the next start.
+ */
+export const SHUTDOWN_EXIT_TIMEOUT_SEC = 60;
+/** Delay before the engine's own retry of an untrusted interface detection, per attempt. */
+export const DETECTION_RETRY_DELAY_MS = 2000;
+
+/**
  * How long a one-shot run waits for the DNS lookups of its domain rules
  * before the follow-up pass. Three times the limit of a single lookup: enough
  * for every lookup of a config with up to 12 domains on one DNS server to
@@ -63,8 +82,9 @@ export const EXIT_CODES = {
  */
 export const ONE_SHOT_DNS_WAIT_MS = 15_000;
 
-export const USAGE = `Usage: com.routeswitch.helper --once [--config <path>]
+export const USAGE = `Usage: com.routeswitch.helper [--once] [--config <path>]
 
+  (no --once)       run as the daemon: clean up leftovers, apply, follow network changes, clean up on SIGTERM
   --once            apply the config once, print the resulting state as JSON, exit
   --config <path>   config file (default: ${PATHS.config})
   --help            show this text
@@ -95,6 +115,16 @@ export interface RunDeps {
   readonly resolverDir?: string | undefined;
   /** File system of the scoped-DNS files; defaults to the real one. */
   readonly resolverFs?: ResolverFs | undefined;
+  /** Daemon: `state.json`; defaults to `PATHS.state`. Tests pass a file in a temporary directory. */
+  readonly statePath?: string | undefined;
+  readonly stateFs?: StateFs | undefined;
+  /** Daemon: starts `route -n monitor`; tests pass a fake that starts nothing. */
+  readonly createSpawner?: ((logger: Logger) => ProcessSpawner) | undefined;
+  /** Daemon: resolves with the name of the first SIGTERM / SIGINT; defaults to the process's signals. */
+  readonly waitForSignal?: (() => Promise<string>) | undefined;
+  /** Daemon: wall clock and monotonic clock of the monitor, in milliseconds. */
+  readonly wallNow?: (() => number) | undefined;
+  readonly monotonicNow?: (() => number) | undefined;
 }
 
 export type ParsedArgs =
@@ -177,10 +207,19 @@ const runOnce = async (configPath: string, deps: RunDeps): Promise<number> => {
 export interface HelperCore {
   readonly engine: Engine;
   readonly dns: DomainResolverService;
-  /** The scoped-DNS files; synced by the engine on every pass. Shutdown (`removeAll`) is TASK-113's. */
+  /** The scoped-DNS files; synced by the engine on every pass, removed by `cleanupAll`. */
   readonly resolverFiles: ResolverFiles;
+  /** The very instance the engine detects with: the monitor invalidates this one. */
+  readonly netinfo: NetInfo;
+  readonly runner: CommandRunner;
   readonly setTimer: SetTimer;
   readonly clearTimer: ClearTimer;
+}
+
+/** What only the daemon wires into the core. */
+export interface CoreHooks {
+  readonly onApplied?: ((routes: readonly AppliedRoute[]) => void | Promise<void>) | undefined;
+  readonly scheduleRetry?: Parameters<typeof createEngine>[0]['scheduleRetry'];
 }
 
 /**
@@ -189,11 +228,13 @@ export interface HelperCore {
  * (`onConfigChanged`), so no caller has to keep the two in step. Starts
  * nothing: no command, no lookup and no timer until the first reconcile.
  */
+
 export const createCore = (
   config: Config,
   deps: RunDeps,
   root: Logger,
   requestReconcile?: (reason: 'dns-refresh') => unknown,
+  hooks: CoreHooks = {},
 ): HelperCore => {
   const setTimer = deps.setTimer ?? realSetTimer;
   const clearTimer = deps.clearTimer ?? realClearTimer;
@@ -214,8 +255,9 @@ export const createCore = (
     logger: root,
     fs: deps.resolverFs,
   });
+  const netinfo = createNetInfo({ runner, logger: root });
   const engine = createEngine({
-    netinfo: createNetInfo({ runner, logger: root }),
+    netinfo,
     routes: createRouteOperations({ runner, logger: root }),
     logger: root,
     helperVersion: HELPER_VERSION,
@@ -224,8 +266,10 @@ export const createCore = (
     resolveDomain: dns.resolveDomain,
     onConfigChanged: dns.syncConfig,
     syncResolvers: (current) => resolverFiles.sync(current),
+    onApplied: hooks.onApplied,
+    scheduleRetry: hooks.scheduleRetry,
   });
-  return { engine, dns, resolverFiles, setTimer, clearTimer };
+  return { engine, dns, resolverFiles, netinfo, runner, setTimer, clearTimer };
 };
 
 const isResolving = (state: EngineState): boolean =>
@@ -289,6 +333,181 @@ const reconcileOnce = async (core: HelperCore, deps: RunDeps, root: Logger): Pro
   return EXIT_CODES.ok;
 };
 
+// ---------------------------------------------------------------------------
+// Daemon: state, cleanup, shutdown
+// ---------------------------------------------------------------------------
+
+export interface CleanupResult extends ClearResult {
+  /** Managed resolver files removed. */
+  readonly resolverFilesRemoved: number;
+  /** Managed resolver files that could not be removed (logged by the resolver module). */
+  readonly resolverFilesFailed: number;
+  /** Whether `state.json` now holds what is still applied. */
+  readonly stateSaved: boolean;
+}
+
+/**
+ * The one way to take everything down: every applied route (through
+ * `routeDelete`, no interface detection), every managed resolver file, then
+ * `state.json` rewritten with whatever could not be removed. Used for the
+ * global toggle off and uninstall (TASK-114/115), at shutdown (`final`) and
+ * for the leftovers at start. Never rejects.
+ */
+export const cleanupAll = async (
+  core: Pick<HelperCore, 'engine' | 'resolverFiles'>,
+  store: StateStore,
+  logger: Logger,
+  options: { readonly final?: boolean } = {},
+): Promise<CleanupResult> => {
+  const routes = await core.engine.clear({ final: options.final === true });
+  const files = await core.resolverFiles.removeAll();
+  const stateSaved = await store.save(core.engine.getApplied());
+  const result: CleanupResult = {
+    ...routes,
+    resolverFilesRemoved: files.changed,
+    resolverFilesFailed: files.issues.size,
+    stateSaved,
+  };
+  logger
+    .child({ component: 'main' })
+    .log(routes.failed > 0 || !stateSaved ? 'warn' : 'info', 'cleanup finished', { ...result, final: options.final === true });
+  return result;
+};
+
+/** Start of the daemon: what `state.json` lists is restored into the engine and removed, with every managed resolver file. */
+export const recoverFromState = async (
+  core: Pick<HelperCore, 'engine' | 'resolverFiles'>,
+  store: StateStore,
+  logger: Logger,
+): Promise<CleanupResult> => {
+  const loaded = await store.load();
+  const restored = core.engine.restoreApplied(loaded.routes);
+  logger.child({ component: 'main' }).info('cleaning up what the previous run left behind', {
+    source: loaded.source,
+    ...restored,
+  });
+  return cleanupAll(core, store, logger);
+};
+
+const defaultWaitForSignal = (): Promise<string> =>
+  new Promise<string>((resolve) => {
+    const signals = ['SIGTERM', 'SIGINT'] as const;
+    const handlers = signals.map((signal) => {
+      const handler = (): void => {
+        for (const [index, name] of signals.entries()) process.off(name, handlers[index] ?? handler);
+        resolve(signal);
+      };
+      return handler;
+    });
+    // `once` per signal and both removed on the first: a second signal gets Node's default (exit at once).
+    for (const [index, signal] of signals.entries()) {
+      const handler = handlers[index];
+      if (handler !== undefined) process.once(signal, handler);
+    }
+  });
+
+const runDaemon = async (configPath: string, deps: RunDeps): Promise<number> => {
+  // Listening before anything else: a SIGTERM during the startup still gets the cleanup.
+  const signalled = (deps.waitForSignal ?? defaultWaitForSignal)();
+  const root = createLogger({
+    sinks: [createJsonLinesSink(deps.stderr)],
+    minLevel: 'info',
+    ...(deps.now === undefined ? {} : { now: deps.now }),
+  });
+  const logger = root.child({ component: 'main' });
+  if (deps.euid !== undefined && deps.euid() !== 0) {
+    logger.warn('not running as root; route commands will be refused by the system');
+  }
+
+  const loaded = await loadConfig(configPath, deps.readConfig);
+  if (!loaded.ok) {
+    logger.error('config could not be loaded; cleaning up leftovers and exiting', {
+      config: configPath,
+      code: loaded.code,
+      error: loaded.message,
+    });
+  } else {
+    logger.info('config loaded', { config: configPath, source: loaded.source, rules: loaded.config.rules.length, enabled: loaded.config.enabled });
+  }
+  const config = loaded.ok ? loaded.config : { ...emptyConfig(), enabled: false };
+
+  const store = createStateStore({ logger: root, path: deps.statePath, fs: deps.stateFs });
+  const retryTimers = new Set<unknown>();
+  // An object, not a `let`: `shutdown` sets it while the startup and the retry hook still run.
+  const life = { stopping: false };
+  let core: HelperCore | null = null;
+  core = createCore(
+    config,
+    deps,
+    root,
+    (reason) => core?.engine.reconcile(reason),
+    {
+      onApplied: async (routes) => {
+        await store.save(routes);
+      },
+      scheduleRetry: ({ reason, attempt }) => {
+        // A pass still running during the shutdown may ask for a retry: no timer may outlive the exit.
+        if (life.stopping) return;
+        const timer = (deps.setTimer ?? realSetTimer)(() => {
+          retryTimers.delete(timer);
+          void core?.engine.reconcile(reason);
+        }, DETECTION_RETRY_DELAY_MS * attempt);
+        retryTimers.add(timer);
+      },
+    },
+  );
+  const helper = core;
+  const clearTimer = deps.clearTimer ?? realClearTimer;
+
+  let monitor: NetworkMonitor | null = null;
+  // Whatever comes first: the startup finishing, or a signal during it.
+  const startup = (async (): Promise<'started'> => {
+    await recoverFromState(helper, store, root);
+    if (loaded.ok && !life.stopping) await helper.engine.reconcile('startup');
+    return 'started';
+  })();
+
+  const shutdown = async (signal: string): Promise<number> => {
+    life.stopping = true;
+    logger.info('shutting down', { signal });
+    // A signal during the startup: let it finish its cleanup first (it adds nothing once `stopping` is set).
+    await startup;
+    // DNS first (no lookup asks for a pass any more), then the monitor, then the timers of the retries.
+    helper.dns.stop();
+    monitor?.stop();
+    for (const timer of retryTimers) clearTimer(timer);
+    retryTimers.clear();
+    const result = await cleanupAll(helper, store, root, { final: true });
+    // Again: a pass the cleanup waited for may have asked for a retry before `stopping` was seen everywhere.
+    for (const timer of retryTimers) clearTimer(timer);
+    retryTimers.clear();
+    return result.failed > 0 || result.resolverFilesFailed > 0 ? EXIT_CODES.ruleError : EXIT_CODES.ok;
+  };
+
+  const first = await Promise.race([startup, signalled]);
+  if (first !== 'started') return shutdown(first);
+  if (!loaded.ok) {
+    helper.dns.stop();
+    return EXIT_CODES.configError;
+  }
+
+  monitor = createNetworkMonitor({
+    engine: helper.engine,
+    netinfo: helper.netinfo,
+    dns: helper.dns,
+    runner: helper.runner,
+    spawner: (deps.createSpawner ?? ((spawnLogger) => createProcessSpawner({ logger: spawnLogger })))(root),
+    logger: root,
+    setTimer: helper.setTimer,
+    clearTimer: helper.clearTimer,
+    now: deps.wallNow,
+    monotonicNow: deps.monotonicNow,
+  });
+  monitor.start();
+  logger.info('daemon running', { pid: process.pid });
+  return shutdown(await signalled);
+};
+
 /** Runs the helper for one command line and returns the process exit code. Never rejects. */
 export const run = async (argv: readonly string[], deps: RunDeps): Promise<number> => {
   try {
@@ -304,13 +523,7 @@ export const run = async (argv: readonly string[], deps: RunDeps): Promise<numbe
         deps.stderr.write(`${args.message}\n\n${USAGE}`);
         return EXIT_CODES.usage;
       case 'run':
-        if (!args.once) {
-          deps.stderr.write(
-            'Daemon mode is not implemented yet (it arrives with the socket server, TASK-114). Run with --once.\n',
-          );
-          return EXIT_CODES.notImplemented;
-        }
-        return await runOnce(args.configPath, deps);
+        return args.once ? await runOnce(args.configPath, deps) : await runDaemon(args.configPath, deps);
     }
   } catch (error) {
     deps.stderr.write(`Unexpected failure: ${error instanceof Error ? error.message : String(error)}\n`);

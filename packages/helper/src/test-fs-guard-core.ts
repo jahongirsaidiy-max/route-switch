@@ -12,7 +12,17 @@ export const FS_GUARD_CODE = 'ETESTFSGUARD';
 export const FS_GUARD_MARK = Symbol.for('routeswitch.fs-guard');
 const KEY = '__routeswitchFsGuardHits';
 const INSTALLED = '__routeswitchFsGuardInstalled';
-const ROOTS = ['/etc/resolver', '/private/etc/resolver'];
+/**
+ * Lower case (paths are compared case-insensitively, like the default macOS volume). The resolver
+ * directory, and `PATHS.supportDir` (config.json, state.json) — a test must never read or write the
+ * daemon's real files there.
+ */
+export const FS_GUARD_ROOTS: readonly string[] = [
+  '/etc/resolver',
+  '/private/etc/resolver',
+  '/library/application support/routeswitch',
+];
+const ROOTS = FS_GUARD_ROOTS;
 const CODE = FS_GUARD_CODE;
 
 const textOf = (value: unknown): string | null => {
