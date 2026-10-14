@@ -677,13 +677,22 @@ export const createDomainResolver = (deps: DomainResolverDeps): DomainResolverSe
       );
     }
     const truncated = answer.usable > LIMITS.maxIpsPerDomain;
+    const truncation = truncated ? `; ${String(answer.usable)} addresses, the ${String(LIMITS.maxIpsPerDomain)} lowest are routed` : '';
+    const servers = refused[DNS_SERVER_REFUSAL] ?? 0;
+    if (refusedTotal > 0 && servers === refusedTotal) {
+      // Only DNS servers were left out and other addresses are routed: the rule works, with a warning.
+      return verdict(
+        'active',
+        'dns-server-excluded',
+        `${plural(servers, 'resolved address')} of ${name} ${servers === 1 ? 'is a DNS server' : 'are DNS servers'} and never routed${truncation}`,
+      );
+    }
     if (refusedTotal > 0) {
+      // A forbidden address in an answer is a sign of a poisoned or broken answer: an error, whatever else.
       return verdict(
         'error',
         'forbidden-destination',
-        `${plural(refusedTotal, 'resolved address')} of ${name} must never be routed (${describeRefused(refused)})${
-          truncated ? `; ${String(answer.usable)} addresses, the ${String(LIMITS.maxIpsPerDomain)} lowest are routed` : ''
-        }`,
+        `${plural(refusedTotal, 'resolved address')} of ${name} must never be routed (${describeRefused(refused)})${truncation}`,
       );
     }
     return truncated

@@ -11,6 +11,10 @@ import { createFakeDns, createFakeScheduler, dnsError, flush, type FakeDns, type
 import { createLogger } from './logger';
 import { EXIT_CODES, HELPER_VERSION, ONE_SHOT_DNS_WAIT_MS, USAGE, createCore, parseArgs, run, type RunDeps } from './main';
 import { createFakeCommandRunner, type FakeCommandResponse, type FakeCommandRunner } from './test-utils';
+import { assertFsGuardInstalled } from './test-fs-guard-check';
+
+// Touches the file system: refuse to run at all without the guard of the test setup.
+assertFsGuardInstalled();
 
 const ROUTE = '/sbin/route';
 const NETWORKSETUP = '/usr/sbin/networksetup';
@@ -694,10 +698,12 @@ describe('run --once: domain rules', () => {
       ['-n', 'add', '-host', '198.51.100.20', '192.168.1.1'],
     ]);
     expect(JSON.stringify(h.routeArgv())).not.toMatch(/10\.20\.4\.53/);
-    expect(code).toBe(EXIT_CODES.ruleError);
+    // The rule works for its other address: a warning, not an error (TASK-DELTA-07).
+    expect(code).toBe(EXIT_CODES.ok);
     expect(EngineState.parse(JSON.parse(h.out[0] ?? '')).rules[0]).toMatchObject({
-      reasonCode: 'forbidden-destination',
-      reason: '1 resolved address of corp.local must never be routed (dns-server: 1)',
+      status: 'active',
+      reasonCode: 'dns-server-excluded',
+      reason: '1 resolved address of corp.local is a DNS server and never routed',
       appliedDestinations: ['198.51.100.53', '198.51.100.20'],
     });
   });
@@ -735,9 +741,9 @@ describe('run --once: domain rules', () => {
       ['-n', 'add', '-host', '203.0.113.7', '192.168.1.1'],
       ['-n', 'add', '-host', '198.51.100.20', ETH_GW],
     ]);
-    expect(code).toBe(EXIT_CODES.ruleError);
+    expect(code).toBe(EXIT_CODES.ok);
     const state = EngineState.parse(JSON.parse(h.out[0] ?? ''));
-    expect(state.rules[0]).toMatchObject({ status: 'error', reasonCode: 'forbidden-destination', appliedDestinations: ['198.51.100.20'] });
+    expect(state.rules[0]).toMatchObject({ status: 'active', reasonCode: 'dns-server-excluded', appliedDestinations: ['198.51.100.20'] });
     // Which server was asked is in the log.
     expect(h.logs().find((entry) => entry['msg'] === 'domain resolved')).toMatchObject({
       component: 'dns',
@@ -766,15 +772,16 @@ describe('run --once: domain rules', () => {
     const h = harness(DOMAIN_CONFIG, { systemDnsServers: () => ['198.51.100.53'] });
     h.dns.auto = () => ['198.51.100.53', '198.51.100.20'];
 
-    expect(await run(['--once'], h.deps)).toBe(EXIT_CODES.ruleError);
+    expect(await run(['--once'], h.deps)).toBe(EXIT_CODES.ok);
 
     expect(h.routeArgv()).toEqual([
       ['-n', 'add', '-host', '203.0.113.7', '192.168.1.1'],
       ['-n', 'add', '-host', '198.51.100.20', ETH_GW],
     ]);
     expect(EngineState.parse(JSON.parse(h.out[0] ?? '')).rules[0]).toMatchObject({
-      reasonCode: 'forbidden-destination',
-      reason: '1 resolved address of corp.local must never be routed (dns-server: 1)',
+      status: 'active',
+      reasonCode: 'dns-server-excluded',
+      reason: '1 resolved address of corp.local is a DNS server and never routed',
     });
   });
 
@@ -893,7 +900,7 @@ describe('run --once: domain rules', () => {
 
     expect(h.dns.lookups.map((lookup) => lookup.hostname)).toEqual(['other.corp.local']);
     expect(h.routeArgv()).toEqual([['-n', 'add', '-host', '198.51.100.20', '192.168.1.1']]);
-    expect(outcome.state.rules.map((rule) => rule.reasonCode)).toEqual(['interface-down', 'forbidden-destination']);
+    expect(outcome.state.rules.map((rule) => rule.reasonCode)).toEqual(['interface-down', 'dns-server-excluded']);
   });
 });
 

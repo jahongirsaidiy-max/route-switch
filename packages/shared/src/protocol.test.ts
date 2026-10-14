@@ -150,7 +150,7 @@ describe('constants', () => {
   });
 
   it('pins the protocol version and the closed enumerations', () => {
-    expect(PROTOCOL_VERSION).toBe(1);
+    expect(PROTOCOL_VERSION).toBe(2);
     expect(RULE_STATUSES).toEqual(['active', 'pending', 'error', 'disabled']);
     expect(EVENT_LOG_LEVELS).toEqual(['info', 'warn', 'error']);
     expect(ERROR_CODES).toEqual([
@@ -188,6 +188,8 @@ describe('constants', () => {
       'resolver-failed',
       'internal',
       'addresses-truncated',
+      'overridden-by-rule',
+      'dns-server-excluded',
     ]);
     expect(STRUCTURE_LIMITS).toEqual({ maxNodes: 65_536, maxArrayLength: 500, maxDepth: 12, maxStringLength: 4096 });
     expect(PROTOCOL_LIMITS.maxAppliedDestinationsPerRule).toBe(LIMITS.maxIpsPerDomain + 1);

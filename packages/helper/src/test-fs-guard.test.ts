@@ -9,13 +9,23 @@ import { describe, expect, it } from 'vitest';
 import { createLogger } from './logger';
 import { createResolverFiles } from './resolver';
 import { createFakeCommandRunner } from './test-utils';
-import { FS_GUARD_CODE, fsGuardHits, isGuardedPath } from './test-fs-guard';
+import { assertFsGuardInstalled, fsGuardActive } from './test-fs-guard-check';
+import { FS_GUARD_CODE, fsGuardHits, fsGuardInstalled, isGuardedPath } from './test-fs-guard-core';
 
 // Control tests of the vitest setup file: they aim at the real resolver directory on purpose and
 // must be refused before any real file-system call. They never run as root (nothing here would
 // change the machine anyway: every call below is refused).
 
+// Started without a config naming the setup file the guard is not in force, and the tests below
+// would aim at the real directory: refuse to run them at all in that case.
+assertFsGuardInstalled();
+
 describe('test file-system guard', () => {
+  it('is in force for the modules the tests import', () => {
+    expect(fsGuardActive()).toBe(true);
+    expect(fsGuardInstalled()).toBe(true);
+  });
+
   it.each([
     PATHS.resolverDir,
     '/etc/resolver/corp.local',

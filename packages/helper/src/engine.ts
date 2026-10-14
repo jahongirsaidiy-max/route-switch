@@ -327,6 +327,14 @@ interface Draft {
   issue: Issue | null;
   /** A route of the rule was not added because the interface detection cannot be trusted yet. */
   deferred: boolean;
+  /** Route keys of resolved addresses (not the rule's own DNS server) planned for this rule. */
+  readonly routedAnswers: Set<string>;
+  /**
+   * Resolved addresses left to an explicit rule or to another rule's DNS
+   * server on another interface: a warning, not an error, while some other
+   * address of the rule is routed (`overridden-by-rule`).
+   */
+  readonly overridden: Map<string, string>;
 }
 
 interface DesiredRoute {
@@ -559,6 +567,8 @@ export const createEngine = (deps: EngineDeps): Engine => {
   let forceNextDetection = false;
   /** Rule id -> the problem logged for it in the previous pass, so a standing error is not repeated at `warn`. */
   let reportedIssues = new Map<string, string>();
+  /** The same for rules that work with an `overridden-by-rule` warning. */
+  let reportedWarnings = new Map<string, string>();
   let reportedGuardSkips = '';
   /** Per role, the DNS servers outside the connected subnet that were warned about last ('' = none). */
   const warnedOutsideDns: Record<IfaceRole, string> = { ethernet: '', wifi: '' };
@@ -787,7 +797,15 @@ export const createEngine = (deps: EngineDeps): Engine => {
     const wantedDomainRuleIds = new Set<string>();
 
     const draftOf = (rule: Rule, base: Verdict, lastResolvedAt: string | null = null): Draft => {
-      const draft: Draft = { rule, base, lastResolvedAt, issue: null, deferred: false };
+      const draft: Draft = {
+        rule,
+        base,
+        lastResolvedAt,
+        issue: null,
+        deferred: false,
+        routedAnswers: new Set(),
+        overridden: new Map(),
+      };
       drafts.set(rule.id, draft);
       return draft;
     };
@@ -879,25 +897,28 @@ export const createEngine = (deps: EngineDeps): Engine => {
         const key = routeKey(destination);
         const existing = desired.get(key);
         const explicit = rule.kind !== 'domain' || target === serverTarget;
+        const isAnswer = rule.kind === 'domain' && target !== serverTarget;
         if (existing === undefined) {
           desired.set(key, { key, dst, gateway, role: rule.iface, explicit, ruleIds: [rule.id] });
+          if (isAnswer) draft.routedAnswers.add(key);
         } else if (existing.gateway === gateway) {
           if (!existing.ruleIds.includes(rule.id)) existing.ruleIds.push(rule.id);
+          if (isAnswer) draft.routedAnswers.add(key);
         } else if (explicit && !existing.explicit) {
           // Only a rule's own DNS server gets here (explicit rules are planned before every domain
           // rule): it takes the destination over from the addresses other domains resolved to.
           desired.set(key, { key, dst, gateway, role: rule.iface, explicit, ruleIds: [rule.id] });
           for (const ruleId of existing.ruleIds) {
-            recordIssue(
-              drafts.get(ruleId),
-              'route-failed',
+            const owner = drafts.get(ruleId);
+            owner?.routedAnswers.delete(key);
+            owner?.overridden.set(
+              key,
               `${dst} is routed through the ${rule.iface} interface as the DNS server of another rule, which takes precedence over a resolved address`,
             );
           }
         } else if (existing.explicit && !explicit) {
-          recordIssue(
-            draft,
-            'route-failed',
+          draft.overridden.set(
+            key,
             `${dst} is routed through the ${existing.role} interface by an explicit rule, which takes precedence over a resolved address`,
           );
         } else {
@@ -1131,6 +1152,52 @@ export const createEngine = (deps: EngineDeps): Engine => {
     reportedIssues = next;
   };
 
+  /**
+   * `active` + `overridden-by-rule` for a working domain rule some of whose
+   * resolved addresses another rule routes; `null` when that does not apply.
+   * Its warnings keep their order of precedence: `overridden-by-rule` first,
+   * then what the resolver reported (`dns-server-excluded`,
+   * `addresses-truncated`), all counted in `reason`.
+   */
+  const partlyApplied = (draft: Draft): Verdict | null => {
+    if (draft.base.status !== 'active' || draft.overridden.size === 0 || draft.routedAnswers.size === 0) return null;
+    const count = draft.overridden.size;
+    const own = `${String(count)} resolved ${count === 1 ? 'address is' : 'addresses are'} routed by another rule, which takes precedence`;
+    return {
+      status: 'active',
+      reasonCode: 'overridden-by-rule',
+      reason: draft.base.reason === null ? own : `${own}; ${draft.base.reason}`,
+    };
+  };
+
+  /** A rule that works with warnings is said once when that changes, then only at `debug`. */
+  const logRuleWarnings = (
+    drafts: ReadonlyMap<string, Draft>,
+    reason: ReconcileReason,
+    /** The verdict that is published: the log never says what the state does not. */
+    published: (draft: Draft) => Verdict,
+  ): void => {
+    const next = new Map<string, string>();
+    for (const [ruleId, draft] of drafts) {
+      const verdict = published(draft);
+      // Only an `active` verdict carries this code (`partlyApplied`).
+      if (verdict.reasonCode !== 'overridden-by-rule') continue;
+      const signature = `${verdict.reasonCode}|${String(verdict.reason)}`;
+      next.set(ruleId, signature);
+      logger.log(reportedWarnings.get(ruleId) === signature ? 'debug' : 'info', 'rule partly applied', {
+        reason,
+        ruleId,
+        target: draft.rule.target,
+        iface: draft.rule.iface,
+        reasonCode: verdict.reasonCode,
+        overridden: draft.overridden.size,
+        routed: draft.routedAnswers.size,
+        detail: verdict.reason,
+      });
+    }
+    reportedWarnings = next;
+  };
+
   const notifyApplied = async (): Promise<void> => {
     if (deps.onApplied === undefined) return;
     try {
@@ -1266,10 +1333,18 @@ export const createEngine = (deps: EngineDeps): Engine => {
       if (draft.issue !== null) return errorVerdict(draft.issue.reasonCode, draft.issue.reason);
       // A rule that already has routes keeps its status; one with nothing applied waits.
       // A rule that is waiting anyway (a domain still resolving) keeps its own reason.
-      return draft.deferred && !owning.has(draft.rule.id) && draft.base.status !== 'pending' ? DEFERRED : draft.base;
+      if (draft.deferred && !owning.has(draft.rule.id) && draft.base.status !== 'pending') return DEFERRED;
+      return partlyApplied(draft) ?? draft.base;
     };
 
+    // Resolved addresses left to other rules are a warning only while some address of the rule is
+    // routed; with none left the rule does not work at all, as before.
+    for (const draft of plan.drafts.values()) {
+      const [first] = draft.overridden.values();
+      if (first !== undefined && draft.routedAnswers.size === 0) recordIssue(draft, 'route-failed', first);
+    }
     logRuleIssues(plan.drafts, reason);
+    logRuleWarnings(plan.drafts, reason, verdictOf);
     if (counters.changed) await notifyApplied();
     if (retry !== null) requestRetry(reason, retry);
 

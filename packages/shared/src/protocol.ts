@@ -39,7 +39,7 @@ import { Config, DEVICE_NAME, IfaceRole, LIMITS, findDuplicateIds } from './sche
  * runs, so such a field is a breaking change too and needs a bump.
  * Reported by `status`; the app offers to reinstall the helper on a mismatch.
  */
-export const PROTOCOL_VERSION = 1;
+export const PROTOCOL_VERSION = 2;
 
 /** Size bounds that keep every message serialisable within `MAX_LINE_BYTES`. */
 export const PROTOCOL_LIMITS = {
@@ -181,7 +181,15 @@ export type RuleStatus = z.infer<typeof RuleStatus>;
  *           `route-failed` (`route add` failed), `resolver-conflict` (an
  *           `/etc/resolver` file exists that is not ours), `resolver-failed`
  *           (writing the resolver file failed), `internal`.
- * active:   `addresses-truncated` (more A records than the per-domain limit).
+ * active:   warnings on a domain rule that works but not for every resolved
+ *           address, in this order of precedence (the first that applies is
+ *           the code, `reason` counts them all): `overridden-by-rule` (an
+ *           address is routed by an explicit `ip` / `/32` rule or as the DNS
+ *           server of another rule, through another interface),
+ *           `dns-server-excluded` (an address is a DNS server and never
+ *           routed), `addresses-truncated` (more A records than the
+ *           per-domain limit). With no address routed at all the rule is
+ *           `error`, and any real error wins over a warning.
  */
 export const RULE_REASON_CODES = [
   'rule-disabled',
@@ -198,6 +206,8 @@ export const RULE_REASON_CODES = [
   'resolver-failed',
   'internal',
   'addresses-truncated',
+  'overridden-by-rule',
+  'dns-server-excluded',
 ] as const;
 export const RuleReasonCode = z.enum(RULE_REASON_CODES);
 export type RuleReasonCode = z.infer<typeof RuleReasonCode>;

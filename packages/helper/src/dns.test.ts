@@ -1562,6 +1562,32 @@ describe('DNS-server addresses in an answer', () => {
     expect(sanitizeAnswer([SYSTEM], new Set())?.addresses).toEqual([SYSTEM]);
   });
 
+  it('stays an error when a forbidden address comes along with a DNS server (TASK-DELTA-07)', async () => {
+    const h = setup({ systemServers: () => [SYSTEM] });
+
+    await resolveFirst(h, DOMAIN, [SYSTEM, '127.0.0.1', '172.16.12.40']);
+
+    expect(h.service.resolveDomain(DOMAIN)).toMatchObject({
+      destinations: ['172.16.12.40'],
+      status: 'error',
+      reasonCode: 'forbidden-destination',
+      reason: '2 resolved addresses of corp.local must never be routed (dns-server: 1, loopback: 1)',
+    });
+  });
+
+  it('counts a truncated answer in the warning of an excluded DNS server (TASK-DELTA-07)', async () => {
+    const h = setup({ systemServers: () => [SYSTEM] });
+    const many = Array.from({ length: 40 }, (_unused, index) => `172.16.13.${String(index + 1)}`);
+
+    await resolveFirst(h, DOMAIN, [SYSTEM, ...many]);
+
+    expect(h.service.resolveDomain(DOMAIN)).toMatchObject({
+      status: 'active',
+      reasonCode: 'dns-server-excluded',
+      reason: '1 resolved address of corp.local is a DNS server and never routed; 40 addresses, the 32 lowest are routed',
+    });
+  });
+
   it('drops the resolvers of the system from an answer, with one warning', async () => {
     const h = setup({ systemServers: () => [SYSTEM, '[2001:db8::53]:53', '192.0.2.54:5353', 'garbage', '999.1.1.1'] });
 
@@ -1569,9 +1595,9 @@ describe('DNS-server addresses in an answer', () => {
 
     expect(h.service.resolveDomain(DOMAIN)).toEqual({
       destinations: ['172.16.12.40'],
-      status: 'error',
-      reasonCode: 'forbidden-destination',
-      reason: '2 resolved addresses of corp.local must never be routed (dns-server: 2)',
+      status: 'active',
+      reasonCode: 'dns-server-excluded',
+      reason: '2 resolved addresses of corp.local are DNS servers and never routed',
       lastResolvedAt: '2026-10-12T08:30:00.000Z',
     });
     const warnings = h.logs('warn', 'resolved addresses refused; they are never routed');
@@ -1605,7 +1631,7 @@ describe('DNS-server addresses in an answer', () => {
     servers = [SYSTEM];
     await refresh(h, [SYSTEM, '172.16.12.40']);
 
-    expect(h.service.resolveDomain(DOMAIN)).toMatchObject({ destinations: ['172.16.12.40'], reasonCode: 'forbidden-destination' });
+    expect(h.service.resolveDomain(DOMAIN)).toMatchObject({ destinations: ['172.16.12.40'], reasonCode: 'dns-server-excluded' });
   });
 
   it('keeps the list it had when the resolvers of the system cannot be read', async () => {
@@ -1639,10 +1665,10 @@ describe('DNS-server addresses in an answer', () => {
     await answer(h, [DNS_SERVER, '172.16.12.40']);
     await answer(h, ['172.16.12.50', DNS_SERVER]);
 
-    expect(h.service.resolveDomain(own)).toMatchObject({ destinations: ['172.16.12.40'], reasonCode: 'forbidden-destination' });
+    expect(h.service.resolveDomain(own)).toMatchObject({ destinations: ['172.16.12.40'], reasonCode: 'dns-server-excluded' });
     expect(h.service.resolveDomain(other)).toMatchObject({
       destinations: ['172.16.12.50'],
-      reason: '1 resolved address of other.corp.local must never be routed (dns-server: 1)',
+      reason: '1 resolved address of other.corp.local is a DNS server and never routed',
     });
   });
 
@@ -1654,7 +1680,7 @@ describe('DNS-server addresses in an answer', () => {
 
     expect(h.service.resolveDomain(DOMAIN, context(['10.20.0.10'], ['10.20.0.10', '192.168.1.1']))).toMatchObject({
       destinations: ['172.16.12.40'],
-      reason: '2 resolved addresses of corp.local must never be routed (dns-server: 2)',
+      reason: '2 resolved addresses of corp.local are DNS servers and never routed',
     });
   });
 
@@ -1668,9 +1694,9 @@ describe('DNS-server addresses in an answer', () => {
 
     expect(h.service.resolveDomain(DOMAIN)).toMatchObject({
       destinations: ['172.16.12.40'],
-      status: 'error',
-      reasonCode: 'forbidden-destination',
-      reason: '1 resolved address of corp.local must never be routed (dns-server: 1)',
+      status: 'active',
+      reasonCode: 'dns-server-excluded',
+      reason: '1 resolved address of corp.local is a DNS server and never routed',
     });
     // And it is served again once no rule uses it as a server.
     h.service.syncConfig(config([DOMAIN]));
@@ -1687,7 +1713,7 @@ describe('DNS-server addresses in an answer', () => {
     const poisoned = await h.settle();
 
     expect(h.take()).toEqual([`add 172.16.12.40 ${ETH_GW}`]);
-    expect(stateOf(poisoned)).toMatchObject({ status: 'error', reasonCode: 'forbidden-destination', appliedDestinations: ['172.16.12.40'] });
+    expect(stateOf(poisoned)).toMatchObject({ status: 'active', reasonCode: 'dns-server-excluded', appliedDestinations: ['172.16.12.40'] });
 
     // From here on every lookup fails. The routes stay for a while ...
     h.dns.auto = () => dnsError('ETIMEOUT');
@@ -2227,7 +2253,7 @@ describe('the DNS server of the interface', () => {
     expect(h.dns.lookups.map((lookup) => lookup.servers)).toEqual([['10.20.0.10']]);
     // The Wi-Fi resolver in the answer is not routed through Ethernet.
     expect(h.take()).toEqual([`add 172.16.12.40 ${ETH_GW}`]);
-    expect(stateOf(first)).toMatchObject({ reasonCode: 'forbidden-destination', appliedDestinations: ['172.16.12.40'] });
+    expect(stateOf(first)).toMatchObject({ reasonCode: 'dns-server-excluded', appliedDestinations: ['172.16.12.40'] });
 
     // A detection that cannot be trusted reports another server: nothing changes.
     network.current = withServers(['203.0.113.53'], true);
@@ -2720,7 +2746,7 @@ describe('the DNS servers of the interfaces are never routed from an answer', ()
     // The rule's own server is routed (TASK-111): it is not the server of an interface.
     expect(h.take()).toEqual([`add 198.51.100.53 ${WIFI_GW}`, `add 172.16.12.40 ${WIFI_GW}`]);
     expect(stateOf(outcome)).toMatchObject({
-      reasonCode: 'forbidden-destination',
+      reasonCode: 'dns-server-excluded',
       appliedDestinations: ['198.51.100.53', '172.16.12.40'],
     });
   });
@@ -2738,7 +2764,7 @@ describe('the DNS servers of the interfaces are never routed from an answer', ()
 
     expect(h.take()).toEqual([`add 198.51.100.53 ${WIFI_GW}`, `add 172.16.12.40 ${WIFI_GW}`]);
     expect(stateOf(accepted)).toMatchObject({
-      reasonCode: 'forbidden-destination',
+      reasonCode: 'dns-server-excluded',
       appliedDestinations: ['198.51.100.53', '172.16.12.40'],
     });
   });
@@ -2764,7 +2790,7 @@ describe('the DNS servers of the interfaces are never routed from an answer', ()
 
     // The new server is excluded; the old one is an ordinary address again.
     expect(h.take()).toEqual([`add 10.20.0.10 ${WIFI_GW}`, `add 172.16.12.41 ${WIFI_GW}`]);
-    expect(stateOf(outcome).reason).toBe('1 resolved address of corp.local must never be routed (dns-server: 1)');
+    expect(stateOf(outcome).reason).toBe('1 resolved address of corp.local is a DNS server and never routed');
   });
 
   it('keeps excluding what untrusted detections reported until a clean one says otherwise', async () => {
@@ -2828,7 +2854,7 @@ describe('the DNS servers of the interfaces are never routed from an answer', ()
     const calls = h.take();
     expect(calls).toContain(`add 198.51.100.7 ${ETH_GW}`);
     expect(calls.filter((call) => call.startsWith('add 10.20.9.53'))).toEqual([]);
-    expect(stateOf(outcome)).toMatchObject({ reasonCode: 'forbidden-destination' });
+    expect(stateOf(outcome)).toMatchObject({ reasonCode: 'dns-server-excluded' });
     expect(stateOf(outcome).appliedDestinations).not.toContain('10.20.9.53');
   });
 });
@@ -2855,8 +2881,8 @@ describe('every DNS server of the system (scutil --dns)', () => {
     expect(h.dns.lookups.map((lookup) => lookup.servers)).toEqual([['10.20.0.10', '10.20.0.11']]);
     expect(h.take()).toEqual([`add 172.16.12.40 ${ETH_GW}`]);
     expect(stateOf(outcome)).toMatchObject({
-      reasonCode: 'forbidden-destination',
-      reason: '2 resolved addresses of a.corp.local must never be routed (dns-server: 2)',
+      reasonCode: 'dns-server-excluded',
+      reason: '2 resolved addresses of a.corp.local are DNS servers and never routed',
       appliedDestinations: ['172.16.12.40'],
     });
   });
@@ -2921,7 +2947,7 @@ describe('the whole exclusion list is read (TASK-DELTA-06 QA verdict 1)', () => 
     const calls = h.take();
     expect(calls).toContain(`add 198.51.100.7 ${ETH_GW}`);
     expect(calls.filter((call) => call.includes(LAST))).toEqual([]);
-    expect(stateOf(outcome)).toMatchObject({ reasonCode: 'forbidden-destination' });
+    expect(stateOf(outcome)).toMatchObject({ reasonCode: 'dns-server-excluded' });
     expect(stateOf(outcome).appliedDestinations).not.toContain(LAST);
   });
 });

@@ -3553,11 +3553,11 @@ describe('explicit rules outrank resolved addresses', () => {
     expect(h.take()).toEqual([add('172.16.12.40', WIFI_GW), add('172.16.12.41', ETH_GW)]);
     const explicit = outcome.state.rules.find((entry) => entry.ruleId !== ruleId(5));
     expect(explicit).toMatchObject({ status: 'active', appliedDestinations: ['172.16.12.40'] });
+    // The domain works through its other address: a warning, not an error (TASK-DELTA-07).
     expect(ruleState(outcome, 5)).toMatchObject({
-      status: 'error',
-      reasonCode: 'route-failed',
-      reason:
-        '172.16.12.40 is routed through the wifi interface by an explicit rule, which takes precedence over a resolved address',
+      status: 'active',
+      reasonCode: 'overridden-by-rule',
+      reason: '1 resolved address is routed by another rule, which takes precedence',
       appliedDestinations: ['172.16.12.41'],
     });
     // The rules are reported in config order, whatever order they were planned in.
@@ -4210,5 +4210,168 @@ describe('scoped DNS: resolver files', () => {
       expect(ruleState(outcome, 1).status).toBe('active');
       expect(engineLogs(h.entries, 'error', 'resolver file sync threw')).toHaveLength(1);
     }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// TASK-DELTA-07: a partly applied domain rule is `active` with a warning
+// ---------------------------------------------------------------------------
+
+describe('a partly applied domain rule', () => {
+  const WIFI_IP = rule(3, 'ip', '172.16.12.40', 'wifi');
+  const answer = (
+    destinations: readonly string[],
+    extra: Partial<DomainTargets> = {},
+  ): DomainTargets => ({ ...domainAnswer(destinations), ...extra });
+  const partly = (entries: readonly LogEntry[]): LogEntry[] => engineLogs(entries, 'info', 'rule partly applied');
+
+  it('is `active` + `overridden-by-rule` while another address is routed, and says so once', async () => {
+    const h = setup(config([DOMAIN_RULE, WIFI_IP]), { deps: { resolveDomain: () => answer(['172.16.12.40', '172.16.12.41']) } });
+
+    const outcome = await h.run();
+    await h.run('dns-refresh');
+    await h.run('dns-refresh');
+
+    expect(ruleState(outcome, 5)).toMatchObject({
+      status: 'active',
+      reasonCode: 'overridden-by-rule',
+      reason: '1 resolved address is routed by another rule, which takes precedence',
+      appliedDestinations: ['172.16.12.41'],
+    });
+    expect(partly(h.entries)).toHaveLength(1);
+    expect(engineLogs(h.entries, 'debug', 'rule partly applied')).toHaveLength(2);
+    expect(engineLogs(h.entries, 'warn', 'rule cannot be applied')).toEqual([]);
+  });
+
+  it('says nothing while the rule is published as deferred, and once when the warning is published (QA verdict 1)', async () => {
+    const ethIp = rule(3, 'ip', '172.16.12.40', 'ethernet');
+    const viaWifi = rule(6, 'domain', 'other.corp.local', 'wifi');
+    const netinfo = createFakeNetInfo(network({ degraded: true }), network(), network());
+    const h = setup(config([ethIp, viaWifi]), { netinfo, deps: { resolveDomain: () => answer(['172.16.12.40', '172.16.12.41']) } });
+
+    const held = await h.run();
+    expect(ruleState(held, 6)).toMatchObject({ status: 'pending', reasonCode: 'interface-down' });
+    expect(partly(h.entries)).toEqual([]);
+    expect(engineLogs(h.entries, 'debug', 'rule partly applied')).toEqual([]);
+
+    const trusted = await h.run('network-change');
+    expect(ruleState(trusted, 6)).toMatchObject({ status: 'active', reasonCode: 'overridden-by-rule', appliedDestinations: ['172.16.12.41'] });
+    expect(partly(h.entries)).toHaveLength(1);
+
+    await h.run('network-change');
+    expect(partly(h.entries)).toHaveLength(1);
+  });
+
+  it('puts the warnings in their order of precedence and counts them all in `reason`', async () => {
+    const fromResolver = (reasonCode: 'dns-server-excluded' | 'addresses-truncated', reason: string) =>
+      answer(['172.16.12.40', '172.16.12.41', '172.16.12.42'], { reasonCode, reason });
+    const cases = [
+      [
+        fromResolver('dns-server-excluded', '1 resolved address of corp.local is a DNS server and never routed; 40 addresses, the 32 lowest are routed'),
+        'overridden-by-rule',
+        '1 resolved address is routed by another rule, which takes precedence; 1 resolved address of corp.local is a DNS server and never routed; 40 addresses, the 32 lowest are routed',
+      ],
+      [
+        fromResolver('addresses-truncated', 'corp.local has 40 addresses; the 32 lowest are routed'),
+        'overridden-by-rule',
+        '1 resolved address is routed by another rule, which takes precedence; corp.local has 40 addresses; the 32 lowest are routed',
+      ],
+    ] as const;
+    for (const [targets, code, reason] of cases) {
+      const h = setup(config([DOMAIN_RULE, WIFI_IP]), { deps: { resolveDomain: () => targets } });
+      expect(ruleState(await h.run(), 5)).toMatchObject({ status: 'active', reasonCode: code, reason });
+    }
+    // Without an override the resolver's own warning stands as it is.
+    const h = setup(config([DOMAIN_RULE]), {
+      deps: { resolveDomain: () => fromResolver('dns-server-excluded', 'x is a DNS server') },
+    });
+    expect(ruleState(await h.run(), 5)).toMatchObject({ status: 'active', reasonCode: 'dns-server-excluded', reason: 'x is a DNS server' });
+  });
+
+  it('counts an address it shares with a rule of its own interface as routed', async () => {
+    const ethIp = rule(4, 'ip', '172.16.12.41', 'ethernet');
+    const h = setup(config([DOMAIN_RULE, WIFI_IP, ethIp]), { deps: { resolveDomain: () => answer(['172.16.12.40', '172.16.12.41']) } });
+
+    expect(ruleState(await h.run(), 5)).toMatchObject({
+      status: 'active',
+      reasonCode: 'overridden-by-rule',
+      appliedDestinations: ['172.16.12.41'],
+    });
+  });
+
+  it('counts overridden addresses, not rules', async () => {
+    const wifi41 = rule(4, 'ip', '172.16.12.41', 'wifi');
+    const h = setup(config([DOMAIN_RULE, WIFI_IP, wifi41]), {
+      deps: { resolveDomain: () => answer(['172.16.12.40', '172.16.12.41', '172.16.12.42']) },
+    });
+
+    expect(ruleState(await h.run(), 5)).toMatchObject({
+      status: 'active',
+      reasonCode: 'overridden-by-rule',
+      reason: '2 resolved addresses are routed by another rule, which takes precedence',
+      appliedDestinations: ['172.16.12.42'],
+    });
+  });
+
+  it('is an error, as before, when no resolved address is routed (its own DNS server does not count)', async () => {
+    for (const rules of [[DOMAIN_RULE, WIFI_IP], [rule(5, 'domain', 'corp.local', 'ethernet', { dns: '10.30.0.53' }), WIFI_IP]]) {
+      const h = setup(config(rules), { deps: { resolveDomain: () => answer(['172.16.12.40']) } });
+
+      const outcome = await h.run();
+
+      expect(ruleState(outcome, 5)).toMatchObject({
+        status: 'error',
+        reasonCode: 'route-failed',
+        reason: '172.16.12.40 is routed through the wifi interface by an explicit rule, which takes precedence over a resolved address',
+      });
+      expect(engineLogs(h.entries, 'warn', 'rule cannot be applied')).toHaveLength(1);
+      expect(partly(h.entries)).toEqual([]);
+    }
+  });
+
+  it('counts an address another rule\'s DNS server takes over as overridden too', async () => {
+    const viaWifi = rule(6, 'domain', 'other.corp.local', 'wifi');
+    const withServer = rule(5, 'domain', 'corp.local', 'ethernet', { dns: '10.30.0.53' });
+    const answers = new Map([[ruleId(6), ['10.30.0.53', '172.16.12.50']]]);
+    const h = setup(config([viaWifi, withServer]), { deps: { resolveDomain: (r) => answer(answers.get(r.id) ?? []) } });
+
+    const outcome = await h.run();
+
+    expect(ruleState(outcome, 6)).toMatchObject({
+      status: 'active',
+      reasonCode: 'overridden-by-rule',
+      appliedDestinations: ['172.16.12.50'],
+    });
+  });
+
+  it('lets any real error win over the warning', async () => {
+    const overridden = ['172.16.12.40', '172.16.12.41'];
+    const cases: readonly (readonly [string, Parameters<typeof setup>[1], readonly Rule[], string])[] = [
+      ['a forbidden address in the answer', { deps: { resolveDomain: () => answer([...overridden, '127.0.0.1']) } }, [DOMAIN_RULE, WIFI_IP], 'forbidden-destination'],
+      ['a connected address', { deps: { resolveDomain: () => answer([...overridden, ETH_GW]) } }, [DOMAIN_RULE, WIFI_IP], 'connected-network'],
+      ['a failed lookup with the old addresses', {
+        deps: { resolveDomain: () => answer(overridden, { status: 'error', reasonCode: 'resolve-failed', reason: 'timed out' }) },
+      }, [DOMAIN_RULE, WIFI_IP], 'resolve-failed'],
+      ['a resolver file problem', {
+        deps: {
+          resolveDomain: () => answer(overridden),
+          syncResolvers: () => ({ issues: new Map([[ruleId(5), { reasonCode: 'resolver-conflict' as const, reason: 'not ours' }]]) }),
+        },
+      }, [DOMAIN_RULE, WIFI_IP], 'resolver-conflict'],
+      ['two domain rules on one address through two interfaces', {
+        deps: { resolveDomain: (r: Rule) => answer(r.id === ruleId(6) ? ['172.16.12.41'] : overridden) },
+      }, [rule(6, 'domain', 'other.corp.local', 'wifi'), DOMAIN_RULE, WIFI_IP], 'route-failed'],
+    ];
+    for (const [name, options, rules, code] of cases) {
+      const h = setup(config(rules), options);
+      const outcome = await h.run();
+      expect([name, ruleState(outcome, 5).status, ruleState(outcome, 5).reasonCode]).toEqual([name, 'error', code]);
+      expect(partly(h.entries)).toEqual([]);
+    }
+
+    // A route of the remaining address that cannot be added.
+    const h = setup(config([DOMAIN_RULE, WIFI_IP]), { deps: { resolveDomain: () => answer(overridden) } });
+    h.routes.onAdd = (request) => (request.dst === '172.16.12.41' ? addFailed('add') : added(request));
+    expect(ruleState(await h.run(), 5)).toMatchObject({ status: 'error', reasonCode: 'route-failed' });
   });
 });

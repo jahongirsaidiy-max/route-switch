@@ -14,6 +14,10 @@ import {
   type ConfigFileRead,
   type ConfigFileReader,
 } from './config-store';
+import { assertFsGuardInstalled } from './test-fs-guard-check';
+
+// Touches the file system: refuse to run at all without the guard of the test setup.
+assertFsGuardInstalled();
 
 const ID_A = '00000000-0000-4000-8000-000000000001';
 const ID_B = '00000000-0000-4000-8000-000000000002';

@@ -18,6 +18,10 @@ import {
   type ResolverFs,
 } from './resolver';
 import { createFakeCommandRunner, type FakeCommandRunner } from './test-utils';
+import { assertFsGuardInstalled } from './test-fs-guard-check';
+
+// Touches the file system: refuse to run at all without the guard of the test setup.
+assertFsGuardInstalled();
 
 // Every test works in a fresh directory under the system's temporary directory. Nothing here ever
 // names the real resolver directory: the module only ever touches the `dir` it is given.

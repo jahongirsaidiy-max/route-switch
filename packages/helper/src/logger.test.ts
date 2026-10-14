@@ -16,6 +16,10 @@ import {
   type LogEntry,
   type SinkFailure,
 } from './logger';
+import { assertFsGuardInstalled } from './test-fs-guard-check';
+
+// Touches the file system: refuse to run at all without the guard of the test setup.
+assertFsGuardInstalled();
 
 const FIXED_NOW = new Date('2026-01-02T03:04:05.678Z');
 const fixedClock = (): Date => FIXED_NOW;
