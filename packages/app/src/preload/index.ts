@@ -1,8 +1,45 @@
 // Runs in every window before the page, under `sandbox: true` — so it is built
 // as a single CommonJS file with its dependencies bundled in.
 //
-// Nothing is exposed to the page yet. The renderer API (`window.rs`) is added
-// here with `contextBridge.exposeInMainWorld`, as thin `ipcRenderer.invoke`
-// wrappers and nothing else.
+// Exposes `window.rs` (types: `src/renderer/src/rs.d.ts`) and nothing else.
+// Each method is a bare `ipcRenderer.invoke` on its channel; the main process
+// (`src/main/ipc.ts`) checks every call. No logic lives here: whatever this
+// file decided, a compromised page could bypass by calling the channel itself.
 
-export {};
+import { contextBridge, ipcRenderer, type IpcRendererEvent } from 'electron';
+
+import type { RsApi, RsInvokeChannel, RsInvokeChannels, RsResult, RsSnapshot, RsStateChannel } from '../renderer/src/rs';
+
+const invoke = <C extends RsInvokeChannel>(
+  channel: C,
+  ...args: RsInvokeChannels[C]['args']
+): Promise<RsResult<RsInvokeChannels[C]['value']>> =>
+  // The main process answers every call on these channels with an `RsResult`.
+  ipcRenderer.invoke(channel, ...args) as Promise<RsResult<RsInvokeChannels[C]['value']>>;
+
+const STATE_CHANNEL: RsStateChannel = 'rs:state';
+
+const api: RsApi = {
+  getState: () => invoke('rs:getState'),
+  getConfig: () => invoke('rs:getConfig'),
+  saveRule: (rule) => invoke('rs:saveRule', rule),
+  deleteRule: (id) => invoke('rs:deleteRule', id),
+  toggleRule: (id, enabled) => invoke('rs:toggleRule', id, enabled),
+  setEnabled: (on) => invoke('rs:setEnabled', on),
+  apply: () => invoke('rs:apply'),
+  test: (target) => invoke('rs:test', target),
+  importConfig: () => invoke('rs:import'),
+  exportConfig: () => invoke('rs:export'),
+  onState: (listener) => {
+    // The page never sees the Electron event object, only the snapshot.
+    const forward = (_event: IpcRendererEvent, snapshot: RsSnapshot): void => {
+      listener(snapshot);
+    };
+    ipcRenderer.on(STATE_CHANNEL, forward);
+    return () => {
+      ipcRenderer.removeListener(STATE_CHANNEL, forward);
+    };
+  },
+};
+
+contextBridge.exposeInMainWorld('rs', api);
