@@ -31,6 +31,7 @@ import {
   type InvokeEvent,
   type StateRecipient,
 } from './ipc';
+import type { HelperSetupResult, Installer } from './installer';
 import { createLogBuffer, type LogBuffer } from './logBuffer';
 import { APP_ENTRY_URL } from './runtime';
 import { createSettings, type Settings } from './settings';
@@ -196,7 +197,14 @@ interface SetupOptions {
   readonly now?: () => number;
   /** The helper's stored config cannot be loaded: the handshake ends `config-unreadable`. */
   readonly brokenConfig?: boolean;
+  readonly installer?: Installer;
 }
+
+/** An installer that must not be reached. */
+const UNUSED_INSTALLER: Installer = {
+  install: () => Promise.reject(new Error('install not expected')),
+  uninstall: () => Promise.reject(new Error('uninstall not expected')),
+};
 
 /** File dialogs the user always cancels. */
 const CANCELLED_DIALOGS: ConfigDialogs = { chooseImportFile: () => Promise.resolve(null), chooseExportFile: () => Promise.resolve(null) };
@@ -237,6 +245,7 @@ async function setup(options: SetupOptions = {}) {
     settings: options.settings ?? unusedSettings(logger),
     openRulesWindow: options.openRulesWindow ?? (() => undefined),
     configDialogs: options.configDialogs ?? CANCELLED_DIALOGS,
+    installer: options.installer ?? UNUSED_INSTALLER,
     ...(options.configFs === undefined ? {} : { configFs: options.configFs }),
     ...(options.now === undefined ? {} : { now: options.now }),
   });
@@ -287,10 +296,10 @@ const newRule = (extra: Partial<RuleInput> = {}): RuleInput => ({
 // ---------------------------------------------------------------------------
 
 describe('registration', () => {
-  it('handles exactly the twenty-one invoke channels of the renderer API', async () => {
+  it('handles exactly the twenty-three invoke channels of the renderer API', async () => {
     const h = await setup({ connect: false });
     expect([...h.ipcMain.handlers.keys()].sort()).toEqual([...INVOKE_CHANNELS].sort());
-    expect(INVOKE_CHANNELS).toHaveLength(21);
+    expect(INVOKE_CHANNELS).toHaveLength(23);
   });
 
   it('dispose removes every handler and stops the state pushes; a second dispose does nothing', async () => {
@@ -301,7 +310,7 @@ describe('registration', () => {
     h.registration.dispose();
     h.registration.dispose();
     expect(h.ipcMain.handlers.size).toBe(0);
-    expect(h.ipcMain.removeHandler).toHaveBeenCalledTimes(21);
+    expect(h.ipcMain.removeHandler).toHaveBeenCalledTimes(23);
     h.sockets[0]?.emit('connect');
     for (let i = 0; i < 6; i += 1) await flush();
     expect(sent).toEqual([]);
@@ -748,6 +757,9 @@ describe('every argument is checked before anything reaches the helper', () => {
     ['arguments to getState', 'rs:getState', [{}]],
     ['arguments to getConfig', 'rs:getConfig', ['x']],
     ['arguments to getLog', 'rs:getLog', [500]],
+    ['a path to installHelper', 'rs:installHelper', ['/tmp/evil']],
+    ['undefined to installHelper', 'rs:installHelper', [undefined]],
+    ['a flag to removeHelper', 'rs:removeHelper', ['--force']],
   ];
 
   it.each(invalid)('%s is refused as invalid-input', async (_name, channel, args) => {
@@ -881,6 +893,7 @@ describe('rs:state', () => {
     let statusListener: (() => void) | null = null;
     const statusListeners: ((status: { kind: 'not-installed' }) => void)[] = [];
     registerIpcHandlers({
+      installer: UNUSED_INSTALLER,
       ipcMain: fakeIpcMain(),
       helperClient: {
         request: () => Promise.reject(new Error('unused')),
@@ -1407,10 +1420,12 @@ describe('the preload against the main process (window.rs)', () => {
         'getSettings',
         'getState',
         'importConfig',
+        'installHelper',
         'onLog',
         'onState',
         'openRulesWindow',
         'reconnectHelper',
+        'removeHelper',
         'resetConfig',
         'saveRule',
         'setEnabled',
@@ -1462,5 +1477,83 @@ describe('the preload against the main process (window.rs)', () => {
       'uninstall',
     ]);
     bridge.setInvokeTarget(null);
+  });
+});
+
+describe('installHelper / removeHelper', () => {
+  const fakeInstaller = (install: HelperSetupResult, uninstall: HelperSetupResult = install) => ({
+    install: vi.fn(() => Promise.resolve(install)),
+    uninstall: vi.fn(() => Promise.resolve(uninstall)),
+  });
+
+  it('install runs the installer with no argument and reconnects at once on success', async () => {
+    const installer = fakeInstaller({ ok: true, value: null });
+    const h = await setup({ connect: false, installer });
+    const reconnect = vi.spyOn(h.client, 'reconnectNow');
+    expect(await h.call('rs:installHelper')).toEqual({ ok: true, value: null });
+    expect(installer.install).toHaveBeenCalledTimes(1);
+    expect(installer.install).toHaveBeenCalledWith();
+    expect(installer.uninstall).not.toHaveBeenCalled();
+    expect(reconnect).toHaveBeenCalledTimes(1);
+    expect(h.entries.some((entry) => entry.msg === 'Helper setup ended' && entry['ok'] === true)).toBe(true);
+  });
+
+  it('removeHelper runs the uninstaller and reconnects (the status becomes not-installed)', async () => {
+    const installer = fakeInstaller({ ok: true, value: null });
+    const h = await setup({ installer });
+    const reconnect = vi.spyOn(h.client, 'reconnectNow');
+    expect(await h.call('rs:removeHelper')).toEqual({ ok: true, value: null });
+    expect(installer.uninstall).toHaveBeenCalledTimes(1);
+    expect(installer.install).not.toHaveBeenCalled();
+    expect(reconnect).toHaveBeenCalledTimes(1);
+  });
+
+  it.each(['install-cancelled', 'install-denied', 'install-unavailable', 'busy'] as const)(
+    '%s is passed on and no reconnect is forced',
+    async (code) => {
+      const installer = fakeInstaller({ ok: false, code, error: 'x' });
+      const h = await setup({ connect: false, installer });
+      const reconnect = vi.spyOn(h.client, 'reconnectNow');
+      expect(await h.call('rs:installHelper')).toEqual({ ok: false, code, error: 'x' });
+      expect(reconnect).not.toHaveBeenCalled();
+    },
+  );
+
+  it('a failed script keeps its detail line for the page', async () => {
+    const failed: HelperSetupResult = { ok: false, code: 'install-failed', error: 'exit 1', detail: 'install-helper: error: x' };
+    const h = await setup({ connect: false, installer: fakeInstaller(failed) });
+    expect(await h.call('rs:installHelper')).toEqual(failed);
+  });
+
+  it('an installer that throws is answered internal', async () => {
+    const h = await setup({ connect: false, installer: UNUSED_INSTALLER });
+    expect(await h.call('rs:installHelper')).toMatchObject({ ok: false, code: 'internal' });
+  });
+
+  it('another document or a sub-frame cannot start an install', async () => {
+    const installer = fakeInstaller({ ok: true, value: null });
+    const h = await setup({ connect: false, installer });
+    for (const event of [
+      { senderFrame: { url: 'https://example.com/', parent: null } },
+      { senderFrame: { url: APP_ENTRY_URL, parent: {} } },
+      { senderFrame: null },
+    ]) {
+      expect(await h.callAs(event, 'rs:installHelper')).toMatchObject({ ok: false, code: 'forbidden' });
+      expect(await h.callAs(event, 'rs:removeHelper')).toMatchObject({ ok: false, code: 'forbidden' });
+    }
+    expect(installer.install).not.toHaveBeenCalled();
+    expect(installer.uninstall).not.toHaveBeenCalled();
+  });
+
+  it('any argument is refused before the installer runs', async () => {
+    const installer = fakeInstaller({ ok: true, value: null });
+    const h = await setup({ connect: false, installer });
+    expect(await h.call('rs:installHelper', '/Applications/Evil.app/Contents/Resources/helper')).toMatchObject({
+      ok: false,
+      code: 'invalid-input',
+    });
+    expect(await h.call('rs:removeHelper', '--force')).toMatchObject({ ok: false, code: 'invalid-input' });
+    expect(installer.install).not.toHaveBeenCalled();
+    expect(installer.uninstall).not.toHaveBeenCalled();
   });
 });

@@ -255,6 +255,7 @@ describe('SettingsScreen', () => {
       getServiceOrder: vi.fn(),
       copyServiceOrderCommand: vi.fn(),
       uninstallHelper: vi.fn(),
+      removeHelper: vi.fn(),
     };
     const html = renderMarkup(createElement(SettingsScreen, { rs }));
     expect(html).toContain('Sozlamalar');
@@ -264,6 +265,7 @@ describe('SettingsScreen', () => {
     expect(rs.setIfaceOverrides).not.toHaveBeenCalled();
     expect(rs.copyServiceOrderCommand).not.toHaveBeenCalled();
     expect(rs.uninstallHelper).not.toHaveBeenCalled();
+    expect(rs.removeHelper).not.toHaveBeenCalled();
   });
 });
 

@@ -36,6 +36,7 @@ import type {
 import { readConfigFile, writeConfigFile, type ConfigFileSystem } from './configFile';
 import { createConnectionJournal } from './connectionJournal';
 import type { HelperClient, HelperStatus } from './helperClient';
+import type { Installer } from './installer';
 import { createLogBuffer, type LogBuffer } from './logBuffer';
 import type { Logger } from './logger';
 import { isAllowedNavigation } from './security';
@@ -71,6 +72,8 @@ export const INVOKE_CHANNELS = [
   'rs:openRulesWindow',
   'rs:reconnect',
   'rs:resetConfig',
+  'rs:installHelper',
+  'rs:removeHelper',
 ] as const satisfies readonly RsInvokeChannel[];
 
 /** What "Bo'sh config bilan boshlash" stores in place of a config the helper cannot load. */
@@ -112,6 +115,8 @@ export interface IpcDeps {
   readonly logBuffer?: LogBuffer;
   /** The login item and the network service order (settings screen). */
   readonly settings: Settings;
+  /** Runs the app's own install / uninstall script as root after the system password dialog (`installer.ts`). */
+  readonly installer: Installer;
   /** Opens the rules window or brings it to the front (`WindowManager.openRules`). Main process only, no helper call. */
   readonly openRulesWindow: () => void;
   /** The system file dialogs of config import / export; null when the user cancels. The path never reaches the page. */
@@ -212,6 +217,8 @@ const ARGUMENTS = {
   'rs:openRulesWindow': argumentsOf(),
   'rs:reconnect': argumentsOf(),
   'rs:resetConfig': argumentsOf(),
+  'rs:installHelper': argumentsOf(),
+  'rs:removeHelper': argumentsOf(),
 } as const satisfies Readonly<Record<RsInvokeChannel, ArgsParser<readonly unknown[]>>>;
 
 type ParsedArgs<C extends RsInvokeChannel> = (typeof ARGUMENTS)[C] extends ArgsParser<infer A> ? A : never;
@@ -242,6 +249,7 @@ export function registerIpcHandlers(deps: IpcDeps): IpcRegistration {
   const changeLog = logger.limited('ipc-change');
   const windowLog = logger.limited('ipc-window');
   const reconnectLog = logger.limited('ipc-reconnect');
+  const setupLog = logger.limited('ipc-helper-setup');
   const internalLog = logger.limited('ipc-internal');
   const pushLog = logger.limited('ipc-push-failed');
   const journalLog = logger.limited('ipc-journal-failed');
@@ -346,6 +354,17 @@ export function registerIpcHandlers(deps: IpcDeps): IpcRegistration {
       return saved;
     });
 
+  // Install / full removal: the page sends nothing; the installer runs a fixed
+  // script of the app's resources. Afterwards the client tries the socket at
+  // once instead of waiting for its backoff (an `incompatible` helper included).
+  const setUpHelper = async (channel: 'rs:installHelper' | 'rs:removeHelper', run: () => ReturnType<Installer['install']>) => {
+    setupLog.info('Helper setup requested', { channel });
+    const result = await run();
+    if (result.ok) helperClient.reconnectNow();
+    setupLog.info('Helper setup ended', { channel, ok: result.ok, code: result.ok ? null : result.code });
+    return result;
+  };
+
   const handlers: Handlers = {
     'rs:getState': () => {
       const { status, state } = helperClient.snapshot();
@@ -430,6 +449,8 @@ export function registerIpcHandlers(deps: IpcDeps): IpcRegistration {
         changeLog.info('Unreadable config replaced with an empty one', { channel: 'rs:resetConfig', ok: saved.ok });
         return saved;
       }),
+    'rs:installHelper': () => setUpHelper('rs:installHelper', deps.installer.install),
+    'rs:removeHelper': () => setUpHelper('rs:removeHelper', deps.installer.uninstall),
   };
 
   const register = (channel: RsInvokeChannel): void => {

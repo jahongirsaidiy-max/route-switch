@@ -26,14 +26,21 @@ export const HELPER_STATUS_TEXT: Readonly<Record<EngineStateView['helper'], Help
 /**
  * What the user can do about a helper status:
  * - `reconnect`     — try the connection again now ("Qayta ulanish");
- * - `install`       — install the helper (not in the app yet: shown disabled, with `INSTALL_UNAVAILABLE`);
- * - `reinstall`     — install the matching helper version (likewise);
+ * - `install`       — install the helper (administrator password, `installHelper`);
+ * - `reinstall`     — install the matching helper version (the same);
  * - `repair-config` — replace the unreadable stored config: import a file, or start with an empty one.
  */
 export type HelperRecovery = 'reconnect' | 'install' | 'reinstall' | 'repair-config';
 
-/** Why "Helper'ni o'rnatish" is disabled: installing from the app is not built yet. */
-export const INSTALL_UNAVAILABLE = "Ilova ichidan o'rnatish hali qo'shilmagan";
+/** The words of installing the helper from the app (TASK-214). */
+export const INSTALL_TEXT = {
+  install: "Helper'ni o'rnatish",
+  reinstall: "Helper'ni qayta o'rnatish",
+  /** Under the busy button: the system dialog may be behind another window. */
+  waiting: "Administrator paroli so'raladi (macOS oynasi). O'rnatish bir daqiqagacha davom etishi mumkin.",
+  installed: "Helper o'rnatildi — ulanmoqda…",
+  removed: "Helper butunlay o'chirildi: route'lar, resolver fayllari, daemon, config va log olib tashlandi.",
+} as const;
 
 export interface HelperNotice {
   readonly title: string;

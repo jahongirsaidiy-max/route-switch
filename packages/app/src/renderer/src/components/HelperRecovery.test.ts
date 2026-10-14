@@ -2,7 +2,7 @@ import { createElement, isValidElement, type ReactElement, type ReactNode } from
 import { describe, expect, it, vi } from 'vitest';
 
 import type { RsApi } from '../rs';
-import { INSTALL_UNAVAILABLE } from '../text';
+import { INSTALL_TEXT } from '../text';
 import { Banner } from './Banner';
 import { Button } from './Button';
 import { HelperRecovery, requestReconnect, type HelperRecoveryProps } from './HelperRecovery';
@@ -24,6 +24,8 @@ const props = (extra: Partial<HelperRecoveryProps> = {}): HelperRecoveryProps =>
   recovery: 'reconnect',
   onReconnect: vi.fn(),
   reconnecting: false,
+  onInstall: vi.fn(),
+  installing: false,
   ...extra,
 });
 
@@ -46,15 +48,27 @@ describe('HelperRecovery', () => {
   it.each([
     ['install', "Helper'ni o'rnatish"],
     ['reinstall', "Helper'ni qayta o'rnatish"],
-  ] as const)('%s: "Qayta tekshirish" and the install button, disabled with the reason in its name', (recovery, install) => {
+  ] as const)('%s: "Qayta tekshirish" and the install button that asks for an install (TASK-214)', (recovery, install) => {
     const all = props({ recovery });
     const buttons = buttonsOf(HelperRecovery(all));
     expect(buttons.map((button) => button.props.children)).toEqual(['Qayta tekshirish', install]);
-    expect(buttons[1]?.props).toMatchObject({ disabled: true, label: `${install} — ${INSTALL_UNAVAILABLE}` });
-    const html = renderMarkup(createElement(HelperRecovery, all));
-    expect(html).toContain(`title="${INSTALL_UNAVAILABLE.replace(/'/g, '&#x27;')}"`);
+    expect(buttons[1]?.props.disabled).toBeUndefined();
     buttons[0]?.props.onClick?.();
     expect(all.onReconnect).toHaveBeenCalledTimes(1);
+    expect(all.onInstall).not.toHaveBeenCalled();
+    buttons[1]?.props.onClick?.();
+    expect(all.onInstall).toHaveBeenCalledTimes(1);
+    expect(renderMarkup(createElement(HelperRecovery, all))).not.toContain(INSTALL_TEXT.waiting.slice(0, 20));
+  });
+
+  it('installing: the install button is busy (focusable, aria-disabled) and a status line says what happens', () => {
+    const html = renderMarkup(createElement(HelperRecovery, props({ recovery: 'install', installing: true })));
+    expect(html).toMatch(/aria-busy="true"[^>]*>|aria-disabled="true"/);
+    expect(html).not.toContain('disabled=""');
+    expect(html).toContain('role="status"');
+    expect(html).toContain('Administrator paroli so&#x27;raladi');
+    const buttons = buttonsOf(HelperRecovery(props({ recovery: 'install', installing: true })));
+    expect(buttons[1]?.props.busy).toBe(true);
   });
 
   it('nothing for a broken config (the rules screen repairs it) or with nothing to do', () => {

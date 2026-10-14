@@ -50,6 +50,8 @@ const INVOKES = [
   ['openRulesWindow', [], 'rs:openRulesWindow'],
   ['reconnectHelper', [], 'rs:reconnect'],
   ['resetConfig', [], 'rs:resetConfig'],
+  ['installHelper', [], 'rs:installHelper'],
+  ['removeHelper', [], 'rs:removeHelper'],
 ] as const;
 
 describe('preload', () => {

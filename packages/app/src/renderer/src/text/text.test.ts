@@ -6,7 +6,7 @@ import type { RsConnection } from '../rs';
 import {
   configIssueText,
   helperNotice,
-  INSTALL_UNAVAILABLE,
+  INSTALL_TEXT,
   type HelperRecovery,
   HELPER_STATUS_TEXT,
   isValidationCode,
@@ -129,8 +129,9 @@ describe('helperNotice — the way out of each helper status (TASK-300)', () => 
     expect(text).toContain("bo'sh config");
   });
 
-  it('the install button says why it is disabled', () => {
-    expect(INSTALL_UNAVAILABLE).toBe("Ilova ichidan o'rnatish hali qo'shilmagan");
+  it('the install button names what it does', () => {
+    expect(INSTALL_TEXT.install).toBe("Helper'ni o'rnatish");
+    expect(INSTALL_TEXT.reinstall).toBe("Helper'ni qayta o'rnatish");
   });
 });
 

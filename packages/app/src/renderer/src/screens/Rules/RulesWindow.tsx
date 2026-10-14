@@ -14,6 +14,7 @@ import { useEngineState, type EngineStateView } from '../../hooks/useEngineState
 import type { RsApi } from '../../rs';
 import { HELPER_STATUS_TEXT, helperNotice, type Feedback } from '../../text';
 import { AddRuleDialog, type RuleEditorTarget } from '../AddRule';
+import { useInstall } from '../Install';
 import { LogScreen } from '../Log';
 import { SettingsScreen } from '../Settings';
 import { RulesScreen } from './RulesScreen';
@@ -89,6 +90,11 @@ export interface RulesWindowFrameProps {
   readonly reconnecting?: boolean;
   /** A refused reconnect request. */
   readonly reconnectFeedback?: Feedback | null;
+  /** "Helper'ni (qayta) o'rnatish" of the helper box (TASK-214). */
+  readonly onInstall?: () => void;
+  readonly installing?: boolean;
+  /** How the last install ended. */
+  readonly installFeedback?: Feedback | null;
   readonly children: ReactNode;
 }
 
@@ -101,6 +107,9 @@ export function RulesWindowFrame({
   onReconnect,
   reconnecting = false,
   reconnectFeedback = null,
+  onInstall = () => undefined,
+  installing = false,
+  installFeedback = null,
   children,
 }: RulesWindowFrameProps): ReactElement {
   const helper = HELPER_STATUS_TEXT[engine.helper];
@@ -134,12 +143,21 @@ export function RulesWindowFrame({
           {connection?.kind === 'connected' ? <div>root daemon · v{connection.helperVersion}</div> : null}
           {notice === null || notice.text === '' ? null : <p className={styles['helperText']}>{notice.text}</p>}
           {onReconnect === undefined ? null : (
-            <HelperRecovery recovery={notice?.recovery ?? null} onReconnect={onReconnect} reconnecting={reconnecting} size="sm" />
+            <HelperRecovery
+              recovery={notice?.recovery ?? null}
+              onReconnect={onReconnect}
+              reconnecting={reconnecting}
+              onInstall={onInstall}
+              installing={installing}
+              size="sm"
+            />
           )}
-          {reconnectFeedback === null ? null : (
-            <p className={styles['helperText']} data-tone={reconnectFeedback.tone} role="alert">
-              {reconnectFeedback.text}
-            </p>
+          {[reconnectFeedback, installFeedback].map((line, index) =>
+            line === null ? null : (
+              <p key={index} className={styles['helperText']} data-tone={line.tone} role="alert">
+                {line.text}
+              </p>
+            ),
           )}
         </div>
       </aside>
@@ -167,7 +185,7 @@ export interface RulesWindowProps {
   readonly screens?: Readonly<Record<RulesSection, ComponentType<SectionScreenProps>>>;
   readonly editorScreen?: ComponentType<{ readonly editor: RuleEditorTarget; readonly onClose: () => void }>;
   /** The preload API; `window.rs` in the app. */
-  readonly rs?: Pick<RsApi, 'getState' | 'onState' | 'reconnectHelper'>;
+  readonly rs?: Pick<RsApi, 'getState' | 'onState' | 'reconnectHelper' | 'installHelper'>;
 }
 
 /** The screen of the rules window (`?view=rules`). */
@@ -190,6 +208,7 @@ export function RulesWindow({
       setReconnecting(false);
     });
   };
+  const installing = useInstall(rs);
   const [section, setSection] = useState<RulesSection>(initialSection);
   const [editor, setEditor] = useState<RuleEditorTarget | null>(null);
   // The button that opened the form; it gets the focus back once the window is no longer inert.
@@ -221,6 +240,9 @@ export function RulesWindow({
         onReconnect={reconnect}
         reconnecting={reconnecting}
         reconnectFeedback={reconnectFeedback}
+        onInstall={installing.install}
+        installing={installing.installing}
+        installFeedback={installing.feedback}
       >
         <Screen
           onAddRule={() => {

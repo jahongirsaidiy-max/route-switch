@@ -14,6 +14,7 @@ import trayOff2x from '../../resources/tray/trayOffTemplate@2x.png?asset';
 import { startApp } from './bootstrap';
 import { createDevelopmentRuntime } from './development';
 import { createHelperClient } from './helperClient';
+import { createInstaller, HELPER_RESOURCES_DIR, runWithExecFile } from './installer';
 import { createJsonLinesSink, createLogger } from './logger';
 import { createSettings, listServiceOrderWithNetworksetup } from './settings';
 import { loadTrayImage, startShell } from './tray';
@@ -101,6 +102,13 @@ startApp({
             return result.canceled || result.filePath === '' ? null : result.filePath;
           },
         },
+        // The helper package ships inside the packaged app only (`extraResources`, TASK-301).
+        installer: createInstaller({
+          resourcesDir: app.isPackaged ? path.join(process.resourcesPath, HELPER_RESOURCES_DIR) : null,
+          uid: process.getuid?.() ?? -1,
+          run: runWithExecFile,
+          logger,
+        }),
         logger,
       },
       context,

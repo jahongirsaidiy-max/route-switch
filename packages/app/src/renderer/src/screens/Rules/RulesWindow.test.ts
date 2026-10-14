@@ -86,10 +86,31 @@ describe('RulesWindowFrame — helper away (TASK-300)', () => {
     expect(onReconnect).toHaveBeenCalledTimes(1);
   });
 
-  it('no helper: "Qayta tekshirish" and the disabled install button', () => {
-    const { html } = withReconnect({ helper: 'not-installed', connection: { kind: 'not-installed' }, state: null, error: null });
+  it('no helper: "Qayta tekshirish" and the install button, wired to onInstall; its outcome is an alert in the box (TASK-214)', () => {
+    const engine: EngineStateView = { helper: 'not-installed', connection: { kind: 'not-installed' }, state: null, error: null };
+    const onInstall = vi.fn();
+    const element = RulesWindowFrame({ section: 'log', engine, onSelect: vi.fn(), onReconnect: vi.fn(), onInstall, children: null });
+    const html = renderMarkup(element);
     expect(html).toContain('Qayta tekshirish');
-    expect(html).toMatch(/<button[^>]*aria-label="Helper&#x27;ni o&#x27;rnatish — Ilova ichidan o&#x27;rnatish hali qo&#x27;shilmagan" disabled=""/);
+    expect(html).not.toContain('disabled=""');
+    const install = expanded(element).find((node) => node.type !== 'button' && node.props.children === "Helper'ni o'rnatish");
+    install?.props.onClick?.();
+    expect(onInstall).toHaveBeenCalledTimes(1);
+    const busy = renderMarkup(
+      RulesWindowFrame({ section: 'log', engine, onSelect: vi.fn(), onReconnect: vi.fn(), installing: true, children: null }),
+    );
+    expect(busy).toContain('aria-busy="true"');
+    const failed = renderMarkup(
+      RulesWindowFrame({
+        section: 'log',
+        engine,
+        onSelect: vi.fn(),
+        onReconnect: vi.fn(),
+        installFeedback: { tone: 'danger', text: 'Parol oynasi yopildi' },
+        children: null,
+      }),
+    );
+    expect(failed).toMatch(/role="alert"[^>]*>Parol oynasi yopildi/);
   });
 
   it('busy while asked; a refused request is an alert in the box', () => {

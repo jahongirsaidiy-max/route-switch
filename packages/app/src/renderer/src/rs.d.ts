@@ -121,7 +121,14 @@ export type RsIfaceOverrides = Partial<Record<IfaceRole, string>>;
  * - `import-expired` — `applyImport`: the token is unknown, used or older than
  *   10 minutes (choose the file again); nothing was sent;
  * - `write-failed`   — `exportConfig`: the file could not be written; the chosen
- *   path is left as it was.
+ *   path is left as it was;
+ * - `install-unavailable` — `installHelper` / `removeHelper`: the app holds no
+ *   usable helper package (not packaged, a file missing, a symbolic link, or
+ *   writable by another user); nothing was run;
+ * - `install-cancelled` — the user closed the password dialog; nothing was run;
+ * - `install-denied`    — the system refused the authorization; nothing was run;
+ * - `install-failed`    — the script ran as root and failed (`detail` holds its
+ *   error line), or could not be started.
  *
  * For a call that changes something (`saveRule`, `deleteRule`, `toggleRule`,
  * `setEnabled`, `apply`), `disconnected` and `timeout` mean the outcome is
@@ -144,7 +151,11 @@ export type RsErrorCode =
   | 'file-not-text'
   | 'file-not-json'
   | 'import-expired'
-  | 'write-failed';
+  | 'write-failed'
+  | 'install-unavailable'
+  | 'install-cancelled'
+  | 'install-denied'
+  | 'install-failed';
 
 /**
  * Where a refused import file breaks the config schema: the first issue.
@@ -171,10 +182,22 @@ export interface RsExportResult {
   readonly bytes: number;
 }
 
-/** Every call settles with one of these and never rejects. `error` is a short English sentence for the log, not for display. */
+/** What `installHelper` / `removeHelper` give back: the outcome arrives as a new connection in `onState`. */
+export type RsHelperSetupResult = null;
+
+/**
+ * Every call settles with one of these and never rejects. `error` is a short English sentence for the log, not for display.
+ * `detail` (only with `install-failed`) is the script's own error line, one line of at most 300 characters, shown as is.
+ */
 export type RsResult<T> =
   | { readonly ok: true; readonly value: T }
-  | { readonly ok: false; readonly code: RsErrorCode; readonly error: string; readonly issue?: RsConfigIssue };
+  | {
+      readonly ok: false;
+      readonly code: RsErrorCode;
+      readonly error: string;
+      readonly issue?: RsConfigIssue;
+      readonly detail?: string;
+    };
 
 /** Removes the subscription it was returned for. Calling it again does nothing. */
 export type RsUnsubscribe = () => void;
@@ -270,6 +293,21 @@ export interface RsApi {
    * connection is `config-unreadable`.
    */
   resetConfig(): Promise<RsResult<SetConfigResult>>;
+  /**
+   * Installs the helper, or reinstalls it (`incompatible`): the system asks
+   * for the administrator password once and runs the app's own
+   * `install-helper.sh` as root. The page passes nothing. On success the main
+   * process reconnects at once (`reconnectNow`). `busy` while an install or
+   * removal runs.
+   */
+  installHelper(): Promise<RsResult<RsHelperSetupResult>>;
+  /**
+   * Removes the helper completely (`uninstall.sh` as root, after the
+   * administrator password): routes and resolver files, the daemon, its
+   * files, config and log. `install-unavailable` when the app holds no
+   * `uninstall.sh`; then `uninstallHelper` is the way (files stay).
+   */
+  removeHelper(): Promise<RsResult<RsHelperSetupResult>>;
 }
 
 /** Channel -> arguments and value of the call behind it. Main and preload are typed against this table. */
@@ -295,6 +333,8 @@ export interface RsInvokeChannels {
   'rs:openRulesWindow': { readonly args: readonly []; readonly value: null };
   'rs:reconnect': { readonly args: readonly []; readonly value: null };
   'rs:resetConfig': { readonly args: readonly []; readonly value: SetConfigResult };
+  'rs:installHelper': { readonly args: readonly []; readonly value: RsHelperSetupResult };
+  'rs:removeHelper': { readonly args: readonly []; readonly value: RsHelperSetupResult };
 }
 
 export type RsInvokeChannel = keyof RsInvokeChannels;

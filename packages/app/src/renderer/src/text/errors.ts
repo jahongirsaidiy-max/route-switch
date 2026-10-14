@@ -41,6 +41,14 @@ export function errorText(code: RsErrorCode): string {
       return "Tanlangan fayl muddati o'tdi — faylni qayta tanlang.";
     case 'write-failed':
       return "Faylni yozib bo'lmadi — boshqa joyni tanlang.";
+    case 'install-unavailable':
+      return "Ilova ichida helper paketi topilmadi yoki u ishonchsiz (symlink yoki boshqa foydalanuvchi o'zgartira oladi) — ilovani qayta o'rnating.";
+    case 'install-cancelled':
+      return "Parol oynasi yopildi — hech narsa o'zgarmadi. Qayta urinib ko'rishingiz mumkin.";
+    case 'install-denied':
+      return "Administrator paroli qabul qilinmadi — hech narsa o'zgarmadi. Qayta urinib ko'ring.";
+    case 'install-failed':
+      return "Skript xato bilan tugadi. Batafsil: /Library/Logs/RouteSwitch/helper.log. Qayta urinib ko'rishingiz mumkin.";
     default:
       return `Kutilmagan xato (${code}).`;
   }

@@ -208,8 +208,8 @@ export function SettingsPanel(props: SettingsPanelProps): ReactElement {
             </span>
           </div>
           <p className={styles['hint']}>
-            O'chirish helper qo'shgan barcha route'lar va resolver fayllarini olib tashlaydi va root daemon'ni to'xtatadi. Qoidalar
-            routing'ga ta'sir qilmay qoladi.
+            O'chirish administrator parolini so'raydi: helper qo'shgan barcha route'lar va resolver fayllari olib tashlanadi, root
+            daemon to'xtaydi va uning fayllari — config (qoidalar) va log ham — o'chadi. Qoidalar kerak bo'lsa, avval Export qiling.
           </p>
           {props.confirmingUninstall ? (
             <div

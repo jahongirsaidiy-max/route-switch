@@ -332,6 +332,10 @@ function shellHarness() {
         logger,
       }),
       configDialogs: { chooseImportFile: () => Promise.resolve(null), chooseExportFile: () => Promise.resolve(null) },
+      installer: {
+        install: () => Promise.reject(new Error('not used')),
+        uninstall: () => Promise.reject(new Error('not used')),
+      },
       now: () => 50_000,
     },
     {

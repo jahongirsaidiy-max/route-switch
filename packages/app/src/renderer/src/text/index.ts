@@ -1,7 +1,7 @@
 export { errorText, type Feedback } from './errors';
 export {
   HELPER_STATUS_TEXT,
-  INSTALL_UNAVAILABLE,
+  INSTALL_TEXT,
   LOADING_NOTICE,
   helperNotice,
   type HelperNotice,

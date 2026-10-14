@@ -8,7 +8,7 @@ import { IDLE_CONFIG, type ConfigView } from '../../hooks/useConfig';
 import { LOADING_VIEW, type EngineStateView } from '../../hooks/useEngineState';
 import type { RsApi, RsSnapshot } from '../../rs';
 import { CONFIG, ID, NOW, ORDER_WIFI_FIRST, STATE, ruleState } from './fixtures';
-import { helperNotice, INSTALL_UNAVAILABLE } from '../../text';
+import { helperNotice, INSTALL_TEXT } from '../../text';
 import { MenuBarPanel, MenuBarScreen, type MenuBarPanelProps } from './MenuBarScreen';
 
 const connected = (state: EngineState = STATE): EngineStateView => ({
@@ -31,6 +31,7 @@ const props = (extra: Partial<MenuBarPanelProps> = {}): MenuBarPanelProps => ({
   onOpenRules: vi.fn(),
   onReloadConfig: vi.fn(),
   onReconnect: vi.fn(),
+  onInstall: vi.fn(),
   ...extra,
 });
 const render = (extra: Partial<MenuBarPanelProps> = {}) => renderMarkup(createElement(MenuBarPanel, props(extra)));
@@ -336,15 +337,19 @@ describe('MenuBarPanel — no live state', () => {
     expect(button(busy.elements, 'Qayta ulanish').props.disabled).toBeUndefined();
   });
 
-  it('no helper, or another version: "Qayta tekshirish", and the install button disabled with its reason', () => {
+  it('no helper, or another version: "Qayta tekshirish", and the install button that installs (TASK-214)', () => {
     for (const name of ['not-installed', 'incompatible']) {
       const engine = views.find(([view]) => view === name)?.[1] ?? LOADING_VIEW;
       const { all, elements } = treeOf({ engine });
       button(elements, 'Qayta tekshirish').props.onClick?.();
       expect(all.onReconnect).toHaveBeenCalledTimes(1);
-      const install = button(elements, name === 'incompatible' ? "Helper'ni qayta o'rnatish" : "Helper'ni o'rnatish");
-      expect(install.props.disabled).toBe(true);
-      expect(install.props.label).toContain(INSTALL_UNAVAILABLE);
+      const install = button(elements, name === 'incompatible' ? INSTALL_TEXT.reinstall : INSTALL_TEXT.install);
+      expect(install.props.disabled).toBeUndefined();
+      install.props.onClick?.();
+      expect(all.onInstall).toHaveBeenCalledTimes(1);
+      const busy = treeOf({ engine, busy: new Set(['install']) });
+      expect(button(busy.elements, name === 'incompatible' ? INSTALL_TEXT.reinstall : INSTALL_TEXT.install).props).toMatchObject({ busy: true });
+      expect(text(render({ engine, busy: new Set(['install']) }))).toContain("Administrator paroli so'raladi");
     }
   });
 
@@ -383,6 +388,7 @@ describe('MenuBarScreen', () => {
       apply: vi.fn(),
       openRulesWindow: vi.fn(),
       reconnectHelper: vi.fn(),
+      installHelper: vi.fn(),
     } satisfies Partial<RsApi>;
     const html = renderMarkup(createElement(MenuBarScreen, { rs }));
     expect(text(html)).toContain("Holat o'qilmoqda…");

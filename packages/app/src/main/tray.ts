@@ -10,6 +10,7 @@ import type { EngineState } from '@routeswitch/shared';
 import type { Menu, MenuItemConstructorOptions, NativeImage, Rectangle } from 'electron';
 
 import type { HelperClient, HelperStatus } from './helperClient';
+import type { Installer } from './installer';
 import { registerIpcHandlers, type ConfigDialogs, type IpcMainLike } from './ipc';
 import type { Logger } from './logger';
 import type { Settings } from './settings';
@@ -131,6 +132,8 @@ export interface ShellDeps {
   readonly settings: Settings;
   /** The system file dialogs of config import / export. */
   readonly configDialogs: ConfigDialogs;
+  /** Installs / removes the helper as root (`installer.ts`). */
+  readonly installer: Installer;
   readonly logger: Logger;
   readonly now?: () => number;
 }
@@ -170,6 +173,7 @@ export function startShell(deps: ShellDeps, context: ShellContext): Shell {
     listRecipients: windows.contents,
     settings: deps.settings,
     configDialogs: deps.configDialogs,
+    installer: deps.installer,
     // "Qoidalarni boshqarish" of the menu bar window: the same window as the tray menu item.
     openRulesWindow: windows.openRules,
   });

@@ -20,7 +20,7 @@ const ORDER: RsServiceOrder = {
   wifiFirst: true,
   command: "sudo networksetup -ordernetworkservices 'Wi-Fi'",
 };
-const refused = (code: 'not-connected' | 'timeout' | 'not-implemented' | 'invalid-input' | 'operation-failed') =>
+const refused = (code: 'not-connected' | 'timeout' | 'not-implemented' | 'invalid-input' | 'operation-failed' | 'install-cancelled') =>
   Promise.resolve({ ok: false, code, error: 'English detail' } as const);
 
 function fakeApi(overrides: Partial<SettingsApi> = {}): SettingsApi {
@@ -34,6 +34,8 @@ function fakeApi(overrides: Partial<SettingsApi> = {}): SettingsApi {
     getServiceOrder: vi.fn(() => Promise.resolve({ ok: true, value: ORDER } as const)),
     copyServiceOrderCommand: vi.fn(() => Promise.resolve({ ok: true, value: ORDER } as const)),
     uninstallHelper: vi.fn(() => Promise.resolve({ ok: true, value: {} } as const)),
+    // No helper package by default (development): the socket uninstall is the way.
+    removeHelper: vi.fn(() => Promise.resolve({ ok: false, code: 'install-unavailable', error: 'x' } as const)),
     ...overrides,
   };
 }
@@ -124,6 +126,15 @@ describe('copyServiceOrderCommand', () => {
 describe('uninstallHelper', () => {
   it('reports success', async () => {
     expect(await uninstallHelper(fakeApi())).toMatchObject({ tone: 'success' });
+  });
+
+  it('the full removal (administrator password) comes first; then the socket uninstall is not used (TASK-214)', async () => {
+    const rs = fakeApi({ removeHelper: vi.fn(() => Promise.resolve({ ok: true, value: null } as const)) });
+    expect(await uninstallHelper(rs)).toMatchObject({ tone: 'success', text: expect.stringContaining('butunlay') as unknown });
+    expect(rs.uninstallHelper).not.toHaveBeenCalled();
+    const cancelled = fakeApi({ removeHelper: () => refused('install-cancelled') });
+    expect(await uninstallHelper(cancelled)).toMatchObject({ tone: 'danger', text: errorText('install-cancelled') });
+    expect(cancelled.uninstallHelper).not.toHaveBeenCalled();
   });
 
   it('a helper that cannot uninstall yet, or an unknown outcome, is a normal error', async () => {

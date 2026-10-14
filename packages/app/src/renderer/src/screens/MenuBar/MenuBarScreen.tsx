@@ -25,11 +25,12 @@ import { useEngineState, type EngineStateView } from '../../hooks/useEngineState
 import { useNow } from '../../hooks/useNow';
 import type { RsApi, RsServiceOrder } from '../../rs';
 import { errorText, helperNotice, LOADING_NOTICE, networkWarnings, type Feedback } from '../../text';
+import { installHelper } from '../Install';
 import { openRules, reapply, setRouting, type MenuBarApi } from './actions';
 import styles from './MenuBarScreen.module.css';
 import { defaultRole, interfacesKey, menuRules, statusLine, type MenuRule, type StatusLine } from './model';
 
-export type MenuBarAction = 'enabled' | 'apply' | 'rules' | 'reconnect';
+export type MenuBarAction = 'enabled' | 'apply' | 'rules' | 'reconnect' | 'install';
 
 export interface MenuBarPanelProps {
   readonly engine: EngineStateView;
@@ -46,6 +47,8 @@ export interface MenuBarPanelProps {
   readonly onReloadConfig: () => void;
   /** "Qayta ulanish" of the helper notice. */
   readonly onReconnect: () => void;
+  /** "Helper'ni (qayta) o'rnatish" of the helper notice (TASK-214). */
+  readonly onInstall: () => void;
 }
 
 function AlertIcon({ size = 14 }: { readonly size?: number }): ReactElement {
@@ -195,7 +198,13 @@ export function MenuBarPanel(props: MenuBarPanelProps): ReactElement {
           <div className={styles['notice']} data-tone={notice?.tone} role={notice?.tone === 'danger' ? 'alert' : 'status'}>
             <p className={styles['noticeTitle']}>{notice?.title}</p>
             {notice === null || notice.text === '' ? null : <p className={styles['noticeText']}>{notice.text}</p>}
-            <HelperRecovery recovery={notice?.recovery ?? null} onReconnect={props.onReconnect} reconnecting={busy.has('reconnect')} />
+            <HelperRecovery
+              recovery={notice?.recovery ?? null}
+              onReconnect={props.onReconnect}
+              reconnecting={busy.has('reconnect')}
+              onInstall={props.onInstall}
+              installing={busy.has('install')}
+            />
           </div>
         ) : (
           <>
@@ -233,7 +242,7 @@ export function MenuBarPanel(props: MenuBarPanelProps): ReactElement {
 
 export interface MenuBarScreenProps {
   /** The preload API; `window.rs` in the app. */
-  readonly rs?: MenuBarApi & Pick<RsApi, 'getState' | 'onState' | 'getConfig' | 'getServiceOrder' | 'reconnectHelper'>;
+  readonly rs?: MenuBarApi & Pick<RsApi, 'getState' | 'onState' | 'getConfig' | 'getServiceOrder' | 'reconnectHelper' | 'installHelper'>;
 }
 
 /** The screen of the menu bar window (`?view=popover`). */
@@ -311,6 +320,10 @@ export function MenuBarScreen({ rs: given }: MenuBarScreenProps): ReactElement {
       }}
       onReconnect={() => {
         run('reconnect', () => requestReconnect(rs));
+      }}
+      onInstall={() => {
+        // One install at a time; the main process would answer a second one `busy`.
+        if (!busy.has('install')) run('install', () => installHelper(rs));
       }}
     />
   );

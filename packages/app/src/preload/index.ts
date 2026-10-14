@@ -61,6 +61,8 @@ const api: RsApi = {
   openRulesWindow: () => invoke('rs:openRulesWindow'),
   reconnectHelper: () => invoke('rs:reconnect'),
   resetConfig: () => invoke('rs:resetConfig'),
+  installHelper: () => invoke('rs:installHelper'),
+  removeHelper: () => invoke('rs:removeHelper'),
   onLog: (listener) => {
     const forward = (_event: IpcRendererEvent, entry: RsLogEntry): void => {
       listener(entry);

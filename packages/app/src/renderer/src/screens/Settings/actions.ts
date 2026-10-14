@@ -5,12 +5,13 @@ import type { AdapterInfo, Config } from '@routeswitch/shared';
 
 import type { RsApi, RsIfaceOverrides, RsResult, RsServiceOrder } from '../../rs';
 import { errorText, type Feedback } from '../../text';
+import { removeHelper } from '../Install';
 
 export type { Feedback };
 
 export type SettingsApi = Pick<
   RsApi,
-  'getSettings' | 'setOpenAtLogin' | 'getConfig' | 'setIfaceOverrides' | 'getServiceOrder' | 'copyServiceOrderCommand' | 'uninstallHelper'
+  'getSettings' | 'setOpenAtLogin' | 'getConfig' | 'setIfaceOverrides' | 'getServiceOrder' | 'copyServiceOrderCommand' | 'uninstallHelper' | 'removeHelper'
 >;
 
 const failed = (result: Extract<RsResult<unknown>, { ok: false }>): Feedback => ({
@@ -70,11 +71,11 @@ export async function copyServiceOrderCommand(
   return { order: result.value, feedback: { tone: 'success', text: "Buyruq nusxalandi — Terminal'ga qo'ying." } };
 }
 
-export async function uninstallHelper(rs: SettingsApi): Promise<Feedback> {
-  const result = await rs.uninstallHelper();
-  if (!result.ok) return failed(result);
-  return {
-    tone: 'success',
-    text: "Helper o'chirildi: uning route'lari va resolver fayllari olib tashlandi. Routing to'xtadi.",
-  };
+/**
+ * "Ha, o'chirish": the full removal through the administrator password
+ * (`uninstall.sh`, TASK-214), or — without the package — the helper's own
+ * `uninstall` over the socket. See `removeHelper` of the install screen.
+ */
+export function uninstallHelper(rs: SettingsApi): Promise<Feedback> {
+  return removeHelper(rs);
 }
