@@ -130,6 +130,53 @@ npm run build -w @routeswitch/app    # production-сборка в packages/app/o
 npm run start -w @routeswitch/app    # собрать и запустить production-сборку
 ```
 
+## Установка (из .dmg)
+
+```bash
+npm ci
+npm run dist        # dist/RouteSwitch-<версия>-arm64.dmg  (Mac на Intel: npm run dist:x64)
+```
+
+1. Откройте `.dmg` и перетащите **RouteSwitch** в **Программы** (Applications).
+2. Сборка не подписана сертификатом Developer ID, поэтому macOS блокирует
+   первый запуск скачанной копии. Либо щёлкните RouteSwitch в «Программах»
+   правой кнопкой → **Открыть** → снова **Открыть**, либо один раз выполните
+   `xattr -dr com.apple.quarantine /Applications/RouteSwitch.app`.
+   Копия, собранная вами самостоятельно, не помечается карантином и
+   открывается сразу.
+3. RouteSwitch работает в строке меню (без значка в Dock). Он покажет
+   «Helper o'rnatilmagan»; нажмите **Helper'ni o'rnatish** и один раз введите
+   пароль администратора. После этого демон helper работает от root под
+   `launchd` и сохраняет маршруты, даже когда приложение закрыто.
+4. Чтобы удалить всё: **Sozlamalar → Helper'ni o'chirish** (маршруты, файлы
+   resolver, демон и его файлы), затем удалите приложение.
+
+Каждый `.dmg` содержит одну архитектуру: приложение и соответствующую часть
+helper. Упакованное приложение отказывается запускаться с любым аргументом
+командной строки (`--remote-debugging-port`, `--proxy-server`, файл или URL, …),
+кроме номера процесса `-psn_…`, который может добавить сама macOS; Electron
+fuses `RunAsNode`, `EnableNodeOptionsEnvironmentVariable` и
+`EnableNodeCliInspectArguments` выключены, `OnlyLoadAppFromAsar` и проверка
+целостности asar включены. Для релиза начинайте с чистого кэша helper
+(`rm -rf ~/.pkg-cache/sea`), чтобы архивы Node.js были скачаны и проверены по
+контрольным суммам заново.
+
+### Подпись и нотаризация (не настроены)
+
+Сборки подписываются ad hoc. Чтобы распространять на другие Mac:
+
+1. Получите сертификат *Developer ID Application* и экспортируйте его в `.p12`.
+   Никогда не коммитьте его: передавайте только через окружение —
+   `CSC_LINK` (путь или base64) и `CSC_KEY_PASSWORD`.
+2. В `electron-builder.yml` уберите `identity: '-'` (тогда electron-builder
+   возьмёт `CSC_LINK`), включите `hardenedRuntime: true` и добавьте entitlements.
+   Бинарник helper тоже нужно подписать (убрать его из `signIgnore`) с
+   `com.apple.security.cs.allow-jit` и
+   `com.apple.security.cs.allow-unsigned-executable-memory`: это Node.js.
+3. Нотаризация: `mac.notarize: true` и `APPLE_API_KEY`, `APPLE_API_KEY_ID`,
+   `APPLE_API_ISSUER` (или `APPLE_ID`, `APPLE_APP_SPECIFIC_PASSWORD`,
+   `APPLE_TEAM_ID`) в окружении, например как секреты CI.
+
 ## Не входит в MVP
 
 - Wildcard-домены (`*.example.com`) — для них нужен DNS-прокси

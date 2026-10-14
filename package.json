@@ -11,6 +11,7 @@
     "packages/*"
   ],
   "scripts": {
+    "postinstall": "node node_modules/electron/install.js",
     "lint": "eslint . --max-warnings 0",
     "typecheck": "npm run typecheck --workspaces --if-present && tsc --noEmit -p tests/tsconfig.json",
     "test": "vitest run",
@@ -19,12 +20,16 @@
     "build:helper:bundle": "esbuild packages/helper/src/main.ts --bundle --platform=node --format=cjs --target=node24 --define:import.meta.main=true --log-level=warning --outfile=build/helper/main.cjs",
     "build:helper:arm64": "pkg --sea --targets node24.21.0-macos-arm64 --output build/helper/arm64/com.routeswitch.helper build/helper/main.cjs",
     "build:helper:x64": "pkg --sea --targets node24.21.0-macos-x64 --output build/helper/x64/com.routeswitch.helper build/helper/main.cjs",
-    "build:helper:universal": "lipo -create -output build/com.routeswitch.helper build/helper/arm64/com.routeswitch.helper build/helper/x64/com.routeswitch.helper && codesign --force --sign - --identifier com.routeswitch.helper build/com.routeswitch.helper && codesign --verify --strict --all-architectures build/com.routeswitch.helper"
+    "build:helper:universal": "codesign --force --sign - --identifier com.routeswitch.helper build/helper/arm64/com.routeswitch.helper && codesign --force --sign - --identifier com.routeswitch.helper build/helper/x64/com.routeswitch.helper && lipo -create -output build/com.routeswitch.helper build/helper/arm64/com.routeswitch.helper build/helper/x64/com.routeswitch.helper && codesign --force --sign - --identifier com.routeswitch.helper build/com.routeswitch.helper && codesign --verify --strict --all-architectures build/com.routeswitch.helper",
+    "dist": "npm run build:helper && npm run dist:app && electron-builder --projectDir build/app-stage --config ../../electron-builder.yml --mac dmg --arm64",
+    "dist:x64": "npm run build:helper && npm run dist:app && electron-builder --projectDir build/app-stage --config ../../electron-builder.yml --mac dmg --x64",
+    "dist:app": "bash scripts/stage-app.sh"
   },
   "devDependencies": {
     "@eslint/js": "10.0.1",
     "@types/node": "24.19.2",
     "@yao-pkg/pkg": "6.22.0",
+    "electron-builder": "26.17.0",
     "esbuild": "0.28.2",
     "eslint": "10.12.0",
     "eslint-plugin-react-hooks": "7.1.1",

@@ -152,6 +152,51 @@ asks the helper to remove its routes and resolver files and stops without
 deleting anything if that fails (`--force` goes on anyway). The paths both
 scripts use are the ones in `packages/shared/src/paths.ts`.
 
+## Install (from the .dmg)
+
+```bash
+npm ci
+npm run dist        # dist/RouteSwitch-<version>-arm64.dmg  (Intel Mac: npm run dist:x64)
+```
+
+1. Open the `.dmg` and drag **RouteSwitch** to **Applications**.
+2. The build is not signed with a Developer ID, so macOS blocks the first
+   launch of a downloaded copy. Either right-click RouteSwitch in
+   Applications, choose **Open**, then **Open** again, or run
+   `xattr -dr com.apple.quarantine /Applications/RouteSwitch.app` once.
+   A copy you built yourself is not quarantined and opens directly.
+3. RouteSwitch lives in the menu bar (no Dock icon). It shows
+   "Helper o'rnatilmagan"; click **Helper'ni o'rnatish** and enter the
+   administrator password once. The helper daemon then runs as root under
+   `launchd` and keeps your routes even when the app is closed.
+4. To remove everything: **Sozlamalar → Helper'ni o'chirish** (routes, resolver
+   files, the daemon and its files), then delete the app.
+
+Each `.dmg` holds one architecture: the app and the matching slice of the
+helper. The packaged app refuses to start with any command-line argument
+(`--remote-debugging-port`, `--proxy-server`, a file or URL, …) except the
+`-psn_…` process number macOS itself may add, and has the Electron fuses
+`RunAsNode`, `EnableNodeOptionsEnvironmentVariable` and
+`EnableNodeCliInspectArguments` off, `OnlyLoadAppFromAsar` and asar integrity
+on. For a release, start from a clean helper cache (`rm -rf ~/.pkg-cache/sea`)
+so the Node.js archives are downloaded and checksum-verified again.
+
+### Signing and notarization (not set up)
+
+Builds are signed ad hoc. To distribute to other Macs later:
+
+1. Get a *Developer ID Application* certificate and export it as `.p12`.
+   Never commit it: provide it only through the environment —
+   `CSC_LINK` (path or base64) and `CSC_KEY_PASSWORD`.
+2. In `electron-builder.yml`, drop `identity: '-'` (electron-builder then uses
+   `CSC_LINK`), set `hardenedRuntime: true` and add entitlements. The helper
+   binary must then be signed too (remove it from `signIgnore`) with
+   `com.apple.security.cs.allow-jit` and
+   `com.apple.security.cs.allow-unsigned-executable-memory`: it is Node.js.
+3. Notarize with `mac.notarize: true` and `APPLE_API_KEY`, `APPLE_API_KEY_ID`,
+   `APPLE_API_ISSUER` (or `APPLE_ID`, `APPLE_APP_SPECIFIC_PASSWORD`,
+   `APPLE_TEAM_ID`) in the environment, e.g. as CI secrets.
+
 ## Not in the MVP
 
 - Wildcard domains (`*.example.com`) — would need a DNS proxy
