@@ -1,5 +1,5 @@
-import { existsSync, mkdtempSync, readFileSync, readdirSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs';
-import { createServer } from 'node:net';
+import { constants, existsSync, mkdtempSync, readFileSync, readdirSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { createServer, type Socket } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -172,6 +172,8 @@ describe('parseArgs', () => {
     [['--once', '--help'], { kind: 'help' }],
     [['--version'], { kind: 'version' }],
     [['--version', '--help'], { kind: 'help' }],
+    [['--uninstall'], { kind: 'uninstall' }],
+    [['--uninstall', '--help'], { kind: 'help' }],
   ] as const)('%j', (argv, expected) => {
     expect(parseArgs(argv)).toEqual(expected);
   });
@@ -186,6 +188,9 @@ describe('parseArgs', () => {
     [['--config', ''], '--config needs a path'],
     [['--config', '--once'], '--config needs a path'],
     [['--config', 'a.json', '--config', 'b.json'], '--config was given more than once'],
+    [['--uninstall', '--once'], '--uninstall takes no other argument'],
+    [['--uninstall', '--config', '/tmp/x.json'], '--uninstall takes no other argument'],
+    [['--uninstall', 'now'], 'Unknown argument at position 2'],
   ] as const)('refuses %j', (argv, message) => {
     expect(parseArgs(argv)).toEqual({ kind: 'usage-error', message });
   });
@@ -1062,6 +1067,8 @@ describe('run without --once (daemon): state.json and cleanup', () => {
       /** Command line of the daemon; `[]` by default. */
       argv?: readonly string[];
       socketPath?: string;
+      /** More dependencies, e.g. failing file systems. */
+      extra?: Partial<RunDeps>;
     } = {},
   ): Daemon => {
     const table = options.table ?? { routes: new Map<string, string>(), failDelete: new Set<string>() };
@@ -1092,6 +1099,7 @@ describe('run without --once (daemon): state.json and cleanup', () => {
       createSpawner: () => spawner,
       waitForSignal: () => signalled,
       ...(options.socketPath === undefined ? {} : { socketPath: options.socketPath }),
+      ...options.extra,
       ...(hold === undefined
         ? {}
         : {
@@ -1571,5 +1579,221 @@ describe('run without --once (daemon): state.json and cleanup', () => {
     const daemonDeps = harness().deps;
     expect(daemonDeps.statePath).toBeUndefined();
     expect(startDaemonStatePath()).not.toBe(PATHS.state);
+  });
+
+  // -------------------------------------------------------------------------
+  // --uninstall (TASK-115): what uninstall.sh runs before it boots the daemon out
+  // -------------------------------------------------------------------------
+
+  it('documents --uninstall and its exit code', () => {
+    expect(EXIT_CODES.uninstallFailed).toBe(8);
+    expect(USAGE).toContain('--uninstall');
+    expect(USAGE).toContain('8 --uninstall: something could not be removed, or the running helper did not answer');
+  });
+
+  it('--uninstall: the running helper removes everything and answers; the daemon then waits for SIGTERM', async () => {
+    const dir = newResolverDir();
+    const socketPath = join(dir, 's.sock');
+    const daemon = startDaemon({ socketPath, argv: ['--config', join(dir, 'config.json')] });
+    await running(daemon);
+    expect(daemon.table.routes.size).toBe(2);
+
+    const tool = startDaemon({ socketPath, argv: ['--uninstall'], table: daemon.table, statePath: join(dir, 'tool-state.json') });
+    expect(await tool.exit).toBe(EXIT_CODES.ok);
+    expect(tool.h.out).toEqual(['the running helper removed its routes and resolver files\n']);
+    // The tool itself ran nothing: the daemon did the cleanup.
+    expect(tool.h.runner.calls).toEqual([]);
+    expect(existsSync(join(dir, 'tool-state.json'))).toBe(false);
+    expect(daemon.table.routes.size).toBe(0);
+    expect(daemon.state()).toEqual({ version: 1, routes: [] });
+    expect(daemon.processes[0]?.stopped).toBe(true);
+    expect(tool.h.logs().find((entry) => entry['msg'] === 'uninstall: the running helper removed every route and resolver file')).toMatchObject({
+      level: 'info',
+      component: 'main',
+    });
+
+    // launchctl bootout: SIGTERM finds nothing left to remove.
+    daemon.signal();
+    expect(await daemon.exit).toBe(EXIT_CODES.ok);
+    expect(daemon.table.routes.size).toBe(0);
+  });
+
+  it('--uninstall without a running helper: removes the routes of state.json and the managed resolver files itself', async () => {
+    const table: Table = {
+      routes: new Map([
+        ['192.0.2.0/24', ETH_GW],
+        ['192.0.2.77', OTHER_GW],
+      ]),
+      failDelete: new Set<string>(),
+    };
+    const statePath = startDaemonStatePath();
+    writeFileSync(
+      statePath,
+      JSON.stringify({
+        version: 1,
+        routes: [
+          { dst: '192.0.2.0/24', gateway: ETH_GW, ruleIds: [ID_A] },
+          { dst: '192.0.2.77', gateway: ETH_GW, ruleIds: [] },
+          { dst: '0.0.0.0/0', gateway: ETH_GW, ruleIds: [] },
+        ],
+      }),
+    );
+    const resolverDir = newResolverDir();
+    writeFileSync(join(resolverDir, 'old.corp.local'), `nameserver 10.30.0.53\n${MARKER}\n`);
+    writeFileSync(join(resolverDir, 'user.example'), 'nameserver 10.30.0.54\n');
+
+    const tool = startDaemon({ table, statePath, resolverDir, argv: ['--uninstall'], socketPath: join(newResolverDir(), 'none.sock') });
+    expect(await tool.exit).toBe(EXIT_CODES.ok);
+
+    expect(tool.h.out).toEqual(['no helper is running\n', 'removed what the last run left behind: 1 route(s), 1 resolver file(s)\n']);
+    // Only checked deletes of what state.json lists (never the forbidden entry, never through another
+    // gateway), the cache flush after the resolver file: no detection, no add, no monitor.
+    expect([...tool.commands()].sort()).toEqual([
+      'dscacheutil -flushcache',
+      'killall -HUP mDNSResponder',
+      'route -n delete -net 192.0.2.0/24',
+      'route -n get -host 192.0.2.77',
+      'route -n get -net 192.0.2.0/24',
+    ]);
+    expect(tool.processes).toEqual([]);
+    expect([...table.routes]).toEqual([['192.0.2.77', OTHER_GW]]);
+    expect(readdirSync(resolverDir)).toEqual(['user.example']);
+    expect(tool.state()).toEqual({ version: 1, routes: [] });
+    expect(tool.h.scheduler.pending()).toBe(0);
+    expect(tool.h.logs().find((entry) => entry['msg'] === 'uninstall: no helper answers on the socket; cleaning up after the last run')).toMatchObject({
+      code: 'ENOENT',
+    });
+  });
+
+  it('--uninstall without a running helper: a route that cannot be deleted stays in state.json and the exit code is 8', async () => {
+    const table: Table = { routes: new Map([['192.0.2.0/24', ETH_GW]]), failDelete: new Set(['192.0.2.0/24']) };
+    const statePath = startDaemonStatePath();
+    writeFileSync(statePath, JSON.stringify({ version: 1, routes: [{ dst: '192.0.2.0/24', gateway: ETH_GW, ruleIds: [] }] }));
+
+    const tool = startDaemon({ table, statePath, argv: ['--uninstall'], socketPath: join(newResolverDir(), 'none.sock') });
+    expect(await tool.exit).toBe(EXIT_CODES.uninstallFailed);
+    expect(tool.h.out.at(-1)).toMatch(/^could not remove everything the last run left behind \(1 route\(s\), 0 resolver file\(s\)\)/);
+    // uninstall.sh stops here, so a second run can still find the route.
+    expect(tool.state()).toEqual({ version: 1, routes: [{ dst: '192.0.2.0/24', gateway: ETH_GW, ruleIds: [] }] });
+  });
+
+  it('--uninstall without a running helper: a managed resolver file that cannot be removed gives exit 8', async () => {
+    const resolverDir = newResolverDir();
+    writeFileSync(join(resolverDir, 'old.corp.local'), `nameserver 10.30.0.53\n${MARKER}\n`);
+    const realFs = await import('node:fs/promises');
+    const tool = startDaemon({
+      resolverDir,
+      argv: ['--uninstall'],
+      socketPath: join(newResolverDir(), 'none.sock'),
+      extra: {
+        resolverFs: {
+          open: realFs.open,
+          readdir: (path) => realFs.readdir(path),
+          lstat: realFs.lstat,
+          rename: realFs.rename,
+          unlink: () => Promise.reject(Object.assign(new Error('EPERM: operation not permitted'), { code: 'EPERM' })),
+          mkdir: (path, options) => realFs.mkdir(path, options),
+          chmod: (path, mode) => realFs.chmod(path, mode),
+        },
+      },
+    });
+    expect(await tool.exit).toBe(EXIT_CODES.uninstallFailed);
+    expect(tool.h.out.at(-1)).toMatch(/^could not remove everything the last run left behind \(0 route\(s\), 1 resolver file\(s\)\)/);
+    expect(readdirSync(resolverDir)).toEqual(['old.corp.local']);
+  });
+
+  it('--uninstall without a running helper: a state.json that cannot be saved gives exit 8', async () => {
+    const table: Table = { routes: new Map([['192.0.2.0/24', ETH_GW]]), failDelete: new Set<string>() };
+    const statePath = startDaemonStatePath();
+    writeFileSync(statePath, JSON.stringify({ version: 1, routes: [{ dst: '192.0.2.0/24', gateway: ETH_GW, ruleIds: [] }] }));
+    const realFs = await import('node:fs/promises');
+    const tool = startDaemon({
+      table,
+      statePath,
+      argv: ['--uninstall'],
+      socketPath: join(newResolverDir(), 'none.sock'),
+      extra: {
+        stateFs: {
+          // Reading works; every write fails.
+          open: (path, flags, mode) =>
+            typeof flags === 'number' && (flags & constants.O_WRONLY) !== 0
+              ? Promise.reject(Object.assign(new Error('EROFS: read-only file system'), { code: 'EROFS' }))
+              : realFs.open(path, flags, mode),
+          rename: realFs.rename,
+          unlink: realFs.unlink,
+          mkdir: (path, options) => realFs.mkdir(path, options),
+        },
+      },
+    });
+    expect(await tool.exit).toBe(EXIT_CODES.uninstallFailed);
+    // The route itself is gone; what fails is the record of it.
+    expect(table.routes.size).toBe(0);
+    expect(tool.h.out.at(-1)).toMatch(/^could not remove everything the last run left behind/);
+  });
+
+  it('--uninstall with nothing left behind: exit 0, no route command', async () => {
+    const tool = startDaemon({ argv: ['--uninstall'], socketPath: join(newResolverDir(), 'none.sock') });
+    expect(await tool.exit).toBe(EXIT_CODES.ok);
+    expect(tool.h.out.at(-1)).toBe('removed what the last run left behind: 0 route(s), 0 resolver file(s)\n');
+    expect(tool.h.runner.calls).toEqual([]);
+  });
+
+  it.each([
+    ['answers with an error', (socket: Socket) => {
+      socket.write(`${JSON.stringify({ id: 1, ok: false, code: 'operation-failed', error: 'cleanup failed: 1 route(s) could not be removed' })}\n`);
+    }, 'the running helper could not remove everything (operation-failed: cleanup failed: 1 route(s) could not be removed); see /Library/Logs/RouteSwitch/helper.log\n'],
+    ['closes the connection without an answer', (socket: Socket) => {
+      socket.end();
+    }, 'the helper socket could not be used (closed)\n'],
+  ])('--uninstall: exit 8 and nothing cleaned up here when the running helper %s', async (_name, answer, line) => {
+    const dir = newResolverDir();
+    const socketPath = join(dir, 's.sock');
+    const helper = createServer((socket) => {
+      socket.once('data', () => {
+        answer(socket);
+      });
+    });
+    await new Promise<void>((resolve) => helper.listen(socketPath, resolve));
+    const statePath = join(dir, 'state.json');
+    writeFileSync(statePath, JSON.stringify({ version: 1, routes: [{ dst: '192.0.2.0/24', gateway: ETH_GW, ruleIds: [] }] }));
+    try {
+      const tool = startDaemon({ socketPath, statePath, argv: ['--uninstall'] });
+      expect(await tool.exit).toBe(EXIT_CODES.uninstallFailed);
+      expect(tool.h.out).toEqual([line]);
+      expect(tool.h.runner.calls).toEqual([]);
+      expect(tool.state()).toEqual({ version: 1, routes: [{ dst: '192.0.2.0/24', gateway: ETH_GW, ruleIds: [] }] });
+      expect(tool.h.logs().find((entry) => entry['msg'] === 'uninstall: the running helper did not confirm the cleanup')).toMatchObject({ level: 'error' });
+    } finally {
+      await new Promise<void>((resolve) => {
+        helper.close(() => {
+          resolve();
+        });
+      });
+    }
+  });
+
+  it('--uninstall: exit 8 after 60 s without an answer', async () => {
+    const dir = newResolverDir();
+    const socketPath = join(dir, 's.sock');
+    const helper = createServer((socket) => {
+      socket.resume();
+    });
+    await new Promise<void>((resolve) => helper.listen(socketPath, resolve));
+    try {
+      const tool = startDaemon({ socketPath, argv: ['--uninstall'] });
+      await vi.waitFor(() => {
+        expect(tool.h.scheduler.delays()).toContain(60_000);
+      });
+      tool.h.scheduler.advance(60_000);
+      expect(await tool.exit).toBe(EXIT_CODES.uninstallFailed);
+      expect(tool.h.out).toEqual(['the running helper did not answer within 60 s\n']);
+      expect(tool.h.runner.calls).toEqual([]);
+    } finally {
+      await new Promise<void>((resolve) => {
+        helper.close(() => {
+          resolve();
+        });
+      });
+    }
   });
 });

@@ -124,7 +124,7 @@ describe('sync: managed files', () => {
 
     const result = await files.sync(config([domainRule(5, 'corp.local'), domainRule(6, 'lab.corp.local', { dns: '10.30.0.54' })]));
 
-    expect(result).toEqual({ issues: new Map(), changed: 2 });
+    expect(result).toEqual({ issues: new Map(), changed: 2, notRemoved: 0 });
     expect(await list()).toEqual(['corp.local', 'lab.corp.local']);
     expect(await read('corp.local')).toBe(`nameserver 10.30.0.53\n${RESOLVER_MARKER}\n`);
     expect(await read('lab.corp.local')).toBe(`nameserver 10.30.0.54\n${RESOLVER_MARKER}\n`);
@@ -209,7 +209,7 @@ describe('sync: managed files', () => {
       { id: ruleId(6), enabled: true, kind: 'ip', target: '10.30.0.1', iface: 'ethernet', refreshSec: 600 },
     ];
 
-    expect(await files.sync(config(rules))).toEqual({ issues: new Map(), changed: 0 });
+    expect(await files.sync(config(rules))).toEqual({ issues: new Map(), changed: 0, notRemoved: 0 });
     expect(await list()).toEqual([]);
     expect(runner.calls).toEqual([]);
   });
@@ -526,7 +526,7 @@ describe('sync: failures', () => {
 
     const result = await files.sync(config([domainRule(5, 'corp.local')]));
 
-    expect(result).toEqual({ issues: new Map(), changed: 1 });
+    expect(result).toEqual({ issues: new Map(), changed: 1, notRemoved: 0 });
     expect(logs(entries, 'warn')).toEqual(['flushing the DNS cache failed', 'flushing the DNS cache failed']);
   });
 
@@ -614,5 +614,46 @@ describe('with the engine', () => {
     expect(await list()).toEqual(['user.local']);
     expect(calls.slice(2).sort()).toEqual(['delete 10.30.0.53', 'delete 10.30.0.54']);
     expect(flushes()).toBe(2);
+  });
+});
+
+describe('removeAll: what may be left is counted (TASK-115, fail closed)', () => {
+  const realResolverFs = (): ResolverFs => ({
+    open: nodeFs.open,
+    readdir: (path) => nodeFs.readdir(path),
+    lstat: nodeFs.lstat,
+    rename: nodeFs.rename,
+    unlink: nodeFs.unlink,
+    mkdir: (path, options) => nodeFs.mkdir(path, options),
+    chmod: (path, mode) => nodeFs.chmod(path, mode),
+  });
+
+  it('counts a managed file whose removal fails', async () => {
+    await writeFile(join(dir, 'corp.local'), `nameserver 10.30.0.53\n${RESOLVER_MARKER}\n`);
+    const { files } = setup({ fs: { ...realResolverFs(), unlink: () => Promise.reject(Object.assign(new Error('EPERM'), { code: 'EPERM' })) } });
+    expect(await files.removeAll()).toEqual({ issues: new Map(), changed: 0, notRemoved: 1 });
+    expect(await list()).toEqual(['corp.local']);
+  });
+
+  it('counts a directory that cannot be listed', async () => {
+    const { files } = setup({ fs: { ...realResolverFs(), readdir: () => Promise.reject(Object.assign(new Error('EACCES'), { code: 'EACCES' })) } });
+    expect((await files.removeAll()).notRemoved).toBe(1);
+  });
+
+  it('counts a directory that cannot be used (a symbolic link), and leaves it alone', async () => {
+    const target = join(root, 'elsewhere');
+    await mkdir(target);
+    await writeFile(join(target, 'corp.local'), `nameserver 10.30.0.53\n${RESOLVER_MARKER}\n`);
+    const linked = join(root, 'linked');
+    await symlink(target, linked);
+    const { files } = setup({ dir: linked });
+    expect((await files.removeAll()).notRemoved).toBe(1);
+    expect(await readdir(target)).toEqual(['corp.local']);
+  });
+
+  it('counts nothing when nothing of ours is there, or the directory does not exist', async () => {
+    await writeFile(join(dir, 'user.local'), 'nameserver 10.30.0.54\n');
+    expect((await setup().files.removeAll()).notRemoved).toBe(0);
+    expect((await setup({ dir: join(root, 'missing') }).files.removeAll()).notRemoved).toBe(0);
   });
 });

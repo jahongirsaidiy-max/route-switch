@@ -39,6 +39,8 @@ export const PATHS = {
   log: `${LOG_DIR}/helper.log`,
   /** Scoped DNS: one file per domain, named after the domain. */
   resolverDir: '/etc/resolver',
+  /** Rotation of `log` by the system's newsyslog (root:wheel 0644); written by the install script. */
+  newsyslogConf: `/etc/newsyslog.d/${LAUNCHD_LABEL}.conf`,
 } as const;
 
 export type PathName = keyof typeof PATHS;

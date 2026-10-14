@@ -14,6 +14,7 @@ describe('paths', () => {
       logDir: '/Library/Logs/RouteSwitch',
       log: '/Library/Logs/RouteSwitch/helper.log',
       resolverDir: '/etc/resolver',
+      newsyslogConf: '/etc/newsyslog.d/com.routeswitch.helper.conf',
     });
   });
 

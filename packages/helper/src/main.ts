@@ -26,6 +26,7 @@ import {
   type SocketServer,
 } from './server';
 import { createStateStore, type StateFs, type StateStore } from './state-store';
+import { UNINSTALL_REPLY_TIMEOUT_MS, requestUninstall, type UninstallReply } from './uninstall-client';
 
 /**
  * Entry point of the helper.
@@ -51,9 +52,17 @@ import { createStateStore, type StateFs, type StateStore } from './state-store';
  * leftovers are cleaned up, nothing is applied, `getConfig` answers
  * `operation-failed` and a `setConfig` replaces the file.
  *
+ * `--uninstall` (run by `scripts/uninstall.sh` before it boots the daemon out
+ * and deletes the files): sends `uninstall` over the socket, so the running
+ * helper removes every route and managed resolver file it applied, and waits
+ * for the answer (`UNINSTALL_REPLY_TIMEOUT_MS`). When no helper listens on the
+ * socket, it removes what the last run left behind itself: the routes of
+ * `state.json` and every managed resolver file, the cleanup a daemon does at
+ * its start. One line on stdout says what happened; exit 0 or 8.
+ *
  * The one-shot run logs to stderr as JSON lines, so stdout carries nothing
- * but the state; the daemon logs to `RunDeps.logPath` (`PATHS.log`) when set,
- * to stderr otherwise.
+ * but the state; the daemon and `--uninstall` log to `RunDeps.logPath`
+ * (`PATHS.log`) when set, to stderr otherwise.
  *
  * Domain rules in `--once` mode: the first pass only starts their DNS lookups
  * (a pass never waits for DNS), so when it leaves a rule `resolving` the run
@@ -79,6 +88,8 @@ export const EXIT_CODES = {
   resolvePending: 6,
   /** Daemon: another helper answers on the socket, or it could not be set up; nothing was touched. */
   socketUnavailable: 7,
+  /** `--uninstall`: something applied could not be removed, or the running helper did not answer. */
+  uninstallFailed: 8,
   /** `run` itself failed, which is a bug. */
   internal: 70,
 } as const;
@@ -102,16 +113,20 @@ export const DETECTION_RETRY_DELAY_MS = 2000;
 export const ONE_SHOT_DNS_WAIT_MS = 15_000;
 
 export const USAGE = `Usage: com.routeswitch.helper [--once] [--config <path>]
+       com.routeswitch.helper --uninstall
 
   (no --once)       run as the daemon: clean up leftovers, apply, follow network changes, clean up on SIGTERM
   --once            apply the config once, print the resulting state as JSON, exit
   --config <path>   config file (default: ${PATHS.config})
+  --uninstall       remove every applied route and managed resolver file: asks the running helper over its
+                    socket, or cleans up after the last run itself when no helper answers (used by uninstall.sh)
   --help            show this text
   --version         print the helper version
 
 Exit codes: 0 applied; 1 a rule is in error; 2 usage; 3 config could not be loaded (--once); 4 mode not implemented;
             5 interfaces could not be detected reliably, nothing was added; 6 a domain is still being resolved;
-            7 daemon: the socket is in use by another helper or could not be set up.
+            7 daemon: the socket is in use by another helper or could not be set up;
+            8 --uninstall: something could not be removed, or the running helper did not answer.
 `;
 
 export interface RunDeps {
@@ -160,13 +175,15 @@ export type ParsedArgs =
   | { readonly kind: 'help' }
   | { readonly kind: 'version' }
   | { readonly kind: 'run'; readonly once: boolean; readonly configPath: string }
+  | { readonly kind: 'uninstall' }
   | { readonly kind: 'usage-error'; readonly message: string };
 
 const usageError = (message: string): ParsedArgs => ({ kind: 'usage-error', message });
 
-/** The whole command line: `--once`, `--config <path>`, `--help`, `--version`. Anything else is refused. */
+/** The whole command line: `--once`, `--config <path>`, `--uninstall`, `--help`, `--version`. Anything else is refused. */
 export const parseArgs = (argv: readonly string[]): ParsedArgs => {
   let once = false;
+  let uninstall = false;
   let help = false;
   let version = false;
   let configPath: string | null = null;
@@ -175,6 +192,8 @@ export const parseArgs = (argv: readonly string[]): ParsedArgs => {
     const arg = argv[index];
     if (arg === '--once') {
       once = true;
+    } else if (arg === '--uninstall') {
+      uninstall = true;
     } else if (arg === '--help') {
       help = true;
     } else if (arg === '--version') {
@@ -193,6 +212,11 @@ export const parseArgs = (argv: readonly string[]): ParsedArgs => {
 
   if (help) return { kind: 'help' };
   if (version) return { kind: 'version' };
+  if (uninstall) {
+    // It works on the socket and on state.json only: a config path or the one-shot mode would mean something else.
+    if (once || configPath !== null) return usageError('--uninstall takes no other argument');
+    return { kind: 'uninstall' };
+  }
   return { kind: 'run', once, configPath: configPath ?? PATHS.config };
 };
 
@@ -372,7 +396,7 @@ const reconcileOnce = async (core: HelperCore, deps: RunDeps, root: Logger): Pro
 export interface CleanupResult extends ClearResult {
   /** Managed resolver files removed. */
   readonly resolverFilesRemoved: number;
-  /** Managed resolver files that could not be removed (logged by the resolver module). */
+  /** Managed resolver files that could not be removed, or a resolver directory that could not be checked (logged by the resolver module). */
   readonly resolverFilesFailed: number;
   /** Whether `state.json` now holds what is still applied. */
   readonly stateSaved: boolean;
@@ -397,7 +421,7 @@ export const cleanupAll = async (
   const result: CleanupResult = {
     ...routes,
     resolverFilesRemoved: files.changed,
-    resolverFilesFailed: files.issues.size,
+    resolverFilesFailed: files.issues.size + files.notRemoved,
     stateSaved,
   };
   logger
@@ -630,6 +654,73 @@ const runDaemon = async (configPath: string, deps: RunDeps): Promise<number> => 
   return shutdown(await signalled);
 };
 
+// ---------------------------------------------------------------------------
+// --uninstall
+// ---------------------------------------------------------------------------
+
+/** What `--uninstall` prints on stdout, one line per outcome; `uninstall.sh` shows it as is. */
+const uninstallLine = (reply: UninstallReply): string => {
+  switch (reply.kind) {
+    case 'done':
+      return 'the running helper removed its routes and resolver files';
+    case 'refused':
+      return `the running helper could not remove everything (${reply.code ?? 'error'}: ${reply.error}); see ${PATHS.log}`;
+    case 'failed':
+      return reply.reason === 'timeout'
+        ? `the running helper did not answer within ${String(UNINSTALL_REPLY_TIMEOUT_MS / 1000)} s`
+        : `the helper socket could not be used (${reply.reason}${reply.code === null ? '' : `, ${reply.code}`})`;
+    case 'no-helper':
+      return 'no helper is running';
+  }
+};
+
+/**
+ * `--uninstall`: the running helper cleans up and answers; without one, the
+ * leftovers of the last run are cleaned up here, exactly as a daemon does at
+ * its start (`recoverFromState`). Never starts the monitor, the socket or a
+ * reconcile.
+ */
+const runUninstall = async (deps: RunDeps): Promise<number> => {
+  const root = daemonLogger(deps);
+  const logger = root.child({ component: 'main' });
+  if (deps.euid !== undefined && deps.euid() !== 0) {
+    logger.warn('not running as root; the cleanup will be refused by the system');
+  }
+  const socketPath = deps.socketPath ?? PATHS.socket;
+  const reply = await requestUninstall({
+    socketPath,
+    setTimer: deps.setTimer ?? realSetTimer,
+    clearTimer: deps.clearTimer ?? realClearTimer,
+  });
+  deps.stdout.write(`${uninstallLine(reply)}\n`);
+
+  if (reply.kind === 'done') {
+    logger.info('uninstall: the running helper removed every route and resolver file');
+    return EXIT_CODES.ok;
+  }
+  if (reply.kind !== 'no-helper') {
+    logger.error('uninstall: the running helper did not confirm the cleanup', { ...reply });
+    return EXIT_CODES.uninstallFailed;
+  }
+
+  logger.info('uninstall: no helper answers on the socket; cleaning up after the last run', { socket: socketPath, code: reply.code });
+  // A disabled, empty config: the engine only ever removes here, it never adds.
+  const core = createCore({ ...emptyConfig(), enabled: false }, deps, root);
+  const store = createStateStore({ logger: root, path: deps.statePath, fs: deps.stateFs });
+  try {
+    const result = await recoverFromState(core, store, root);
+    const clean = result.failed === 0 && result.resolverFilesFailed === 0 && result.stateSaved;
+    deps.stdout.write(
+      clean
+        ? `removed what the last run left behind: ${String(result.removed)} route(s), ${String(result.resolverFilesRemoved)} resolver file(s)\n`
+        : `could not remove everything the last run left behind (${String(result.failed)} route(s), ${String(result.resolverFilesFailed)} resolver file(s)); see ${PATHS.log}\n`,
+    );
+    return clean ? EXIT_CODES.ok : EXIT_CODES.uninstallFailed;
+  } finally {
+    core.dns.stop();
+  }
+};
+
 /** Runs the helper for one command line and returns the process exit code. Never rejects. */
 export const run = async (argv: readonly string[], deps: RunDeps): Promise<number> => {
   try {
@@ -646,6 +737,8 @@ export const run = async (argv: readonly string[], deps: RunDeps): Promise<numbe
         return EXIT_CODES.usage;
       case 'run':
         return args.once ? await runOnce(args.configPath, deps) : await runDaemon(args.configPath, deps);
+      case 'uninstall':
+        return await runUninstall(deps);
     }
   } catch (error) {
     deps.stderr.write(`Unexpected failure: ${error instanceof Error ? error.message : String(error)}\n`);
@@ -663,6 +756,10 @@ export const realDeps = (): RunDeps => ({
   logPath: PATHS.log,
 });
 
+// No top-level await: the binary (`npm run build:helper`) is a CommonJS bundle, where the bundler
+// replaces `import.meta.main` with `true`. `run` never rejects.
 if (import.meta.main) {
-  process.exitCode = await run(process.argv.slice(2), realDeps());
+  void run(process.argv.slice(2), realDeps()).then((code) => {
+    process.exitCode = code;
+  });
 }

@@ -125,6 +125,33 @@ npm run build -w @routeswitch/app    # production build into packages/app/out
 npm run start -w @routeswitch/app    # build, then run the production build
 ```
 
+### Helper binary and installation
+
+```bash
+npm run build:helper   # build/com.routeswitch.helper (universal: x86_64 + arm64)
+```
+
+The helper is bundled into one CommonJS file with esbuild and packed by
+`@yao-pkg/pkg` in SEA mode: the official Node.js 24.21.0 binary (downloaded
+from nodejs.org and checked against its `SHASUMS256.txt`) with the bundle
+injected, one per architecture, joined with `lipo` and signed ad hoc.
+
+Installing and removing change the system, so they run as root and only when
+you start them:
+
+```bash
+RES="$(mktemp -d)"   # a fresh private directory, never a fixed /tmp name
+cp build/com.routeswitch.helper packages/helper/launchd/com.routeswitch.helper.plist "$RES/"
+sudo /bin/bash scripts/install-helper.sh "$RES"   # install or update, then start
+rm -rf "$RES"
+sudo /bin/bash scripts/uninstall.sh               # remove routes, resolver files, daemon, files
+```
+
+`install-helper.sh` keeps `config.json` across updates. `uninstall.sh` first
+asks the helper to remove its routes and resolver files and stops without
+deleting anything if that fails (`--force` goes on anyway). The paths both
+scripts use are the ones in `packages/shared/src/paths.ts`.
+
 ## Not in the MVP
 
 - Wildcard domains (`*.example.com`) — would need a DNS proxy

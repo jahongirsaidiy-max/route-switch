@@ -57,6 +57,12 @@ export interface ResolverSyncResult {
   readonly issues: ReadonlyMap<string, ResolverIssue>;
   /** Files created, rewritten or removed in this pass. */
   readonly changed: number;
+  /**
+   * Stale files of ours that may still be there: a removal that failed, or a directory that could
+   * not be checked or listed. Fail closed: `removeAll` has no rule to hang an issue on, so this is
+   * how the uninstall knows that a managed file may be left (TASK-115).
+   */
+  readonly notRemoved: number;
 }
 
 /** The part of `node:fs/promises` this module uses; tests point it at a temporary directory. */
@@ -332,15 +338,16 @@ export const createResolverFiles = (deps: ResolverFilesDeps): ResolverFiles => {
       }
     };
     let changed = 0;
+    let notRemoved = 0;
 
     const dirState = await checkDir();
     if (typeof dirState === 'string') {
       logger.error('resolver files cannot be managed', { dir, problem: dirState });
       failAll(`Resolver files cannot be managed: ${dirState}`);
-      return { issues, changed };
+      return { issues, changed, notRemoved: 1 };
     }
     if (!dirState) {
-      if (wanted.size === 0) return { issues, changed };
+      if (wanted.size === 0) return { issues, changed, notRemoved };
       try {
         await fs.mkdir(dir, { mode: DIR_MODE });
         // `mkdir` applies the umask; the mode is set as meant.
@@ -350,7 +357,7 @@ export const createResolverFiles = (deps: ResolverFilesDeps): ResolverFiles => {
         if (detail !== 'EEXIST') {
           logger.error('the resolver directory could not be created', { dir, error: detail });
           failAll(`The resolver directory could not be created (${detail})`);
-          return { issues, changed };
+          return { issues, changed, notRemoved };
         }
       }
     }
@@ -407,6 +414,7 @@ export const createResolverFiles = (deps: ResolverFilesDeps): ResolverFiles => {
       names = await fs.readdir(dir);
     } catch (error) {
       logger.error('the resolver directory could not be listed; stale files stay for now', { dir, error: errorCodeOf(error) });
+      notRemoved += 1;
     }
     if (names.length > MAX_RESOLVER_DIR_ENTRIES) {
       logger.warn('the resolver directory has more entries than are looked at in one pass', {
@@ -429,11 +437,12 @@ export const createResolverFiles = (deps: ResolverFilesDeps): ResolverFiles => {
         logger.info(isTemp ? 'leftover temporary resolver file removed' : 'resolver file removed', { file: name });
       } catch (error) {
         logger.error('resolver file could not be removed; tried again next time', { file: name, error: errorCodeOf(error) });
+        notRemoved += 1;
       }
     }
 
     if (changed > 0) await flush();
-    return { issues, changed };
+    return { issues, changed, notRemoved };
   };
 
   const serialised = (config: Pick<Config, 'enabled' | 'rules'>): Promise<ResolverSyncResult> => {
@@ -444,7 +453,7 @@ export const createResolverFiles = (deps: ResolverFilesDeps): ResolverFiles => {
     const safe = next.catch((error: unknown) => {
       // Nothing above is expected to throw; a daemon must still get an answer.
       logger.error('resolver sync failed', { error: error instanceof Error ? error.message : String(error) });
-      return { issues: new Map<string, ResolverIssue>(), changed: 0 };
+      return { issues: new Map<string, ResolverIssue>(), changed: 0, notRemoved: 1 };
     });
     queue = safe;
     return safe;

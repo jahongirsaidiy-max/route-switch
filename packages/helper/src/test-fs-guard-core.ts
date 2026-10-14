@@ -14,13 +14,19 @@ const KEY = '__routeswitchFsGuardHits';
 const INSTALLED = '__routeswitchFsGuardInstalled';
 /**
  * Lower case (paths are compared case-insensitively, like the default macOS volume). The resolver
- * directory, and `PATHS.supportDir` (config.json, state.json) — a test must never read or write the
- * daemon's real files there.
+ * directory, `PATHS.supportDir` (config.json, state.json), and every file the install script puts
+ * on the system (TASK-115: binary, plist, log directory, newsyslog file) — a test must never read
+ * or write the daemon's real files there. `/etc` is also reached as `/private/etc`.
  */
 export const FS_GUARD_ROOTS: readonly string[] = [
   '/etc/resolver',
   '/private/etc/resolver',
   '/library/application support/routeswitch',
+  '/library/privilegedhelpertools/com.routeswitch.helper',
+  '/library/launchdaemons/com.routeswitch.helper.plist',
+  '/library/logs/routeswitch',
+  '/etc/newsyslog.d/com.routeswitch.helper.conf',
+  '/private/etc/newsyslog.d/com.routeswitch.helper.conf',
 ];
 const ROOTS = FS_GUARD_ROOTS;
 const CODE = FS_GUARD_CODE;

@@ -53,6 +53,14 @@ describe('test file-system guard', () => {
     expect(FS_GUARD_ROOTS).toContain(PATHS.resolverDir.toLowerCase());
   });
 
+  it('guards every file the install script puts on the system (TASK-115)', () => {
+    for (const path of [PATHS.helperBinary, PATHS.launchDaemonPlist, PATHS.logDir, PATHS.log, PATHS.newsyslogConf, `/private${PATHS.newsyslogConf}`]) {
+      expect(isGuardedPath(path)).toBe(true);
+    }
+    expect(isGuardedPath('/Library/PrivilegedHelperTools/.com.routeswitch.helper.install.123')).toBe(false);
+    expect(isGuardedPath('/Library/LaunchDaemons')).toBe(false);
+  });
+
   it.each(['/etc/resolverx', '/etc/hosts', '/private/etc', tmpdir(), 'resolver/x', '/Library/Application Support', '/Library/Application Support/RouteSwitchX'])('leaves %s alone', (path) => {
     expect(isGuardedPath(path)).toBe(false);
   });
