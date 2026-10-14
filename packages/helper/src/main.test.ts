@@ -1,12 +1,13 @@
 import { readFileSync } from 'node:fs';
 
-import { EngineState, PATHS } from '@routeswitch/shared';
+import { Config, EngineState, PATHS } from '@routeswitch/shared';
 import { describe, expect, it } from 'vitest';
 
 import type { ConfigFileRead, ConfigFileReader } from './config-store';
 import { LOOKUP_TIMEOUT_MS } from './dns';
 import { createFakeDns, createFakeScheduler, dnsError, flush, type FakeDns, type FakeScheduler } from './dns-test-utils';
-import { EXIT_CODES, HELPER_VERSION, ONE_SHOT_DNS_WAIT_MS, USAGE, parseArgs, run, type RunDeps } from './main';
+import { createLogger } from './logger';
+import { EXIT_CODES, HELPER_VERSION, ONE_SHOT_DNS_WAIT_MS, USAGE, createCore, parseArgs, run, type RunDeps } from './main';
 import { createFakeCommandRunner, type FakeCommandResponse, type FakeCommandRunner } from './test-utils';
 
 const ROUTE = '/sbin/route';
@@ -90,6 +91,8 @@ const harness = (file: unknown = CONFIG, extra: Partial<RunDeps> = {}): Harness 
       now: () => NOW,
       euid: () => 0,
       createDnsResolver: dns.factory,
+      // Never the resolvers of the machine the tests run on.
+      systemDnsServers: () => [],
       setTimer: scheduler.setTimer,
       clearTimer: scheduler.clearTimer,
       ...extra,
@@ -553,7 +556,7 @@ describe('run --once: domain rules', () => {
   });
 
   it('stops waiting after the one-shot limit and says that a domain is still being resolved', async () => {
-    const ids = Array.from({ length: 26 }, (_unused, index) => `00000000-0000-4000-8000-${String(index + 100).padStart(12, '0')}`);
+    const ids = Array.from({ length: 14 }, (_unused, index) => `00000000-0000-4000-8000-${String(index + 100).padStart(12, '0')}`);
     const h = harness({
       version: 1,
       rules: ids.map((id, index) => ({ id, kind: 'domain', target: `host-${String(index)}.corp.local`, iface: 'ethernet' })),
@@ -562,9 +565,10 @@ describe('run --once: domain rules', () => {
     const running = run(['--once'], h.deps);
     // The first pass is over and the run waits for the lookups.
     await until(() => h.scheduler.scheduled.includes(ONE_SHOT_DNS_WAIT_MS));
-    // Three batches of eight answer just before their lookup timeout; the last two domains are still in flight at 15 s.
+    // Three batches of four (the limit per server set) answer just before their lookup timeout; the last
+    // two domains are still in flight at 15 s.
     for (let batch = 1; batch <= 3; batch += 1) {
-      await until(() => h.dns.open().length === 8);
+      await until(() => h.dns.open().length === 4);
       h.scheduler.advance(LOOKUP_TIMEOUT_MS - 100);
       for (const lookup of h.dns.open()) lookup.answer(['198.51.100.20']);
     }
@@ -573,7 +577,7 @@ describe('run --once: domain rules', () => {
 
     expect(await running).toBe(EXIT_CODES.resolvePending);
     const state = EngineState.parse(JSON.parse(h.out[0] ?? ''));
-    expect(state.rules.filter((rule) => rule.status === 'active')).toHaveLength(24);
+    expect(state.rules.filter((rule) => rule.status === 'active')).toHaveLength(12);
     expect(state.rules.filter((rule) => rule.reasonCode === 'resolving')).toHaveLength(2);
     expect(h.routeArgv()).toEqual([['-n', 'add', '-host', '198.51.100.20', ETH_GW]]);
     expect(h.logs().find((entry) => entry['msg'] === 'DNS lookups are still running; reconciling with what has been resolved so far')).toMatchObject({
@@ -604,5 +608,248 @@ describe('run --once: domain rules', () => {
   it('documents the exit code for a domain that is still being resolved', () => {
     expect(EXIT_CODES.resolvePending).toBe(6);
     expect(USAGE).toContain('6 a domain is still being resolved');
+  });
+
+  // -------------------------------------------------------------------------
+  // The DNS server of the interface, config changes, QA gaps of TASK-110
+  // -------------------------------------------------------------------------
+
+  const DNS_OPTION = 'domain_name_server';
+  const dnsArgv = (h: Harness): (readonly string[])[] =>
+    h.runner.calls.filter((call) => call.bin === IPCONFIG && call.args[2] === DNS_OPTION).map((call) => call.args);
+
+  it('never looks up the DNS servers of the interfaces for a config without an enabled domain rule', async () => {
+    const files: unknown[] = [
+      CONFIG,
+      { version: 1, rules: [] },
+      { version: 1, rules: [{ ...DOMAIN_CONFIG.rules[0], enabled: false }, CONFIG.rules[1]] },
+      { ...DOMAIN_CONFIG, enabled: false },
+    ];
+    for (const file of files) {
+      const h = harness(file);
+
+      expect(await run(['--once'], h.deps)).toBe(EXIT_CODES.ok);
+
+      expect(dnsArgv(h)).toEqual([]);
+      expect(h.dns.created).toBe(0);
+    }
+  });
+
+  it('looks them up for a rule that names its own server too, to keep them out of its answers (QA scenario i)', async () => {
+    // One domain rule WITH `dns`, bound to Wi-Fi; the answer contains the DHCP DNS server of Ethernet.
+    const h = harness({ version: 1, rules: [{ ...DOMAIN_CONFIG.rules[0], iface: 'wifi', dns: '198.51.100.53' }] });
+    h.runner.when(IPCONFIG, ['getoption', 'en5', DNS_OPTION], { stdout: '10.20.4.53\n' });
+    h.runner.when(IPCONFIG, ['getoption', 'en0', DNS_OPTION], { stdout: '192.168.1.1\n' });
+    h.dns.auto = () => ['10.20.4.53', '198.51.100.20'];
+
+    const code = await run(['--once'], h.deps);
+
+    expect(dnsArgv(h).map((args) => args[1]).sort()).toEqual(['en0', 'en5']);
+    expect(h.dns.lookups.map((lookup) => lookup.servers)).toEqual([['198.51.100.53']]);
+    // The real route wrapper on the fake runner: no argv carries the address of a DNS server.
+    expect(h.routeArgv()).toEqual([['-n', 'add', '-host', '198.51.100.20', '192.168.1.1']]);
+    expect(JSON.stringify(h.routeArgv())).not.toMatch(/10\.20\.4\.53|198\.51\.100\.53/);
+    expect(code).toBe(EXIT_CODES.ruleError);
+    expect(EngineState.parse(JSON.parse(h.out[0] ?? '')).rules[0]).toMatchObject({
+      reasonCode: 'forbidden-destination',
+      reason: '1 resolved address of corp.local must never be routed (dns-server: 1)',
+      appliedDestinations: ['198.51.100.20'],
+    });
+  });
+
+  it('does not hold explicit rules back when the DNS server of an interface cannot be looked up', async () => {
+    const h = harness(DOMAIN_CONFIG);
+    h.runner.when(IPCONFIG, ['getoption', 'en5', DNS_OPTION], { failure: 'timeout' });
+    h.runner.when(IPCONFIG, ['getoption', 'en0', DNS_OPTION], { stdout: '192.168.1.1\n' });
+    h.dns.auto = () => ['198.51.100.20'];
+
+    const code = await run(['--once'], h.deps);
+
+    // Before, the failed lookup made the detection degraded: exit 5 and no route at all.
+    expect(code).toBe(EXIT_CODES.ok);
+    expect(h.routeArgv()).toEqual([
+      ['-n', 'add', '-host', '203.0.113.7', '192.168.1.1'],
+      ['-n', 'add', '-host', '198.51.100.20', ETH_GW],
+    ]);
+    // The domain rule's own interface server is unknown, so the system resolvers were asked, with the warning.
+    expect(h.dns.lookups.map((lookup) => lookup.servers)).toEqual([null]);
+    expect(h.logs().filter((entry) => entry['msg'] === 'no DNS server is known for the interface of the rule; the system resolvers are asked')).toHaveLength(1);
+  });
+
+  it('asks the DNS server of the interface the rule is bound to, with one more command per connected role', async () => {
+    const h = harness(DOMAIN_CONFIG);
+    h.runner.when(IPCONFIG, ['getoption', 'en5', DNS_OPTION], { stdout: '10.20.0.10\n' });
+    h.runner.when(IPCONFIG, ['getoption', 'en0', DNS_OPTION], { stdout: '192.168.1.1\n' });
+    // The answer names the Wi-Fi resolver as well: it is not routed through Ethernet.
+    h.dns.auto = () => ['198.51.100.20', '192.168.1.1'];
+
+    const code = await run(['--once'], h.deps);
+
+    expect(h.dns.lookups.map((lookup) => [lookup.hostname, lookup.servers])).toEqual([['corp.local', ['10.20.0.10']]]);
+    // Two passes, one cached detection: each role asked once.
+    expect(dnsArgv(h).map((args) => args[1]).sort()).toEqual(['en0', 'en5']);
+    expect(h.routeArgv()).toEqual([
+      ['-n', 'add', '-host', '203.0.113.7', '192.168.1.1'],
+      ['-n', 'add', '-host', '198.51.100.20', ETH_GW],
+    ]);
+    expect(code).toBe(EXIT_CODES.ruleError);
+    const state = EngineState.parse(JSON.parse(h.out[0] ?? ''));
+    expect(state.rules[0]).toMatchObject({ status: 'error', reasonCode: 'forbidden-destination', appliedDestinations: ['198.51.100.20'] });
+    // Which server was asked is in the log.
+    expect(h.logs().find((entry) => entry['msg'] === 'domain resolved')).toMatchObject({
+      component: 'dns',
+      domain: 'corp.local',
+      servers: ['10.20.0.10'],
+      source: 'interface',
+    });
+    expect(h.logs().some((entry) => entry['msg'] === 'no DNS server is known for the interface of the rule; the system resolvers are asked')).toBe(false);
+    // The interface state on stdout has no DNS field.
+    expect(h.out[0]).not.toContain('10.20.0.10');
+  });
+
+  it('falls back to the system resolvers, with a warning, when the interface has no DNS server', async () => {
+    const h = harness(DOMAIN_CONFIG);
+    h.dns.auto = () => ['198.51.100.20'];
+
+    expect(await run(['--once'], h.deps)).toBe(EXIT_CODES.ok);
+
+    expect(h.dns.lookups.map((lookup) => lookup.servers)).toEqual([null]);
+    expect(h.logs().filter((entry) => entry['msg'] === 'no DNS server is known for the interface of the rule; the system resolvers are asked')).toEqual([
+      expect.objectContaining({ level: 'warn', component: 'dns', ruleId: ID_A, domain: 'corp.local', iface: 'ethernet' }),
+    ]);
+  });
+
+  it('does not route the resolver of the system when a name resolves to it', async () => {
+    const h = harness(DOMAIN_CONFIG, { systemDnsServers: () => ['198.51.100.53'] });
+    h.dns.auto = () => ['198.51.100.53', '198.51.100.20'];
+
+    expect(await run(['--once'], h.deps)).toBe(EXIT_CODES.ruleError);
+
+    expect(h.routeArgv()).toEqual([
+      ['-n', 'add', '-host', '203.0.113.7', '192.168.1.1'],
+      ['-n', 'add', '-host', '198.51.100.20', ETH_GW],
+    ]);
+    expect(EngineState.parse(JSON.parse(h.out[0] ?? '')).rules[0]).toMatchObject({
+      reasonCode: 'forbidden-destination',
+      reason: '1 resolved address of corp.local must never be routed (dns-server: 1)',
+    });
+  });
+
+  it('does not wait for DNS on a degraded detection: the lookup is still open, and the run ends at once', async () => {
+    // The rule names its server, so its lookup starts whatever the detection is like, and nothing answers it.
+    const h = harness({ version: 1, rules: [{ ...DOMAIN_CONFIG.rules[0], dns: '198.51.100.53' }, DOMAIN_CONFIG.rules[1]] });
+    // Wi-Fi's mask cannot be read: the detection is degraded, Ethernet is as usable as ever.
+    h.runner.when(IPCONFIG, ['getoption', 'en0', 'subnet_mask'], { failure: 'timeout' });
+
+    const code = await run(['--once'], h.deps);
+
+    expect(code).toBe(EXIT_CODES.detectionUnreliable);
+    expect(h.routeArgv()).toEqual([]);
+    // The rule is `resolving` in the last state, and its lookup really was in flight ...
+    const state = EngineState.parse(JSON.parse(h.out[0] ?? ''));
+    expect(state.rules[0]).toMatchObject({ status: 'pending', reasonCode: 'resolving' });
+    expect(h.dns.lookups).toHaveLength(1);
+    expect(h.dns.lookups[0]).toMatchObject({ settled: false, cancelled: true });
+    // ... and still the run neither armed the DNS wait nor ran a third pass (which would have accepted
+    // the degraded detection and added routes).
+    expect(h.scheduler.scheduled).not.toContain(ONE_SHOT_DNS_WAIT_MS);
+    expect(h.logs().filter((entry) => entry['msg'] === 'reconcile finished')).toHaveLength(2);
+    expect(h.logs().some((entry) => entry['reason'] === 'dns-refresh')).toBe(false);
+    expect(h.scheduler.pending()).toBe(0);
+  });
+
+  it('on a degraded detection a rule without `dns` waits for a reliable one instead of asking the system resolvers', async () => {
+    const h = harness(DOMAIN_CONFIG);
+    h.runner.when(IPCONFIG, ['getoption', 'en0', 'subnet_mask'], { failure: 'timeout' });
+    h.runner.when(IPCONFIG, ['getoption', 'en5', DNS_OPTION], { stdout: '10.20.0.10\n' });
+
+    const code = await run(['--once'], h.deps);
+
+    expect(code).toBe(EXIT_CODES.detectionUnreliable);
+    expect(h.routeArgv()).toEqual([]);
+    expect(h.dns.created).toBe(0);
+    expect(EngineState.parse(JSON.parse(h.out[0] ?? '')).rules[0]).toMatchObject({
+      status: 'pending',
+      reasonCode: 'resolving',
+      reason: 'Waiting for the DNS server of the ethernet interface to be known',
+    });
+    expect(h.logs().some((entry) => entry['msg'] === 'no DNS server is known for the interface of the rule; the system resolvers are asked')).toBe(false);
+    // Nothing is in flight, so a wait would have returned at once and let a third, accepting pass run.
+    expect(h.scheduler.scheduled).toEqual([]);
+    expect(h.logs().filter((entry) => entry['msg'] === 'reconcile finished')).toHaveLength(2);
+    expect(h.scheduler.pending()).toBe(0);
+  });
+
+  it('still reports a command that failed in the first pass after the follow-up pass succeeded', async () => {
+    const h = harness(DOMAIN_CONFIG);
+    h.dns.auto = () => ['198.51.100.20'];
+    let failures = 1;
+    h.runner.whenMatching((bin, args) => {
+      if (bin !== ROUTE || args[1] !== 'add' || args[3] !== '203.0.113.7' || failures === 0) return undefined;
+      failures -= 1;
+      return { exitCode: 1, stderr: 'route: writing to routing socket: Network is unreachable\n' };
+    });
+
+    const code = await run(['--once'], h.deps);
+
+    // The follow-up pass added the route after all: no rule is in error at the end ...
+    const state = EngineState.parse(JSON.parse(h.out[0] ?? ''));
+    expect(state.rules.map((rule) => rule.status)).toEqual(['active', 'active']);
+    expect(h.routeArgv().filter((args) => args[3] === '203.0.113.7')).toHaveLength(2);
+    // ... but the run did have a failed command, and says so.
+    expect(code).toBe(EXIT_CODES.ruleError);
+    expect(h.logs().at(-1)).toMatchObject({ msg: 'one-shot run finished with errors', failedRules: 0, failedCommands: 1 });
+  });
+
+  it('wires the resolver to the engine: a config change reaches it without anyone calling `syncConfig`', async () => {
+    const h = harness();
+    const requests: string[] = [];
+    const config = Config.parse(DOMAIN_CONFIG);
+    const core = createCore(config, h.deps, createLogger({ sinks: [] }), (reason) => requests.push(reason));
+    // Nothing runs before the first reconcile.
+    expect([h.runner.calls.length, h.dns.created, h.scheduler.scheduled.length]).toEqual([0, 0, 0]);
+
+    await core.engine.reconcile('startup');
+    h.dns.lookups[0]?.answer(['198.51.100.20']);
+    await flush();
+    h.scheduler.advance(500);
+    expect(requests).toEqual(['dns-refresh']);
+    expect(core.dns.stats().entries).toBe(1);
+
+    core.engine.setConfig(Config.parse({ ...DOMAIN_CONFIG, rules: [DOMAIN_CONFIG.rules[1]] }));
+
+    expect(core.dns.stats()).toEqual({ entries: 0, inFlight: 0, queued: 0, timers: 0 });
+    expect(h.scheduler.pending()).toBe(0);
+
+    core.engine.setConfig(config);
+    await core.engine.reconcile('config-change');
+    expect(core.dns.stats().entries).toBe(1);
+    core.engine.setEnabled(false);
+    expect(core.dns.stats().entries).toBe(0);
+    core.dns.stop();
+  });
+
+  it('knows the `dns` of every rule from the start, also of a rule whose interface is down', async () => {
+    const h = harness();
+    // Ethernet has no address: its rule is never asked about, and its DNS server must still not be routed.
+    h.runner.when(IPCONFIG, ['getifaddr', 'en5'], NO_VALUE);
+    const config = Config.parse({
+      version: 1,
+      rules: [
+        { id: ID_A, kind: 'domain', target: 'corp.local', iface: 'ethernet', dns: '198.51.100.53' },
+        { id: ID_B, kind: 'domain', target: 'other.corp.local', iface: 'wifi' },
+      ],
+    });
+    const core = createCore(config, h.deps, createLogger({ sinks: [] }));
+    h.dns.auto = () => ['198.51.100.53', '198.51.100.20'];
+
+    await core.engine.reconcile('startup');
+    await flush();
+    const outcome = await core.engine.reconcile('dns-refresh');
+    core.dns.stop();
+
+    expect(h.dns.lookups.map((lookup) => lookup.hostname)).toEqual(['other.corp.local']);
+    expect(h.routeArgv()).toEqual([['-n', 'add', '-host', '198.51.100.20', '192.168.1.1']]);
+    expect(outcome.state.rules.map((rule) => rule.reasonCode)).toEqual(['interface-down', 'forbidden-destination']);
   });
 });

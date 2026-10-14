@@ -175,6 +175,23 @@ export interface DetectedInterfaces {
    * may be missing for a reason other than the state of the network.
    */
   readonly degraded: boolean;
+  /**
+   * Only when the detection was asked for it (`DetectOptions.dns`): the DNS
+   * server each role's interface got from its DHCP lease, as usable IPv4
+   * addresses. Empty: the role has no address, or its lease has no such
+   * server. `null`: the lookup failed, so nothing is known about the role.
+   * Internal like `subnet`: it is not part of the wire `InterfaceState`.
+   *
+   * A failed lookup does not make the detection `degraded`: these servers are
+   * not used to decide about any route, only about whom to ask for a name,
+   * and rules that name their destination must not wait for them.
+   *
+   * `ipconfig getoption <dev> domain_name_server` prints the first server of
+   * the lease only (observed on macOS 26: a lease with two servers gives one
+   * line), so each list has at most one entry. Servers set by hand in the
+   * network settings are not in the lease and are not seen here.
+   */
+  readonly dnsServers?: Readonly<Record<IfaceRole, readonly string[] | null>>;
 }
 
 /** Role -> device, as in `Config.ifaceOverrides`. */
@@ -191,6 +208,12 @@ export interface DetectOptions {
    * may predate the change.
    */
   readonly force?: boolean | undefined;
+  /**
+   * Also look up the DNS server of each role's interface (one more `ipconfig`
+   * per role that has an address). Off by default, so a caller that has no use
+   * for it runs exactly the commands it ran before.
+   */
+  readonly dns?: boolean | undefined;
 }
 
 export interface NetInfo {
@@ -198,7 +221,7 @@ export interface NetInfo {
    * Never rejects and never throws, whatever it is given: options that cannot
    * be read give a result with both roles down (`invalid-override`) and
    * `degraded` set. Results are cached for `NETINFO_CACHE_TTL_MS` per set of
-   * overrides.
+   * overrides (and per `dns` flag).
    */
   detectInterfaces(options?: DetectOptions): Promise<DetectedInterfaces>;
   /** Drops the cached result and detaches from any detection still running. */
@@ -477,6 +500,7 @@ const overrideOf = (overrides: unknown, role: IfaceRole): unknown => ownProperty
 interface DetectRequest {
   readonly overrides: { readonly ethernet: unknown; readonly wifi: unknown };
   readonly force: boolean;
+  readonly dns: boolean;
 }
 
 /** Throws when `options` is neither `undefined` nor an object, or when reading it throws. */
@@ -488,6 +512,7 @@ const readRequest = (options: unknown): DetectRequest => {
   return {
     overrides: { ethernet: overrideOf(overrides, 'ethernet'), wifi: overrideOf(overrides, 'wifi') },
     force: ownProperty(options, 'force') === true,
+    dns: ownProperty(options, 'dns') === true,
   };
 };
 
@@ -501,7 +526,7 @@ const overridesKey = (overrides: unknown): string =>
     }),
   );
 
-type IpconfigQuery = 'address' | 'router' | 'subnet_mask';
+type IpconfigQuery = 'address' | 'router' | 'subnet_mask' | 'domain_name_server';
 
 /** Where a role's gateway or subnet came from; `null` when there is none. Logged, not returned. */
 type ValueSource = 'dhcp' | 'routing-table' | null;
@@ -520,6 +545,11 @@ interface RoleSources {
 const NO_SOURCES: RoleSources = { gateway: null, subnet: null };
 
 /** A detection result plus what is only logged about it. */
+/** The DNS servers of one role; `null` when the lookup failed. */
+type DnsLookup = readonly string[] | null;
+
+const NO_DNS: DnsLookup = [];
+
 interface Detection {
   readonly result: DetectedInterfaces;
   readonly sources: { readonly ethernet: RoleSources; readonly wifi: RoleSources };
@@ -581,6 +611,11 @@ const freezeResult = (result: DetectedInterfaces): DetectedInterfaces => {
   Object.freeze(result.adapters);
   Object.freeze(result.ethernet);
   Object.freeze(result.wifi);
+  if (result.dnsServers !== undefined) {
+    if (result.dnsServers.ethernet !== null) Object.freeze(result.dnsServers.ethernet);
+    if (result.dnsServers.wifi !== null) Object.freeze(result.dnsServers.wifi);
+    Object.freeze(result.dnsServers);
+  }
   return Object.freeze(result);
 };
 
@@ -680,6 +715,25 @@ export const createNetInfo = (deps: NetInfoDeps): NetInfo => {
       return { netmask: null, subnet: null, failed: true };
     }
     return { netmask: netmask.value, subnet, failed: false };
+  };
+
+  /**
+   * The DNS server of the device's DHCP lease. No value is ordinary (a static
+   * address, a lease without the option). A value that is not a routable IPv4
+   * address is not used: the query worked, there is just no server to ask. A
+   * query that failed gives `null`.
+   */
+  const lookupDnsServers = async (device: string): Promise<DnsLookup> => {
+    const lookup = await ipconfig(device, 'domain_name_server');
+    if (lookup.value === null) return lookup.failed ? null : NO_DNS;
+    const server = normalizeHostAddress(lookup.value);
+    if (server.ok) return [server.value];
+    logger.warn('ipconfig returned an unusable DNS server; it is ignored', {
+      device,
+      value: describeInput(lookup.value),
+      reason: server.error.code,
+    });
+    return NO_DNS;
   };
 
   /** `null` when the table could not be read or does not look like one. */
@@ -799,18 +853,23 @@ export const createNetInfo = (deps: NetInfoDeps): NetInfo => {
     choice: RoleChoice,
     addresses: ReadonlyMap<string, Lookup>,
     routingTable: () => Promise<RoutingTable | null>,
-  ): Promise<{ info: InterfaceInfo; degraded: boolean; sources: RoleSources }> => {
+    wantDns: boolean,
+  ): Promise<{ info: InterfaceInfo; degraded: boolean; sources: RoleSources; dnsServers: DnsLookup }> => {
     if (choice.reason !== null || choice.device === null) {
-      return { info: down(role, choice, choice.reason ?? 'no-device'), degraded: false, sources: NO_SOURCES };
+      return { info: down(role, choice, choice.reason ?? 'no-device'), degraded: false, sources: NO_SOURCES, dnsServers: [] };
     }
     const { device } = choice;
     const address = addresses.get(device) ?? FAILED;
     if (address.value === null) {
       const reason = address.failed ? 'address-lookup-failed' : 'no-address';
-      return { info: down(role, choice, reason), degraded: address.failed, sources: NO_SOURCES };
+      return { info: down(role, choice, reason), degraded: address.failed, sources: NO_SOURCES, dnsServers: [] };
     }
     const ip = address.value;
-    const [leaseGateway, leaseSubnet] = await Promise.all([lookupGateway(device), lookupSubnet(device, ip)]);
+    const [leaseGateway, leaseSubnet, dns] = await Promise.all([
+      lookupGateway(device),
+      lookupSubnet(device, ip),
+      wantDns ? lookupDnsServers(device) : NO_DNS,
+    ]);
     // The routing table is consulted only for what the lease does not have. A
     // lease query that failed is not "no value": it stays failed.
     const gatewayMissing = leaseGateway.value === null && !leaseGateway.failed;
@@ -838,6 +897,7 @@ export const createNetInfo = (deps: NetInfoDeps): NetInfo => {
         overridden: choice.overridden,
       },
       degraded: gateway.failed || subnet.failed,
+      dnsServers: dns,
       sources: {
         gateway: sourceOf(gateway.value !== null, gatewayMissing),
         subnet: sourceOf(subnet.subnet !== null, subnetMissing),
@@ -845,7 +905,7 @@ export const createNetInfo = (deps: NetInfoDeps): NetInfo => {
     };
   };
 
-  const detect = async (overrides: DetectRequest['overrides']): Promise<Detection> => {
+  const detect = async (overrides: DetectRequest['overrides'], wantDns: boolean): Promise<Detection> => {
     const ports = await listHardwarePorts();
     if (ports === null) return unavailable('hardware-ports-unavailable');
 
@@ -905,8 +965,8 @@ export const createNetInfo = (deps: NetInfoDeps): NetInfo => {
     const routingTable = (): Promise<RoutingTable | null> => (tableLoad ??= loadRoutingTable());
 
     const [ethernet, wifi] = await Promise.all([
-      describeRole('ethernet', ethernetChoice, addresses, routingTable),
-      describeRole('wifi', wifiChoice, addresses, routingTable),
+      describeRole('ethernet', ethernetChoice, addresses, routingTable, wantDns),
+      describeRole('wifi', wifiChoice, addresses, routingTable, wantDns),
     ]);
 
     return {
@@ -919,6 +979,7 @@ export const createNetInfo = (deps: NetInfoDeps): NetInfo => {
           ip: addresses.get(port.device)?.value ?? null,
         })),
         degraded: ethernet.degraded || wifi.degraded || [...addresses.values()].some((lookup) => lookup.failed),
+        ...(wantDns ? { dnsServers: { ethernet: ethernet.dnsServers, wifi: wifi.dnsServers } } : {}),
       },
       sources: { ethernet: ethernet.sources, wifi: wifi.sources },
     };
@@ -945,17 +1006,18 @@ export const createNetInfo = (deps: NetInfoDeps): NetInfo => {
       wifi: summaryOf(result.wifi, sources.wifi),
       adapters: result.adapters.length,
       degraded: result.degraded,
+      ...(result.dnsServers === undefined ? {} : { dnsServers: result.dnsServers }),
     };
     const summary = JSON.stringify(context);
     logger.log(summary === lastSummary ? 'debug' : 'info', 'interfaces detected', { ...context, durationMs });
     lastSummary = summary;
   };
 
-  const detectAndLog = async (overrides: DetectRequest['overrides']): Promise<DetectedInterfaces> => {
+  const detectAndLog = async (overrides: DetectRequest['overrides'], wantDns: boolean): Promise<DetectedInterfaces> => {
     const startedAt = now();
     let detection: Detection;
     try {
-      detection = await detect(overrides);
+      detection = await detect(overrides, wantDns);
     } catch (error) {
       // Nothing above is expected to throw; a daemon must still get an answer.
       logger.error('interface detection failed', { error: describeThrown(error) });
@@ -979,7 +1041,8 @@ export const createNetInfo = (deps: NetInfoDeps): NetInfo => {
       return Promise.resolve(refused('detection options could not be read', 'invalid-override', error));
     }
     const { overrides } = request;
-    const key = overridesKey(overrides);
+    // A detection without the DNS servers cannot answer a call that wants them.
+    const key = `${overridesKey(overrides)}${request.dns ? '|dns' : ''}`;
 
     if (!request.force && cache !== null && cache.key === key) {
       const age = now() - cache.at;
@@ -991,7 +1054,7 @@ export const createNetInfo = (deps: NetInfoDeps): NetInfo => {
     }
 
     const startedIn = generation;
-    const promise: Promise<DetectedInterfaces> = detectAndLog(overrides)
+    const promise: Promise<DetectedInterfaces> = detectAndLog(overrides, request.dns)
       .then((value) => {
         if (inFlight?.promise === promise) inFlight = null;
         // A result that `invalidate()` overtook is returned to its callers but not kept.

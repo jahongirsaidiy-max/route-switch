@@ -41,6 +41,8 @@ import type { RouteAddResult, RouteDeleteResult, RouteOperations } from './route
  * - One pass at a time; calls that arrive during a pass share one follow-up.
  *
  * Seams for the modules that come later (none of them is implemented here):
+ * - config changes: `EngineDeps.onConfigChanged` is told about every real
+ *   change, so a module that tracks the rules (DNS) cannot miss one.
  * - domain rules: `EngineDeps.resolveDomain` supplies the destinations of a
  *   domain rule (the resolved addresses and, once scoped DNS exists, the
  *   rule's DNS server). The default resolves nothing and reports `resolving`.
@@ -81,11 +83,37 @@ export interface DomainTargets {
   readonly lastResolvedAt: string | null;
 }
 
+/**
+ * What the engine knows about the interfaces when it asks for a domain rule.
+ * The two fields follow different rules, on purpose:
+ * - whom to ask (`dnsServers`) comes from trusted (clean) detections only;
+ * - what never to route (`interfaceDnsServers`) is collected from every
+ *   detection, trusted or not, and always holds the servers of `dnsServers`.
+ *   An address excluded too many only goes by the default route; routing the
+ *   DNS server of an interface because a name resolved to it is worse.
+ */
+export interface DomainContext {
+  /**
+   * DNS servers of the interface that plays the rule's role, from the last
+   * trusted detection.
+   * - a list: known; empty when the interface has none.
+   * - `null`: not known yet, and a trustworthy detection is expected shortly
+   *   (the current one is being held back). The resolver should wait rather
+   *   than ask a server that is probably the wrong one.
+   * - `undefined`: not known and nothing better is coming (the detection was
+   *   accepted as it is, its lookup failed, or the `NetInfo` does not report
+   *   DNS servers).
+   */
+  readonly dnsServers: readonly string[] | null | undefined;
+  /** The DNS servers of every role's interface, as far as ever seen. A resolver never returns them as destinations. */
+  readonly interfaceDnsServers: readonly string[];
+}
+
 /** Supplies the destinations of a domain rule. May be asynchronous; a throw makes the rule `error`/`internal`. */
-export type DomainResolver = (rule: Rule) => DomainTargets | Promise<DomainTargets>;
+export type DomainResolver = (rule: Rule, context: DomainContext) => DomainTargets | Promise<DomainTargets>;
 
 /** The resolver used until the DNS module exists: nothing is routed, the rule waits. */
-export const unresolvedDomain: DomainResolver = () => ({
+export const unresolvedDomain: (rule: Rule) => DomainTargets = () => ({
   destinations: [],
   status: 'pending',
   reasonCode: 'resolving',
@@ -160,6 +188,13 @@ export interface EngineDeps {
   readonly onApplied?: ((routes: readonly AppliedRoute[]) => void | Promise<void>) | undefined;
   /** Called when `ReconcileOutcome.retryRequested` is true; the daemon turns it into a timer. */
   readonly scheduleRetry?: ((request: RetryRequest) => void) | undefined;
+  /**
+   * Called with the new config whenever `setConfig` or `setEnabled` really
+   * changed it, before the call returns (so before the reconcile the caller
+   * follows up with). The DNS module hangs its `syncConfig` here. A throw is
+   * logged and changes nothing.
+   */
+  readonly onConfigChanged?: ((config: Config) => void) | undefined;
 }
 
 export interface Engine {
@@ -200,6 +235,19 @@ export interface Engine {
 export const DEGRADED_ACCEPT_AFTER = 3;
 
 const ROLES: readonly IfaceRole[] = ['ethernet', 'wifi'];
+/**
+ * How many clean detections in a row may report "no DNS server" for a role
+ * that had one before the engine believes it. A DHCP renewal can leave the
+ * lease without the option for a moment; switching servers on that would throw
+ * the resolved addresses, and their routes, away for nothing.
+ */
+export const DNS_LOSS_GRACE = 2;
+/**
+ * DNS-server addresses remembered per role for the exclusion; the one not
+ * reported for longest goes first. The servers being asked are excluded on top
+ * of these, whatever the cap.
+ */
+export const MAX_EXCLUDED_DNS_PER_ROLE = 8;
 
 /**
  * A rule whose route the wrapper refused because a connected route is in the
@@ -256,6 +304,8 @@ interface DesiredRoute {
   readonly dst: string;
   readonly gateway: string;
   readonly role: IfaceRole;
+  /** Wanted by an `ip` / `subnet` rule, as opposed to only by addresses a domain resolved to. */
+  readonly explicit: boolean;
   readonly ruleIds: string[];
 }
 
@@ -487,6 +537,25 @@ export const createEngine = (deps: EngineDeps): Engine => {
    */
   let trusted: readonly GuardFacts[] | null = null;
   /**
+   * Whom to ask: DNS servers per role from clean detections only (same rule
+   * as `trusted`). A role is missing until a clean detection has reported it.
+   */
+  let trustedDns: Partial<Record<IfaceRole, readonly string[]>> = {};
+  /**
+   * What never to route: every DNS server any detection has reported for a
+   * role, clean or not. A clean detection that reports the role replaces the
+   * role's list; an untrusted one adds to it (a value reported again moves to
+   * the end) and the cap drops the one not reported for longest. The servers
+   * in `trustedDns` are excluded besides this list (`excludedServers`).
+   */
+  let excludedDns: Record<IfaceRole, readonly string[]> = { ethernet: [], wifi: [] };
+  /** Clean detections in a row that reported no DNS server for a role that had one. */
+  let dnsLossStreak: Record<IfaceRole, number> = { ethernet: 0, wifi: 0 };
+  /** The detection whose DNS servers were taken in last; a cached result is not counted twice. */
+  let lastDnsDetection: DetectedInterfaces | null = null;
+  /** What a rule is told when its role's DNS servers are not known: wait (`null`) or give up waiting (`undefined`). */
+  let unknownDns: null | undefined;
+  /**
    * Route key -> what the refusal was made under (gateway and interface
    * facts), for every wanted route the wrapper refused as `connected-route`
    * and that is still wanted. See `REFUSAL_RETRY_REASONS`.
@@ -538,9 +607,14 @@ export const createEngine = (deps: EngineDeps): Engine => {
   // Guarded calls into the other modules: a throw becomes a value.
   // -------------------------------------------------------------------------
 
-  const detect = async (overrides: Config['ifaceOverrides'], force: boolean): Promise<DetectedInterfaces | null> => {
+  const detect = async (
+    overrides: Config['ifaceOverrides'],
+    force: boolean,
+    wantDns: boolean,
+  ): Promise<DetectedInterfaces | null> => {
     try {
-      return await netinfo.detectInterfaces({ overrides, force });
+      // The DNS servers cost one more command per role, so they are asked for only when a rule needs them.
+      return await netinfo.detectInterfaces({ overrides, force, ...(wantDns ? { dns: true } : {}) });
     } catch (error) {
       logger.error('interface detection threw', { error: describeThrown(error) });
       return null;
@@ -567,9 +641,22 @@ export const createEngine = (deps: EngineDeps): Engine => {
     }
   };
 
+  /**
+   * What a resolver must never route: per role, the servers it is asked
+   * (`trustedDns`) and then the remembered ones. The asked ones do not depend on
+   * the cap of `excludedDns`: untrusted detections can push them out of that
+   * list, never out of the exclusion.
+   */
+  const excludedServers = (): string[] => [
+    ...new Set(ROLES.flatMap((role) => [...(trustedDns[role] ?? []), ...excludedDns[role]])),
+  ];
+
   const safeResolve = async (rule: Rule): Promise<DomainTargets> => {
     try {
-      return await resolveDomain(rule);
+      return await resolveDomain(rule, {
+        dnsServers: trustedDns[rule.iface] ?? unknownDns,
+        interfaceDnsServers: excludedServers(),
+      });
     } catch (error) {
       const thrown = describeThrown(error);
       logger.error('domain resolver threw', { ruleId: rule.id, error: thrown });
@@ -634,7 +721,15 @@ export const createEngine = (deps: EngineDeps): Engine => {
       return draft;
     };
 
-    for (const rule of snapshot.rules) {
+    // Explicit rules are planned first, whatever their place in the config: a
+    // destination the user named in an `ip` / `subnet` rule belongs to that
+    // rule, and an address a domain happens to resolve to never takes it over.
+    // Among themselves, rules keep the config order (the first one wins).
+    const planned = [
+      ...snapshot.rules.filter((rule) => rule.kind !== 'domain'),
+      ...snapshot.rules.filter((rule) => rule.kind === 'domain'),
+    ];
+    for (const rule of planned) {
       const disabled = disabledVerdict(snapshot, rule);
       if (disabled !== null) {
         draftOf(rule, disabled);
@@ -698,9 +793,15 @@ export const createEngine = (deps: EngineDeps): Engine => {
         const key = routeKey(destination);
         const existing = desired.get(key);
         if (existing === undefined) {
-          desired.set(key, { key, dst, gateway, role: rule.iface, ruleIds: [rule.id] });
+          desired.set(key, { key, dst, gateway, role: rule.iface, explicit: rule.kind !== 'domain', ruleIds: [rule.id] });
         } else if (existing.gateway === gateway) {
           if (!existing.ruleIds.includes(rule.id)) existing.ruleIds.push(rule.id);
+        } else if (existing.explicit && rule.kind === 'domain') {
+          recordIssue(
+            draft,
+            'route-failed',
+            `${dst} is routed through the ${existing.role} interface by an explicit rule, which takes precedence over a resolved address`,
+          );
         } else {
           recordIssue(draft, 'route-failed', `${dst} is already routed through the ${existing.role} interface by another rule`);
         }
@@ -944,6 +1045,51 @@ export const createEngine = (deps: EngineDeps): Engine => {
     }
   };
 
+  /**
+   * Takes in the DNS servers a detection reports. Nothing here decides about a
+   * route: a failed lookup (`null` for a role) or a missing report leaves what
+   * is known as it is.
+   */
+  const noteDnsServers = (detected: DetectedInterfaces | null, mode: PassMode, wanted: boolean): void => {
+    if (!wanted) {
+      // No domain rule, no lookups: what was known would only go stale.
+      trustedDns = {};
+      excludedDns = { ethernet: [], wifi: [] };
+      dnsLossStreak = { ethernet: 0, wifi: 0 };
+      lastDnsDetection = null;
+      unknownDns = undefined;
+      return;
+    }
+    // While a detection is held back, a clean one is expected with the retry: a rule can wait for it.
+    unknownDns = mode === 'hold' ? null : undefined;
+    const reported = detected?.dnsServers;
+    if (detected === null || reported === undefined || detected === lastDnsDetection) return;
+    lastDnsDetection = detected;
+    const nextTrusted = { ...trustedDns };
+    const nextExcluded = { ...excludedDns };
+    for (const role of ROLES) {
+      const servers = reported[role];
+      if (servers === null) continue;
+      if (mode !== 'normal') {
+        // A value reported again moves to the end: the one not seen for longest goes first.
+        const fresh = new Set(servers);
+        nextExcluded[role] = [...excludedDns[role].filter((server) => !fresh.has(server)), ...fresh].slice(
+          -MAX_EXCLUDED_DNS_PER_ROLE,
+        );
+        continue;
+      }
+      if (servers.length === 0 && (trustedDns[role]?.length ?? 0) > 0) {
+        dnsLossStreak[role] += 1;
+        if (dnsLossStreak[role] <= DNS_LOSS_GRACE) continue;
+      }
+      dnsLossStreak[role] = 0;
+      nextTrusted[role] = servers;
+      nextExcluded[role] = servers.slice(0, MAX_EXCLUDED_DNS_PER_ROLE);
+    }
+    trustedDns = nextTrusted;
+    excludedDns = nextExcluded;
+  };
+
   /** Classifies the detection and keeps the streak counters. */
   const classify = (detected: DetectedInterfaces | null, reason: ReconcileReason): { mode: PassMode; retry: number | null } => {
     if (detected === null) {
@@ -977,13 +1123,17 @@ export const createEngine = (deps: EngineDeps): Engine => {
     const snapshot = config;
     const revision = configRevision;
 
-    const detected = await detect(snapshot.ifaceOverrides, force || forceNextDetection);
+    // Wanted for every enabled domain rule, also one with its own `dns`: the
+    // servers of the interfaces must be known to keep them out of its answers.
+    const wantDns = snapshot.enabled && snapshot.rules.some((rule) => rule.enabled && rule.kind === 'domain');
+    const detected = await detect(snapshot.ifaceOverrides, force || forceNextDetection, wantDns);
     forceNextDetection = false;
     const { mode, retry } = classify(detected, reason);
     if (detected !== null) wire = toWireInterfaces(detected);
 
     const current = detected === null ? [] : guardFacts(detected);
     if (mode === 'normal') trusted = current;
+    noteDnsServers(detected, mode, wantDns);
     // An untrusted detection is checked together with the last trusted one: a
     // role it reports as down or without a subnet may only have failed to answer.
     const guardInterfaces = mode === 'normal' ? current : [...current, ...(trusted ?? [])];
@@ -1149,11 +1299,21 @@ export const createEngine = (deps: EngineDeps): Engine => {
   // Config and applied-set accessors
   // -------------------------------------------------------------------------
 
+  const notifyConfigChanged = (): void => {
+    if (deps.onConfigChanged === undefined) return;
+    try {
+      deps.onConfigChanged(config);
+    } catch (error) {
+      logger.error('config-change listener failed', { error: describeThrown(error) });
+    }
+  };
+
   const setConfig = (next: Config): boolean => {
     if (JSON.stringify(next) === JSON.stringify(config)) return false;
     config = next;
     configRevision += 1;
     logger.info('config replaced', { configRevision, rules: next.rules.length, enabled: next.enabled });
+    notifyConfigChanged();
     return true;
   };
 
@@ -1162,6 +1322,7 @@ export const createEngine = (deps: EngineDeps): Engine => {
     config = { ...config, enabled };
     configRevision += 1;
     logger.info('global toggle changed', { configRevision, enabled });
+    notifyConfigChanged();
     return true;
   };
 

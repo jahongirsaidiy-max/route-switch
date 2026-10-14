@@ -3,6 +3,8 @@ import { describe, expect, it } from 'vitest';
 
 import {
   DEGRADED_ACCEPT_AFTER,
+  DNS_LOSS_GRACE,
+  MAX_EXCLUDED_DNS_PER_ROLE,
   REFUSAL_RETRY_REASONS,
   buildEngineState,
   createEngine,
@@ -10,6 +12,7 @@ import {
   guardCoversEveryRole,
   unresolvedDomain,
   type AppliedRoute,
+  type DomainContext,
   type DomainResolver,
   type DomainTargets,
   type Engine,
@@ -3451,5 +3454,396 @@ VLAN Configurations
     expect(third.retryRequested).toBe(false);
     // The forced retries really bypassed the cache: networksetup ran once per pass.
     expect(r.runner.calls.filter((call) => call.bin === '/usr/sbin/networksetup')).toHaveLength(4);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Config-change hook, explicit rules before resolved addresses, DNS facts
+// ---------------------------------------------------------------------------
+
+describe('onConfigChanged', () => {
+  it('is called once for every real change of the config or the toggle, with the new config', () => {
+    const seen: Config[] = [];
+    const first = config([HOST]);
+    const h = setup(first, { deps: { onConfigChanged: (next) => seen.push(next) } });
+
+    expect(seen).toEqual([]);
+    expect(h.engine.setConfig(config([HOST]))).toBe(false);
+    expect(h.engine.setEnabled(true)).toBe(false);
+    expect(seen).toEqual([]);
+
+    const second = config([HOST, NET]);
+    expect(h.engine.setConfig(second)).toBe(true);
+    expect(seen).toEqual([second]);
+    expect(seen[0]).toBe(h.engine.getConfig());
+
+    expect(h.engine.setEnabled(false)).toBe(true);
+    expect(seen).toHaveLength(2);
+    expect(seen[1]).toEqual({ ...second, enabled: false });
+    expect(seen[1]).toBe(h.engine.getConfig());
+  });
+
+  it('is called before the call returns, so before the reconcile that follows', async () => {
+    const order: string[] = [];
+    const h = setup(config([HOST]), {
+      deps: {
+        onConfigChanged: () => order.push('config-changed'),
+        resolveDomain: () => {
+          order.push('resolve');
+          return unresolvedDomain(DOMAIN_RULE);
+        },
+      },
+    });
+
+    h.engine.setConfig(config([DOMAIN_RULE]));
+    order.push('returned');
+    await h.run('config-change');
+
+    expect(order).toEqual(['config-changed', 'returned', 'resolve']);
+  });
+
+  it('contains a hook that throws: the change stands and the engine goes on', async () => {
+    const h = setup(config([HOST]), {
+      deps: {
+        onConfigChanged: () => {
+          throw new Error('listener bug');
+        },
+      },
+    });
+
+    expect(h.engine.setConfig(config([HOST, HOST_B]))).toBe(true);
+    expect(h.engine.setEnabled(false)).toBe(true);
+    expect(h.engine.setEnabled(true)).toBe(true);
+    const outcome = await h.run('config-change');
+
+    expect(h.take()).toEqual([add('172.16.12.40', ETH_GW), add('172.16.12.41', ETH_GW)]);
+    expect(outcome.state.configRevision).toBe(3);
+    expect(engineLogs(h.entries, 'error', 'config-change listener failed')).toHaveLength(3);
+  });
+});
+
+const DOMAIN_RULE = rule(5, 'domain', 'corp.local', 'ethernet');
+const domainAnswer = (destinations: readonly string[]): DomainTargets => ({
+  destinations,
+  status: 'active',
+  reasonCode: null,
+  reason: null,
+  lastResolvedAt: '2026-10-12T08:29:00.000Z',
+});
+
+describe('explicit rules outrank resolved addresses', () => {
+  const WIFI_IP = rule(3, 'ip', '172.16.12.40', 'wifi');
+  const WIFI_SUBNET_32 = rule(4, 'subnet', '172.16.12.40/32', 'wifi');
+  const answerWith = { resolveDomain: () => domainAnswer(['172.16.12.40', '172.16.12.41']) };
+
+  it.each([
+    ['the ip rule comes first', [WIFI_IP, DOMAIN_RULE]],
+    ['the domain rule comes first', [DOMAIN_RULE, WIFI_IP]],
+    ['a /32 subnet rule comes last', [DOMAIN_RULE, WIFI_SUBNET_32]],
+  ])('gives the destination to the explicit rule when %s', async (_name, rules) => {
+    const h = setup(config(rules), { deps: answerWith });
+
+    const outcome = await h.run();
+
+    // The explicit destination goes through Wi-Fi; the domain keeps its other address.
+    expect(h.take()).toEqual([add('172.16.12.40', WIFI_GW), add('172.16.12.41', ETH_GW)]);
+    const explicit = outcome.state.rules.find((entry) => entry.ruleId !== ruleId(5));
+    expect(explicit).toMatchObject({ status: 'active', appliedDestinations: ['172.16.12.40'] });
+    expect(ruleState(outcome, 5)).toMatchObject({
+      status: 'error',
+      reasonCode: 'route-failed',
+      reason:
+        '172.16.12.40 is routed through the wifi interface by an explicit rule, which takes precedence over a resolved address',
+      appliedDestinations: ['172.16.12.41'],
+    });
+    // The rules are reported in config order, whatever order they were planned in.
+    expect(outcome.state.rules.map((entry) => entry.ruleId)).toEqual(rules.map((entry) => entry.id));
+
+    // Stable: the next passes run no command.
+    await h.run('dns-refresh');
+    await h.run('drift-check');
+    expect(h.take()).toEqual([]);
+  });
+
+  it('does not take the route of an explicit rule when the domain resolves to its address later', async () => {
+    let destinations: readonly string[] = ['172.16.12.41'];
+    const h = setup(config([DOMAIN_RULE, WIFI_IP]), { deps: { resolveDomain: () => domainAnswer(destinations) } });
+    await h.run();
+    expect(h.take()).toEqual([add('172.16.12.40', WIFI_GW), add('172.16.12.41', ETH_GW)]);
+
+    destinations = ['172.16.12.40', '172.16.12.41'];
+    const outcome = await h.run('dns-refresh');
+
+    // Before, the domain rule placed first deleted the route and added it through Ethernet.
+    expect(h.take()).toEqual([]);
+    expect(ruleState(outcome, 3)).toMatchObject({ status: 'active', appliedDestinations: ['172.16.12.40'] });
+  });
+
+  it('shares the route when the explicit rule and the domain use the same interface', async () => {
+    const sameRole = rule(3, 'ip', '172.16.12.40', 'ethernet');
+    const h = setup(config([DOMAIN_RULE, sameRole]), { deps: answerWith });
+
+    const outcome = await h.run();
+
+    expect(h.take()).toEqual([add('172.16.12.40', ETH_GW), add('172.16.12.41', ETH_GW)]);
+    expect(ruleState(outcome, 5)).toMatchObject({ status: 'active', appliedDestinations: ['172.16.12.40', '172.16.12.41'] });
+    expect(ruleState(outcome, 3)).toMatchObject({ status: 'active', appliedDestinations: ['172.16.12.40'] });
+  });
+
+  it('leaves an address alone that merely lies inside an explicit subnet of the other interface', async () => {
+    const wifiSubnet = rule(4, 'subnet', '172.16.12.0/24', 'wifi');
+    const h = setup(config([wifiSubnet, DOMAIN_RULE]), { deps: answerWith });
+
+    const outcome = await h.run();
+
+    // The host routes are more specific: these two addresses go through Ethernet, as the domain rule says.
+    expect(h.take()).toEqual([add('172.16.12.0/24', WIFI_GW), add('172.16.12.40', ETH_GW), add('172.16.12.41', ETH_GW)]);
+    expect(outcome.state.rules.map((entry) => entry.status)).toEqual(['active', 'active']);
+  });
+
+  it('keeps the first of two domain rules that resolve to the same address through different interfaces, without thrashing', async () => {
+    const viaWifi = rule(6, 'domain', 'other.corp.local', 'wifi');
+    const h = setup(config([DOMAIN_RULE, viaWifi]), { deps: { resolveDomain: () => domainAnswer(['172.16.12.40']) } });
+
+    const outcome = await h.run();
+    for (let pass = 0; pass < 5; pass += 1) await h.run('dns-refresh');
+
+    expect(h.take()).toEqual([add('172.16.12.40', ETH_GW)]);
+    expect(ruleState(outcome, 6)).toMatchObject({
+      status: 'error',
+      reasonCode: 'route-failed',
+      reason: '172.16.12.40 is already routed through the ethernet interface by another rule',
+    });
+  });
+});
+
+describe('DNS servers of the interfaces', () => {
+  type Reported = NonNullable<DetectedInterfaces['dnsServers']>;
+  // A new object every time: the engine takes the DNS servers of one detection in once.
+  const withDns = (dnsServers: Reported | undefined, extra: Partial<DetectedInterfaces> = {}): DetectedInterfaces => ({
+    ...network(extra),
+    ...(dnsServers === undefined ? {} : { dnsServers }),
+  });
+  const SERVERS: Reported = { ethernet: ['10.20.0.10'], wifi: ['192.168.1.1'] };
+  const DEGRADED = { degraded: true };
+
+  const recording = () => {
+    const contexts: DomainContext[] = [];
+    const resolveDomain: DomainResolver = (_rule, context) => {
+      contexts.push(context);
+      return domainAnswer(['172.16.12.40']);
+    };
+    return { contexts, resolveDomain };
+  };
+
+  /** One pass per detection, in order; returns what the resolver was told in each. */
+  const through = async (detections: FakeNetInfo['results'], rules: readonly Rule[] = [DOMAIN_RULE]) => {
+    const { contexts, resolveDomain } = recording();
+    const h = setup(config(rules), { netinfo: createFakeNetInfo(...detections), deps: { resolveDomain } });
+    for (let pass = 0; pass < detections.length; pass += 1) await h.run('network-change');
+    return { h, contexts };
+  };
+
+  it('asks the detection for them whenever an enabled domain rule exists, and never otherwise', async () => {
+    const withOwnDns = rule(5, 'domain', 'corp.local', 'ethernet', { dns: '10.20.0.10' });
+    const cases: readonly (readonly [Config, boolean])[] = [
+      [config([]), false],
+      [config([HOST, NET]), false],
+      [config([HOST, { ...DOMAIN_RULE, enabled: false }]), false],
+      [config([HOST, { ...withOwnDns, enabled: false }]), false],
+      [config([DOMAIN_RULE], { enabled: false }), false],
+      [config([HOST, DOMAIN_RULE]), true],
+      // Also for a rule with its own server: the interfaces' servers must be kept out of its answers.
+      [config([HOST, withOwnDns]), true],
+    ];
+    for (const [initial, wanted] of cases) {
+      const h = setup(initial);
+      await h.run();
+      expect(h.netinfo.calls).toHaveLength(1);
+      expect(h.netinfo.calls[0]?.dns).toBe(wanted ? true : undefined);
+      expect('dns' in (h.netinfo.calls[0] ?? {})).toBe(wanted);
+    }
+  });
+
+  it('hands the resolver the servers of the role of the rule, and those of every role', async () => {
+    const viaWifi = rule(6, 'domain', 'other.corp.local', 'wifi');
+
+    const { contexts } = await through([withDns(SERVERS)], [DOMAIN_RULE, viaWifi]);
+
+    expect(contexts).toEqual([
+      { dnsServers: ['10.20.0.10'], interfaceDnsServers: ['10.20.0.10', '192.168.1.1'] },
+      { dnsServers: ['192.168.1.1'], interfaceDnsServers: ['10.20.0.10', '192.168.1.1'] },
+    ]);
+  });
+
+  it('says "not known, nothing better coming" when the detection does not report them at all', async () => {
+    const { contexts } = await through([network()]);
+
+    expect(contexts).toEqual([{ dnsServers: undefined, interfaceDnsServers: [] }]);
+  });
+
+  it('asks only trusted servers, while the exclusion also takes in what untrusted detections report', async () => {
+    const poisoned: Reported = { ethernet: ['203.0.113.53'], wifi: ['203.0.113.54'] };
+    const { contexts } = await through([
+      withDns(SERVERS),
+      withDns(poisoned, DEGRADED),
+      withDns({ ethernet: ['203.0.113.55'], wifi: [] }, DEGRADED),
+      // The third degraded detection in a row is accepted for routes; its DNS servers still are not asked.
+      withDns(poisoned, DEGRADED),
+      withDns({ ethernet: ['10.30.0.10'], wifi: ['192.168.1.1'] }),
+    ]);
+
+    expect(contexts.map((context) => context.dnsServers)).toEqual([
+      ['10.20.0.10'],
+      ['10.20.0.10'],
+      ['10.20.0.10'],
+      ['10.20.0.10'],
+      ['10.30.0.10'],
+    ]);
+    expect(contexts.map((context) => context.interfaceDnsServers)).toEqual([
+      ['10.20.0.10', '192.168.1.1'],
+      ['10.20.0.10', '203.0.113.53', '192.168.1.1', '203.0.113.54'],
+      ['10.20.0.10', '203.0.113.53', '203.0.113.55', '192.168.1.1', '203.0.113.54'],
+      // Reported again: moved behind the one seen since.
+      ['10.20.0.10', '203.0.113.55', '203.0.113.53', '192.168.1.1', '203.0.113.54'],
+      // Only a clean detection that reports the role lets addresses go.
+      ['10.30.0.10', '192.168.1.1'],
+    ]);
+  });
+
+  it('excludes the servers of a detection that is never clean, and makes the rule wait only while a clean one may still come', async () => {
+    const seen: Reported = { ethernet: ['10.20.9.53'], wifi: ['192.168.1.1'] };
+    const { contexts, h } = await through([
+      withDns(seen, DEGRADED),
+      withDns(seen, DEGRADED),
+      withDns(seen, DEGRADED),
+      withDns(seen, DEGRADED),
+    ]);
+
+    expect(contexts.map((context) => context.dnsServers)).toEqual([null, null, undefined, undefined]);
+    expect(contexts.every((context) => context.interfaceDnsServers.join() === '10.20.9.53,192.168.1.1')).toBe(true);
+    // Held twice, accepted on the third pass: the route is added then, with the exclusion already in force.
+    expect(h.take()).toEqual([add('172.16.12.40', ETH_GW)]);
+  });
+
+  it('keeps the exclusion through a detection that fails outright', async () => {
+    const { contexts } = await through([
+      withDns(SERVERS),
+      () => {
+        throw new Error('detection failed');
+      },
+      withDns({ ethernet: ['203.0.113.53'], wifi: null }, DEGRADED),
+    ]);
+
+    // No resolver call in the failed pass; the next one still excludes everything seen so far.
+    expect(contexts.map((context) => context.interfaceDnsServers)).toEqual([
+      ['10.20.0.10', '192.168.1.1'],
+      ['10.20.0.10', '203.0.113.53', '192.168.1.1'],
+    ]);
+  });
+
+  it('keeps what it knew about a role whose lookup failed', async () => {
+    const { contexts } = await through([withDns(SERVERS), withDns({ ethernet: null, wifi: ['192.168.1.9'] })]);
+
+    expect(contexts.at(-1)).toEqual({ dnsServers: ['10.20.0.10'], interfaceDnsServers: ['10.20.0.10', '192.168.1.9'] });
+  });
+
+  it('tells a rule whose role was never looked up successfully to stop waiting', async () => {
+    const { contexts } = await through([withDns({ ethernet: null, wifi: [] })]);
+
+    expect(contexts).toEqual([{ dnsServers: undefined, interfaceDnsServers: [] }]);
+  });
+
+  it('does not believe a lease that loses its DNS server until it has said so three times', async () => {
+    const none = (): DetectedInterfaces => withDns({ ethernet: [], wifi: ['192.168.1.1'] });
+    const { contexts } = await through([withDns(SERVERS), none(), none(), none(), none()]);
+
+    expect(DNS_LOSS_GRACE).toBe(2);
+    expect(contexts.map((context) => context.dnsServers)).toEqual([['10.20.0.10'], ['10.20.0.10'], ['10.20.0.10'], [], []]);
+    expect(contexts.map((context) => context.interfaceDnsServers.includes('10.20.0.10'))).toEqual([true, true, true, false, false]);
+  });
+
+  it('starts the count again when the server is back in between, and does not count a cached detection twice', async () => {
+    const cached = withDns({ ethernet: [], wifi: ['192.168.1.1'] });
+    const { contexts } = await through([
+      withDns(SERVERS),
+      cached,
+      cached,
+      cached,
+      cached,
+      withDns(SERVERS),
+      withDns({ ethernet: [], wifi: ['192.168.1.1'] }),
+      withDns({ ethernet: [], wifi: ['192.168.1.1'] }),
+    ]);
+
+    // The same (cached) detection four times is one report; then the server is back; then two reports.
+    expect(contexts).toHaveLength(8);
+    expect(contexts.every((context) => context.dnsServers?.join() === '10.20.0.10')).toBe(true);
+  });
+
+  it('believes at once that a role has no server when it never had one', async () => {
+    const { contexts } = await through([withDns({ ethernet: [], wifi: [] })]);
+
+    expect(contexts).toEqual([{ dnsServers: [], interfaceDnsServers: [] }]);
+  });
+
+  it('remembers at most eight excluded addresses per role', async () => {
+    const detections = Array.from({ length: 12 }, (_unused, index) =>
+      withDns({ ethernet: [`203.0.113.${String(index + 1)}`], wifi: [] }, DEGRADED),
+    );
+
+    const { contexts } = await through(detections);
+
+    expect(MAX_EXCLUDED_DNS_PER_ROLE).toBe(8);
+    expect(contexts.at(-1)?.interfaceDnsServers).toEqual(Array.from({ length: 8 }, (_unused, index) => `203.0.113.${String(index + 5)}`));
+  });
+
+  it('always excludes the servers it asks, whatever the untrusted detections push out of the remembered ones (QA verdict 2)', async () => {
+    const others = Array.from({ length: MAX_EXCLUDED_DNS_PER_ROLE + 4 }, (_unused, index) =>
+      withDns({ ethernet: [`10.66.0.${String(index + 1)}`], wifi: ['192.168.1.1'] }, DEGRADED),
+    );
+
+    const { contexts } = await through([withDns({ ethernet: ['10.20.9.53'], wifi: ['192.168.1.1'] }), ...others]);
+
+    expect(contexts.every((context) => context.dnsServers?.join() === '10.20.9.53')).toBe(true);
+    expect(contexts.every((context) => context.interfaceDnsServers.includes('10.20.9.53'))).toBe(true);
+    // The cap still holds for the remembered ones: the eight reported last, besides the server asked.
+    expect(contexts.at(-1)?.interfaceDnsServers).toEqual([
+      '10.20.9.53',
+      ...Array.from({ length: MAX_EXCLUDED_DNS_PER_ROLE }, (_unused, index) => `10.66.0.${String(index + 5)}`),
+      '192.168.1.1',
+    ]);
+  });
+
+  it('drops the address not reported for longest, not one that was reported again', async () => {
+    const report = (address: string): DetectedInterfaces => withDns({ ethernet: [address], wifi: [] }, DEGRADED);
+    const first = Array.from({ length: MAX_EXCLUDED_DNS_PER_ROLE }, (_unused, index) => report(`203.0.113.${String(index + 1)}`));
+
+    // 203.0.113.1 is reported again before the ninth value comes: 203.0.113.2 is the one to go.
+    const { contexts } = await through([...first, report('203.0.113.1'), report('203.0.113.99')]);
+
+    expect(contexts.at(-1)?.interfaceDnsServers).toEqual([
+      ...Array.from({ length: MAX_EXCLUDED_DNS_PER_ROLE - 2 }, (_unused, index) => `203.0.113.${String(index + 3)}`),
+      '203.0.113.1',
+      '203.0.113.99',
+    ]);
+  });
+
+  it('forgets everything when the last enabled domain rule goes, instead of keeping it stale', async () => {
+    const { contexts, resolveDomain } = recording();
+    const netinfo = createFakeNetInfo(withDns(SERVERS), network(), withDns({ ethernet: ['10.30.0.10'], wifi: [] }, DEGRADED));
+    const h = setup(config([DOMAIN_RULE]), { netinfo, deps: { resolveDomain } });
+    await h.run();
+
+    // No domain rule: no DNS lookups by the detection, so nothing that was known can be kept current.
+    h.engine.setConfig(config([HOST]));
+    await h.run('config-change');
+    expect(h.netinfo.calls.at(-1)?.dns).toBeUndefined();
+
+    // The rule is back while the interface has another server and the detection is not clean.
+    h.engine.setConfig(config([DOMAIN_RULE]));
+    await h.run('config-change');
+
+    expect(contexts.at(-1)).toEqual({ dnsServers: null, interfaceDnsServers: ['10.30.0.10'] });
   });
 });

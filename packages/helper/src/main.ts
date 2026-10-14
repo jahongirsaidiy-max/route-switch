@@ -10,7 +10,7 @@ import {
   type DomainResolverService,
   type SetTimer,
 } from './dns';
-import { DEGRADED_ACCEPT_AFTER, createEngine } from './engine';
+import { DEGRADED_ACCEPT_AFTER, createEngine, type Engine } from './engine';
 import { createCommandRunner, type CommandRunner } from './exec';
 import { createJsonLinesSink, createLogger, type LineWritable, type Logger } from './logger';
 import { createNetInfo } from './netinfo';
@@ -57,7 +57,8 @@ export const EXIT_CODES = {
 /**
  * How long a one-shot run waits for the DNS lookups of its domain rules
  * before the follow-up pass. Three times the limit of a single lookup: enough
- * for every lookup of a config with up to 24 domains to answer or time out.
+ * for every lookup of a config with up to 12 domains on one DNS server to
+ * answer or time out (four run at a time against one set of servers).
  */
 export const ONE_SHOT_DNS_WAIT_MS = 15_000;
 
@@ -87,6 +88,8 @@ export interface RunDeps {
   /** Timers of the DNS lookups and of the one-shot wait; default to the real ones. */
   readonly setTimer?: SetTimer | undefined;
   readonly clearTimer?: ClearTimer | undefined;
+  /** The resolvers of the process, which a domain rule never routes; defaults to `dns.getServers()`. */
+  readonly systemDnsServers?: (() => readonly string[]) | undefined;
 }
 
 export type ParsedArgs =
@@ -156,36 +159,66 @@ const runOnce = async (configPath: string, deps: RunDeps): Promise<number> => {
     logger.warn('not running as root; route commands will be refused by the system');
   }
 
+  // No `requestReconcile`: a one-shot run decides itself when the follow-up pass happens.
+  const core = createCore(loaded.config, deps, root);
+  try {
+    return await reconcileOnce(core, deps, root);
+  } finally {
+    core.dns.stop();
+  }
+};
+
+/** The engine and the DNS resolver, wired to each other. */
+export interface HelperCore {
+  readonly engine: Engine;
+  readonly dns: DomainResolverService;
+  readonly setTimer: SetTimer;
+  readonly clearTimer: ClearTimer;
+}
+
+/**
+ * Builds the engine with everything it needs. The resolver is told about the
+ * initial config here and about every later change by the engine itself
+ * (`onConfigChanged`), so no caller has to keep the two in step. Starts
+ * nothing: no command, no lookup and no timer until the first reconcile.
+ */
+export const createCore = (
+  config: Config,
+  deps: RunDeps,
+  root: Logger,
+  requestReconcile?: (reason: 'dns-refresh') => unknown,
+): HelperCore => {
   const setTimer = deps.setTimer ?? realSetTimer;
   const clearTimer = deps.clearTimer ?? realClearTimer;
-  // No `requestReconcile`: a one-shot run decides itself when the follow-up pass happens.
   const dns = createDomainResolver({
     logger: root,
     now: deps.now,
     createResolver: deps.createDnsResolver,
     setTimer,
     clearTimer,
+    systemServers: deps.systemDnsServers,
+    requestReconcile,
   });
-  dns.syncConfig(loaded.config);
-
-  try {
-    return await reconcileOnce(loaded.config, deps, root, { dns, setTimer, clearTimer });
-  } finally {
-    dns.stop();
-  }
+  dns.syncConfig(config);
+  const runner = deps.createRunner(root);
+  const engine = createEngine({
+    netinfo: createNetInfo({ runner, logger: root }),
+    routes: createRouteOperations({ runner, logger: root }),
+    logger: root,
+    helperVersion: HELPER_VERSION,
+    initialConfig: config,
+    now: deps.now,
+    resolveDomain: dns.resolveDomain,
+    onConfigChanged: dns.syncConfig,
+  });
+  return { engine, dns, setTimer, clearTimer };
 };
 
 const isResolving = (state: EngineState): boolean =>
   state.rules.some((rule) => rule.status === 'pending' && rule.reasonCode === 'resolving');
 
-interface OneShotDns {
-  readonly dns: DomainResolverService;
-  readonly setTimer: SetTimer;
-  readonly clearTimer: ClearTimer;
-}
-
 /** Resolves with whether every lookup finished within `ONE_SHOT_DNS_WAIT_MS`. */
-const waitForLookups = ({ dns, setTimer, clearTimer }: OneShotDns): Promise<boolean> =>
+const waitForLookups = ({ dns, setTimer, clearTimer }: HelperCore): Promise<boolean> =>
   new Promise<boolean>((resolve) => {
     const deadline = setTimer(() => {
       resolve(false);
@@ -196,18 +229,9 @@ const waitForLookups = ({ dns, setTimer, clearTimer }: OneShotDns): Promise<bool
     });
   });
 
-const reconcileOnce = async (config: Config, deps: RunDeps, root: Logger, oneShotDns: OneShotDns): Promise<number> => {
+const reconcileOnce = async (core: HelperCore, deps: RunDeps, root: Logger): Promise<number> => {
   const logger = root.child({ component: 'main' });
-  const runner = deps.createRunner(root);
-  const engine = createEngine({
-    netinfo: createNetInfo({ runner, logger: root }),
-    routes: createRouteOperations({ runner, logger: root }),
-    logger: root,
-    helperVersion: HELPER_VERSION,
-    initialConfig: config,
-    now: deps.now,
-    resolveDomain: oneShotDns.dns.resolveDomain,
-  });
+  const { engine } = core;
 
   // There is no daemon loop to retry later, so an untrusted interface
   // detection is retried right here, but only as long as the engine still
@@ -221,11 +245,11 @@ const reconcileOnce = async (config: Config, deps: RunDeps, root: Logger, oneSho
 
   let failedCommands = outcome.summary.failed;
   if (!outcome.retryRequested && isResolving(outcome.state)) {
-    const finished = await waitForLookups(oneShotDns);
+    const finished = await waitForLookups(core);
     if (!finished) {
       logger.warn('DNS lookups are still running; reconciling with what has been resolved so far', {
         waitedMs: ONE_SHOT_DNS_WAIT_MS,
-        ...oneShotDns.dns.stats(),
+        ...core.dns.stats(),
       });
     }
     outcome = await engine.reconcile('dns-refresh');

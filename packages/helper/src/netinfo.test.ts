@@ -1958,3 +1958,165 @@ describe('detectInterfaces: QA observations of TASK-101', () => {
     expect(pinned.ethernet).toMatchObject({ device: null, reason: 'invalid-override' });
   });
 });
+
+// ---------------------------------------------------------------------------
+// DNS servers of the role interfaces (opt-in)
+// ---------------------------------------------------------------------------
+
+describe('detectInterfaces: DNS servers (opt-in)', () => {
+  const DNS = 'domain_name_server';
+  const dnsQuery = (device: string): string[] => ['getoption', device, DNS];
+
+  // `ipconfig getoption <dev> domain_name_server` on macOS 26.3.1, anonymised: one address and a
+  // newline, exit 0 -- also for a lease that carries two servers (`ipconfig getpacket` shows
+  // `domain_name_server (ip_mult): {a, b}` for it; `getoption` prints the first only). Without a lease
+  // or for an unknown device: exit 1, nothing on stdout or stderr.
+  const withDns = (servers: Readonly<Record<string, FakeCommandResponse>>) => {
+    const h = setup(PORTS, BOTH);
+    for (const [device, response] of Object.entries(servers)) h.runner.when(IPCONFIG, dnsQuery(device), response);
+    return h;
+  };
+  const dnsCalls = (runner: FakeCommandRunner): string[] => argvOf(runner).filter((argv) => argv.endsWith(DNS));
+
+  it('does not ask for them, and does not report them, unless told to', async () => {
+    const { netinfo, runner } = withDns({ en5: value('10.20.0.10'), en0: value('192.168.1.1') });
+
+    const result = await netinfo.detectInterfaces();
+
+    expect(dnsCalls(runner)).toEqual([]);
+    expect(runner.calls).toHaveLength(9);
+    expect('dnsServers' in result).toBe(false);
+    expect(await netinfo.detectInterfaces({ dns: false })).toBe(result);
+    expect(await netinfo.detectInterfaces({ dns: 'yes' } as unknown as DetectOptions)).toBe(result);
+    expect(dnsCalls(runner)).toEqual([]);
+  });
+
+  it('reports the DNS server of each role with one more command per role that has an address', async () => {
+    const { netinfo, runner, entries } = withDns({ en5: value('10.20.0.10'), en0: value('192.168.1.1') });
+
+    const result = await netinfo.detectInterfaces({ dns: true });
+
+    expect(result.dnsServers).toEqual({ ethernet: ['10.20.0.10'], wifi: ['192.168.1.1'] });
+    expect(result.degraded).toBe(false);
+    expect(dnsCalls(runner).sort()).toEqual(['ipconfig getoption en0 domain_name_server', 'ipconfig getoption en5 domain_name_server']);
+    // 1 networksetup + 4 addresses + 2 x (router, mask) + 2 DNS.
+    expect(runner.calls).toHaveLength(9 + 2);
+    expect(Object.isFrozen(result.dnsServers)).toBe(true);
+    expect(Object.isFrozen(result.dnsServers?.ethernet)).toBe(true);
+    expect(summaries(entries)[0]?.context).toMatchObject({ dnsServers: { ethernet: ['10.20.0.10'], wifi: ['192.168.1.1'] } });
+    // Everything else is what a detection without DNS reports.
+    const plain = setup(PORTS, BOTH);
+    expect({ ...result, dnsServers: undefined }).toEqual(await plain.netinfo.detectInterfaces());
+  });
+
+  it('asks nothing for a role without an address', async () => {
+    const h = setup(PORTS, { en0: WIFI });
+    h.runner.when(IPCONFIG, dnsQuery('en0'), value('192.168.1.1'));
+
+    const result = await h.netinfo.detectInterfaces({ dns: true });
+
+    expect(result.dnsServers).toEqual({ ethernet: [], wifi: ['192.168.1.1'] });
+    expect(dnsCalls(h.runner)).toEqual(['ipconfig getoption en0 domain_name_server']);
+    expect(result.degraded).toBe(false);
+  });
+
+  it('treats "no value" as an interface without a DNS server, which is ordinary', async () => {
+    const { netinfo, entries } = withDns({ en5: NO_VALUE, en0: value('192.168.1.1') });
+
+    const result = await netinfo.detectInterfaces({ dns: true });
+
+    expect(result.dnsServers).toEqual({ ethernet: [], wifi: ['192.168.1.1'] });
+    expect(result.degraded).toBe(false);
+    expect(result.ethernet.routable).toBe(true);
+    expect(warnings(entries)).toEqual([]);
+  });
+
+  it.each([
+    ['loopback', '127.0.0.1', 'loopback'],
+    ['the unspecified address', '0.0.0.0', 'default-route'],
+    ['link-local', '169.254.1.1', 'link-local'],
+    ['multicast', '224.0.0.251', 'multicast'],
+    ['broadcast', '255.255.255.255', 'broadcast'],
+    ['IPv6', 'fe80::1', 'invalid-ipv4'],
+    ['a host name', 'ns.corp.local', 'invalid-ipv4'],
+    ['an octal form', '010.20.0.10', 'invalid-ipv4'],
+    ['a braced list', '{10.20.0.10, 10.20.0.11}', 'invalid-ipv4'],
+    ['an argument-like value', '-interface', 'invalid-ipv4'],
+  ])('ignores a DNS server that is %s, without calling the detection degraded', async (_name, text, reason) => {
+    const { netinfo, entries } = withDns({ en5: value(text), en0: value('192.168.1.1') });
+
+    const result = await netinfo.detectInterfaces({ dns: true });
+
+    expect(result.dnsServers).toEqual({ ethernet: [], wifi: ['192.168.1.1'] });
+    expect(result.degraded).toBe(false);
+    expect(warnings(entries).map((entry) => [entry.msg, entry.context?.['reason']])).toEqual([
+      ['ipconfig returned an unusable DNS server; it is ignored', reason],
+    ]);
+  });
+
+  it.each([
+    ...FAILURES,
+    ['several lines', { stdout: '10.20.0.10\n10.20.0.11\n' }] as const,
+    ['an empty success', { stdout: '\n' }] as const,
+    ['a usage error', USAGE] as const,
+  ])('reports "not known" for the role, and nothing worse, when the DNS query fails with %s', async (_name, response) => {
+    const { netinfo, entries } = withDns({ en5: response, en0: value('192.168.1.1') });
+
+    const result = await netinfo.detectInterfaces({ dns: true });
+
+    // `null` is not "no server": the caller keeps what it knew.
+    expect(result.dnsServers).toEqual({ ethernet: null, wifi: ['192.168.1.1'] });
+    // No route decision depends on a DNS server, so the detection is as trustworthy as without the lookup.
+    expect(result.degraded).toBe(false);
+    expect(result.ethernet).toMatchObject({ routable: true, gateway: '10.20.4.1', subnet: '10.20.4.0/22' });
+    expect(warnings(entries).length).toBeGreaterThan(0);
+    const plain = setup(PORTS, BOTH);
+    expect({ ...result, dnsServers: undefined }).toEqual(await plain.netinfo.detectInterfaces());
+  });
+
+  it('still calls the detection degraded for what does decide about routes, whatever the DNS lookup did', async () => {
+    const { netinfo, runner } = withDns({ en5: value('10.20.0.10'), en0: value('192.168.1.1') });
+    runner.when(IPCONFIG, ['getoption', 'en5', 'subnet_mask'], { failure: 'timeout', signal: 'SIGKILL', error: 'Timed out after 5000 ms' });
+
+    const result = await netinfo.detectInterfaces({ dns: true });
+
+    expect(result.degraded).toBe(true);
+    expect(result.dnsServers).toEqual({ ethernet: ['10.20.0.10'], wifi: ['192.168.1.1'] });
+  });
+
+  it('never answers a call that wants the DNS servers from a detection that did not look them up, or the other way round', async () => {
+    const { netinfo, runner } = withDns({ en5: value('10.20.0.10'), en0: value('192.168.1.1') });
+
+    const plain = await netinfo.detectInterfaces();
+    const withServers = await netinfo.detectInterfaces({ dns: true });
+    expect(runner.calls).toHaveLength(9 + 11);
+    expect(plain.dnsServers).toBeUndefined();
+    expect(withServers.dnsServers).toBeDefined();
+
+    expect(await netinfo.detectInterfaces({ dns: true })).toBe(withServers);
+    expect(runner.calls).toHaveLength(9 + 11);
+
+    // One result is kept at a time; the plain call detects again and gets no DNS servers.
+    expect((await netinfo.detectInterfaces()).dnsServers).toBeUndefined();
+    expect(runner.calls).toHaveLength(9 + 11 + 9);
+  });
+
+  it('follows a lease whose DNS server changed once the cache is gone', async () => {
+    const { netinfo, runner } = withDns({ en5: value('10.20.0.10'), en0: value('192.168.1.1') });
+    await netinfo.detectInterfaces({ dns: true });
+
+    runner.when(IPCONFIG, dnsQuery('en5'), value('10.30.0.10'));
+    netinfo.invalidate();
+
+    expect((await netinfo.detectInterfaces({ dns: true })).dnsServers?.ethernet).toEqual(['10.30.0.10']);
+  });
+
+  it('never puts the DNS servers on the wire', async () => {
+    const { netinfo } = withDns({ en5: value('10.20.0.10'), en0: value('192.168.1.1') });
+
+    const wire = toWireInterfaces(await netinfo.detectInterfaces({ dns: true }));
+
+    expect(JSON.stringify(wire)).not.toContain('10.20.0.10');
+    expect(InterfaceState.parse(wire.interfaces.ethernet)).toEqual(wire.interfaces.ethernet);
+  });
+});
