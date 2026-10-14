@@ -3,6 +3,7 @@ import { describe, expect, it } from 'vitest';
 
 import { App, SCREENS, VIEWS, VIEW_TITLES, parseView, type View } from './App';
 import { renderMarkup } from './components/test-utils';
+import { MenuBarScreen } from './screens/MenuBar';
 
 describe('parseView', () => {
   it('reads the view the main process puts in the query', () => {
@@ -40,11 +41,13 @@ describe('App', () => {
     expect(html).not.toContain('data-screen');
   });
 
-  it('has a placeholder screen for every view until the screens land', () => {
-    for (const view of VIEWS) {
-      const html = renderMarkup(createElement(App, { search: `?view=${view}` }));
-      expect(html).toContain(VIEW_TITLES[view]);
-      expect(SCREENS[view]).toBeTypeOf('function');
-    }
+  it('the popover view is the menu bar screen', () => {
+    expect(SCREENS.popover).toBe(MenuBarScreen);
+  });
+
+  it('has a placeholder for the rules view until its screen lands', () => {
+    const html = renderMarkup(createElement(App, { search: '?view=rules' }));
+    expect(html).toContain(VIEW_TITLES.rules);
+    expect(SCREENS.rules).toBeTypeOf('function');
   });
 });

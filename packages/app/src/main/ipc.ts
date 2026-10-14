@@ -65,6 +65,7 @@ export const INVOKE_CHANNELS = [
   'rs:getServiceOrder',
   'rs:copyServiceOrderCommand',
   'rs:uninstall',
+  'rs:openRulesWindow',
 ] as const satisfies readonly RsInvokeChannel[];
 
 /** The part of a `WebFrameMain` a call is checked against. */
@@ -103,6 +104,8 @@ export interface IpcDeps {
   readonly logBuffer?: LogBuffer;
   /** The login item and the network service order (settings screen). */
   readonly settings: Settings;
+  /** Opens the rules window or brings it to the front (`WindowManager.openRules`). Main process only, no helper call. */
+  readonly openRulesWindow: () => void;
 }
 
 export interface IpcRegistration {
@@ -178,6 +181,7 @@ const ARGUMENTS = {
   'rs:getServiceOrder': argumentsOf(),
   'rs:copyServiceOrderCommand': argumentsOf(),
   'rs:uninstall': argumentsOf(),
+  'rs:openRulesWindow': argumentsOf(),
 } as const satisfies Readonly<Record<RsInvokeChannel, ArgsParser<readonly unknown[]>>>;
 
 type ParsedArgs<C extends RsInvokeChannel> = (typeof ARGUMENTS)[C] extends ArgsParser<infer A> ? A : never;
@@ -206,6 +210,7 @@ export function registerIpcHandlers(deps: IpcDeps): IpcRegistration {
   const inputLog = logger.limited('ipc-invalid-input');
   const failureLog = logger.limited('ipc-call-failed');
   const changeLog = logger.limited('ipc-change');
+  const windowLog = logger.limited('ipc-window');
   const internalLog = logger.limited('ipc-internal');
   const pushLog = logger.limited('ipc-push-failed');
   const journalLog = logger.limited('ipc-journal-failed');
@@ -307,6 +312,12 @@ export function registerIpcHandlers(deps: IpcDeps): IpcRegistration {
         changeLog.info('Helper uninstall requested', { channel: 'rs:uninstall', ok: result.ok });
         return result;
       }),
+    // A window of this process; the helper is not involved. A throw is answered `internal` below.
+    'rs:openRulesWindow': () => {
+      deps.openRulesWindow();
+      windowLog.info('Rules window requested', { channel: 'rs:openRulesWindow' });
+      return Promise.resolve({ ok: true, value: null });
+    },
   };
 
   const register = (channel: RsInvokeChannel): void => {

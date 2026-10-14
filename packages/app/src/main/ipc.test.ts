@@ -168,6 +168,7 @@ interface SetupOptions {
   readonly recipients?: StateRecipient[];
   readonly logBuffer?: LogBuffer;
   readonly settings?: Settings;
+  readonly openRulesWindow?: () => void;
 }
 
 async function setup(options: SetupOptions = {}) {
@@ -203,6 +204,7 @@ async function setup(options: SetupOptions = {}) {
     listRecipients: () => recipients,
     ...(options.logBuffer === undefined ? {} : { logBuffer: options.logBuffer }),
     settings: options.settings ?? unusedSettings(logger),
+    openRulesWindow: options.openRulesWindow ?? (() => undefined),
   });
 
   if (options.client === undefined) {
@@ -251,10 +253,10 @@ const newRule = (extra: Partial<RuleInput> = {}): RuleInput => ({
 // ---------------------------------------------------------------------------
 
 describe('registration', () => {
-  it('handles exactly the seventeen invoke channels of the renderer API', async () => {
+  it('handles exactly the eighteen invoke channels of the renderer API', async () => {
     const h = await setup({ connect: false });
     expect([...h.ipcMain.handlers.keys()].sort()).toEqual([...INVOKE_CHANNELS].sort());
-    expect(INVOKE_CHANNELS).toHaveLength(17);
+    expect(INVOKE_CHANNELS).toHaveLength(18);
   });
 
   it('dispose removes every handler and stops the state pushes; a second dispose does nothing', async () => {
@@ -265,7 +267,7 @@ describe('registration', () => {
     h.registration.dispose();
     h.registration.dispose();
     expect(h.ipcMain.handlers.size).toBe(0);
-    expect(h.ipcMain.removeHandler).toHaveBeenCalledTimes(17);
+    expect(h.ipcMain.removeHandler).toHaveBeenCalledTimes(18);
     h.sockets[0]?.emit('connect');
     for (let i = 0; i < 6; i += 1) await flush();
     expect(sent).toEqual([]);
@@ -670,6 +672,7 @@ describe('rs:state', () => {
       entryUrl: APP_ENTRY_URL,
       logger,
       settings: unusedSettings(logger),
+      openRulesWindow: () => undefined,
       listRecipients: () => {
         throw new Error('no windows');
       },
@@ -1004,9 +1007,58 @@ describe('settings: uninstall the helper', () => {
   });
 });
 
+describe('rs:openRulesWindow (main process only)', () => {
+  it('opens the rules window and sends nothing to the helper', async () => {
+    const openRulesWindow = vi.fn();
+    const h = await setup({ openRulesWindow });
+    expect(await h.call('rs:openRulesWindow')).toEqual({ ok: true, value: null });
+    expect(openRulesWindow).toHaveBeenCalledTimes(1);
+    expect(openRulesWindow).toHaveBeenCalledWith();
+    expect(h.sentAfterHandshake()).toEqual([]);
+    expect(h.entries.some((entry) => entry.level === 'info' && entry.msg === 'Rules window requested')).toBe(true);
+  });
+
+  it('works without a helper connection', async () => {
+    const openRulesWindow = vi.fn();
+    const h = await setup({ connect: false, openRulesWindow });
+    expect(await h.call('rs:openRulesWindow')).toEqual({ ok: true, value: null });
+    expect(openRulesWindow).toHaveBeenCalledTimes(1);
+    expect(h.sent()).toEqual([]);
+  });
+
+  it('refuses arguments, and opens nothing', async () => {
+    const openRulesWindow = vi.fn();
+    const h = await setup({ openRulesWindow });
+    expect(await h.call('rs:openRulesWindow', 'https://example.com/')).toMatchObject({ ok: false, code: 'invalid-input' });
+    expect(openRulesWindow).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ['another document', { senderFrame: { url: 'https://example.com/', parent: null } }],
+    ['a sub-frame of the app page', { senderFrame: { url: APP_ENTRY_URL, parent: {} } }],
+    ['a frame that is gone', { senderFrame: null }],
+  ] as [string, InvokeEvent][])('%s gets forbidden, and nothing is opened', async (_name, event) => {
+    const openRulesWindow = vi.fn();
+    const h = await setup({ openRulesWindow });
+    expect(await h.callAs(event, 'rs:openRulesWindow')).toMatchObject({ ok: false, code: 'forbidden' });
+    expect(openRulesWindow).not.toHaveBeenCalled();
+  });
+
+  it('a failure to open the window is answered internal and logged, not thrown into the page', async () => {
+    const h = await setup({
+      openRulesWindow: () => {
+        throw new Error('Object has been destroyed');
+      },
+    });
+    expect(await h.call('rs:openRulesWindow')).toMatchObject({ ok: false, code: 'internal' });
+    expect(h.entries.some((entry) => entry.level === 'error' && entry.msg === 'A call failed unexpectedly')).toBe(true);
+  });
+});
+
 describe('the preload against the main process (window.rs)', () => {
-  it('exposes exactly the nineteen methods of the renderer API, each wired to a handled channel', async () => {
-    const h = await setup({ settings: fakeSettings().settings });
+  it('exposes exactly the twenty methods of the renderer API, each wired to a handled channel', async () => {
+    const openRulesWindow = vi.fn();
+    const h = await setup({ settings: fakeSettings().settings, openRulesWindow });
     bridge.setInvokeTarget((channel, ...args) => {
       const handler = h.ipcMain.handlers.get(channel);
       if (handler === undefined) return Promise.reject(new Error(`No handler registered for '${channel}'`));
@@ -1028,6 +1080,7 @@ describe('the preload against the main process (window.rs)', () => {
         'importConfig',
         'onLog',
         'onState',
+        'openRulesWindow',
         'saveRule',
         'setEnabled',
         'setIfaceOverrides',
@@ -1059,6 +1112,8 @@ describe('the preload against the main process (window.rs)', () => {
     expect((await settle(rs.getServiceOrder())).ok).toBe(true);
     expect((await settle(rs.copyServiceOrderCommand())).ok).toBe(true);
     expect(await settle(rs.uninstallHelper())).toMatchObject({ ok: false, code: 'not-implemented' });
+    expect(await settle(rs.openRulesWindow())).toEqual({ ok: true, value: null });
+    expect(openRulesWindow).toHaveBeenCalledTimes(1);
     expect(h.sentAfterHandshake().filter((method) => method !== 'getConfig')).toEqual([
       'setConfig',
       'setConfig',

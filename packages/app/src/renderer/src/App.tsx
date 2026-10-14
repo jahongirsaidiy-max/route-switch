@@ -7,6 +7,7 @@ import './styles/global.css';
 import type { ComponentType, ReactElement } from 'react';
 
 import styles from './App.module.css';
+import { MenuBarScreen } from './screens/MenuBar';
 
 /** The screens a window can show; the same values as `WindowView` in the main process. */
 export const VIEWS = ['popover', 'rules'] as const;
@@ -42,11 +43,11 @@ function ScreenPlaceholder({ view }: { readonly view: View }): ReactElement {
 }
 
 /**
- * The screen component of each view. TASK-211 (menu bar) and TASK-212 (rules)
- * replace the placeholders with `screens/MenuBar` and `screens/Rules`.
+ * The screen component of each view. TASK-212 replaces the rules placeholder
+ * with `screens/Rules`.
  */
 export const SCREENS: Readonly<Record<View, ComponentType>> = {
-  popover: () => <ScreenPlaceholder view="popover" />,
+  popover: MenuBarScreen,
   rules: () => <ScreenPlaceholder view="rules" />,
 };
 

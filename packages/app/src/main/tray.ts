@@ -144,6 +144,8 @@ export function startShell(deps: ShellDeps, context: ShellContext): Shell {
     logger: deps.logger,
     listRecipients: windows.contents,
     settings: deps.settings,
+    // "Qoidalarni boshqarish" of the menu bar window: the same window as the tray menu item.
+    openRulesWindow: windows.openRules,
   });
 
   let appearance = INITIAL_APPEARANCE;

@@ -1,0 +1,242 @@
+/*
+ * Menu bar window, after route-switch-docs/RouteSwitch UI.html ("Menu bar oynasi", 360×600).
+ * The window is transparent and frameless (POPOVER_LAYOUT): the page draws the rounded panel
+ * inside a 10px margin, so the page behind it must not paint.
+ */
+:global(html):has(.screen),
+:global(body):has(.screen) {
+  background: transparent;
+}
+
+/* 360×600, padding 10. */
+.screen {
+  height: 100%;
+  padding: var(--rs-space-5);
+}
+
+/* Panel: #FBFBFC, border #D4D6DA, radius 12, column. */
+.panel {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  overflow: hidden;
+  border: 1px solid var(--rs-color-border-strong);
+  border-radius: var(--rs-radius-window);
+  background: var(--rs-color-surface);
+}
+
+/* Header: padding 14 16 12, divider below. */
+.header {
+  display: flex;
+  flex-shrink: 0;
+  align-items: center;
+  justify-content: space-between;
+  padding: var(--rs-space-7) var(--rs-space-8) var(--rs-space-6);
+  border-bottom: 1px solid var(--rs-color-divider);
+}
+
+.brand {
+  display: flex;
+  align-items: center;
+  gap: var(--rs-space-5);
+  color: var(--rs-color-text);
+}
+
+.brandName {
+  font-size: var(--rs-text-brand);
+  font-weight: var(--rs-weight-semibold);
+}
+
+/* "Faol" + switch: gap 8, 12px, #4A4E57. */
+.switch {
+  display: flex;
+  align-items: center;
+  gap: var(--rs-space-4);
+  color: var(--rs-color-text-secondary);
+  font-size: var(--rs-text-small);
+}
+
+/* Section label: 11px / 600, 0.06em, uppercase, #6B6F78. */
+.label {
+  color: var(--rs-color-text-caption);
+  font-size: var(--rs-text-caption);
+  font-weight: var(--rs-weight-semibold);
+  letter-spacing: var(--rs-tracking-label);
+  text-transform: uppercase;
+}
+
+/* Interfaces: padding 14 16, gap 8. */
+.interfaces {
+  display: flex;
+  flex-shrink: 0;
+  flex-direction: column;
+  gap: var(--rs-space-4);
+  padding: var(--rs-space-7) var(--rs-space-8);
+}
+
+/* Active rules: padding 4 16 0, gap 6, takes the rest of the height. */
+.rules {
+  display: flex;
+  flex: 1;
+  flex-direction: column;
+  gap: var(--rs-space-3);
+  min-height: 0;
+  overflow: hidden;
+  padding: var(--rs-space-2) var(--rs-space-8) 0;
+}
+
+.rulesHead {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+}
+
+.count {
+  color: var(--rs-color-text-caption);
+  font-size: var(--rs-text-caption);
+}
+
+.list {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+/* Routing off: the rules are listed but not applied (derived — the design shows only the "on" state). */
+.rules[data-off] .list {
+  opacity: 0.55;
+}
+
+/* Row: gap 10, padding 8 0, divider #F0F1F3. */
+.row {
+  display: flex;
+  align-items: center;
+  gap: var(--rs-space-5);
+  padding: var(--rs-space-4) 0;
+  border-bottom: 1px solid var(--rs-color-row-divider);
+}
+
+/* Target: mono 12px. */
+.target {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  font-family: var(--rs-font-mono);
+  font-size: var(--rs-text-small);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* Detail: 11px, #5B5F68. */
+.detail {
+  flex-shrink: 1;
+  max-width: 45%;
+  overflow: hidden;
+  color: var(--rs-color-text-muted);
+  font-size: var(--rs-text-caption);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.more,
+.empty {
+  color: var(--rs-color-text-caption);
+  font-size: var(--rs-text-caption);
+}
+
+.empty {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: var(--rs-space-2);
+  padding: var(--rs-space-4) 0;
+}
+
+/* Status row: padding 10 16, gap 8, 11px, #4A4E57 on #F3F4F6, divider above. */
+.status {
+  display: flex;
+  flex-shrink: 0;
+  align-items: center;
+  gap: var(--rs-space-4);
+  padding: var(--rs-space-5) var(--rs-space-8);
+  border-top: 1px solid var(--rs-color-divider);
+  background: var(--rs-color-subtle);
+  color: var(--rs-color-text-secondary);
+  font-size: var(--rs-text-caption);
+}
+
+.statusIcon {
+  display: inline-flex;
+  flex-shrink: 0;
+  color: var(--rs-color-success);
+}
+
+.status[data-tone='danger'] .statusIcon {
+  color: var(--rs-color-danger);
+}
+
+.statusText {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.errors {
+  flex-shrink: 0;
+  margin-left: auto;
+  color: var(--rs-color-danger-soft-text);
+  font-weight: var(--rs-weight-semibold);
+}
+
+/* No live state: one message in place of the interfaces and the rules (not in the design — derived). */
+.notice {
+  display: flex;
+  flex: 1;
+  flex-direction: column;
+  justify-content: center;
+  gap: var(--rs-space-3);
+  padding: var(--rs-space-11) var(--rs-space-10);
+  text-align: center;
+}
+
+.noticeTitle {
+  color: var(--rs-color-text);
+  font-size: var(--rs-text-body);
+  font-weight: var(--rs-weight-medium);
+}
+
+.notice[data-tone='warning'] .noticeTitle {
+  color: var(--rs-color-warning-soft-text);
+}
+
+.notice[data-tone='danger'] .noticeTitle {
+  color: var(--rs-color-danger-soft-text);
+}
+
+.noticeText {
+  color: var(--rs-color-text-muted);
+  font-size: var(--rs-text-small);
+}
+
+.feedback {
+  flex-shrink: 0;
+  padding: var(--rs-space-4) var(--rs-space-8) 0;
+  font-size: var(--rs-text-small);
+}
+
+.feedback[data-tone='danger'] {
+  color: var(--rs-color-danger-soft-text);
+}
+
+.feedback[data-tone='success'] {
+  color: var(--rs-color-success-soft-text);
+}
+
+/* Buttons: gap 8, padding 12 16 14. */
+.actions {
+  display: flex;
+  flex-shrink: 0;
+  gap: var(--rs-space-4);
+  padding: var(--rs-space-6) var(--rs-space-8) var(--rs-space-7);
+}

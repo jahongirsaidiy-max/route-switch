@@ -57,6 +57,7 @@ const api: RsApi = {
   getServiceOrder: () => invoke('rs:getServiceOrder'),
   copyServiceOrderCommand: () => invoke('rs:copyServiceOrderCommand'),
   uninstallHelper: () => invoke('rs:uninstall'),
+  openRulesWindow: () => invoke('rs:openRulesWindow'),
   onLog: (listener) => {
     const forward = (_event: IpcRendererEvent, entry: RsLogEntry): void => {
       listener(entry);

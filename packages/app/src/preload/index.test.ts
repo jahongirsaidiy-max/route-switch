@@ -27,30 +27,39 @@ beforeAll(async () => {
 
 const RULE = { id: '7f0e9a52-3c1b-4d8e-9a6f-2b5c8d1e4f70', kind: 'ip', target: '10.1.2.3', iface: 'wifi' } as const;
 
+/** Every invoke of `window.rs`: method, arguments, channel. */
+const INVOKES = [
+  ['getState', [], 'rs:getState'],
+  ['getConfig', [], 'rs:getConfig'],
+  ['saveRule', [RULE], 'rs:saveRule'],
+  ['deleteRule', [RULE.id], 'rs:deleteRule'],
+  ['toggleRule', [RULE.id, false], 'rs:toggleRule'],
+  ['setEnabled', [true], 'rs:setEnabled'],
+  ['apply', [], 'rs:apply'],
+  ['test', ['10.1.2.3'], 'rs:test'],
+  ['importConfig', [], 'rs:import'],
+  ['exportConfig', [], 'rs:export'],
+  ['getLog', [], 'rs:getLog'],
+  ['getSettings', [], 'rs:getSettings'],
+  ['setOpenAtLogin', [true], 'rs:setOpenAtLogin'],
+  ['setIfaceOverrides', [{ ethernet: 'en5' }], 'rs:setIfaceOverrides'],
+  ['getServiceOrder', [], 'rs:getServiceOrder'],
+  ['copyServiceOrderCommand', [], 'rs:copyServiceOrderCommand'],
+  ['uninstallHelper', [], 'rs:uninstall'],
+  ['openRulesWindow', [], 'rs:openRulesWindow'],
+] as const;
+
 describe('preload', () => {
   it('exposes one object, `rs`, and nothing else', () => {
     expect([...electron.exposed.keys()]).toEqual(['rs']);
   });
 
-  it.each([
-    ['getState', [], 'rs:getState'],
-    ['getConfig', [], 'rs:getConfig'],
-    ['saveRule', [RULE], 'rs:saveRule'],
-    ['deleteRule', [RULE.id], 'rs:deleteRule'],
-    ['toggleRule', [RULE.id, false], 'rs:toggleRule'],
-    ['setEnabled', [true], 'rs:setEnabled'],
-    ['apply', [], 'rs:apply'],
-    ['test', ['10.1.2.3'], 'rs:test'],
-    ['importConfig', [], 'rs:import'],
-    ['exportConfig', [], 'rs:export'],
-    ['getLog', [], 'rs:getLog'],
-    ['getSettings', [], 'rs:getSettings'],
-    ['setOpenAtLogin', [true], 'rs:setOpenAtLogin'],
-    ['setIfaceOverrides', [{ ethernet: 'en5' }], 'rs:setIfaceOverrides'],
-    ['getServiceOrder', [], 'rs:getServiceOrder'],
-    ['copyServiceOrderCommand', [], 'rs:copyServiceOrderCommand'],
-    ['uninstallHelper', [], 'rs:uninstall'],
-  ] as const)('%s is a bare invoke on %s with the arguments unchanged', async (method, args, channel) => {
+  it('every method but the two subscriptions is in INVOKES (a new method cannot go untested)', () => {
+    const invokes = INVOKES.map(([method]) => method as string);
+    expect(Object.keys(rs).filter((key) => key !== 'onState' && key !== 'onLog').sort()).toEqual([...invokes].sort());
+  });
+
+  it.each(INVOKES)('%s is a bare invoke on %s with the arguments unchanged', async (method, args, channel) => {
     const answer = { ok: true, value: method };
     electron.invoke.mockResolvedValueOnce(answer);
     const call = (rs[method] as (...values: unknown[]) => Promise<unknown>)(...args);

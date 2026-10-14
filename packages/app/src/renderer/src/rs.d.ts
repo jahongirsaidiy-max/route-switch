@@ -187,6 +187,12 @@ export interface RsApi {
    * becomes `not-installed`. `disconnected` / `timeout` mean the outcome is unknown.
    */
   uninstallHelper(): Promise<RsResult<UninstallResult>>;
+  /**
+   * Opens the rules window, or brings the open one to the front ("Qoidalarni
+   * boshqarish" of the menu bar window). Main process only: nothing is sent to
+   * the helper. The value is null.
+   */
+  openRulesWindow(): Promise<RsResult<null>>;
 }
 
 /** Channel -> arguments and value of the call behind it. Main and preload are typed against this table. */
@@ -208,6 +214,7 @@ export interface RsInvokeChannels {
   'rs:getServiceOrder': { readonly args: readonly []; readonly value: RsServiceOrder };
   'rs:copyServiceOrderCommand': { readonly args: readonly []; readonly value: RsServiceOrder };
   'rs:uninstall': { readonly args: readonly []; readonly value: UninstallResult };
+  'rs:openRulesWindow': { readonly args: readonly []; readonly value: null };
 }
 
 export type RsInvokeChannel = keyof RsInvokeChannels;

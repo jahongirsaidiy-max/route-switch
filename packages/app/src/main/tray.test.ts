@@ -390,6 +390,18 @@ describe('startShell', () => {
     expect(h.quit).toHaveBeenCalledTimes(1);
   });
 
+  it('"Qoidalarni boshqarish" of the menu bar window (rs:openRulesWindow) opens the same single rules window', async () => {
+    const h = shellHarness();
+    h.tray().click();
+    const handler = h.handlers.get('rs:openRulesWindow') as (event: unknown) => Promise<unknown>;
+    const fromPopover = { senderFrame: { url: `${APP_ENTRY_URL}?view=popover`, parent: null } };
+    expect(await handler(fromPopover)).toEqual({ ok: true, value: null });
+    expect(await handler(fromPopover)).toEqual({ ok: true, value: null });
+    expect(h.windows.map((window) => window.view)).toEqual(['popover', 'rules']);
+    clickItem(h.menuItem('Qoidalarni boshqarish'));
+    expect(h.windows.map((window) => window.view)).toEqual(['popover', 'rules']);
+  });
+
   it('after a window is destroyed the tray opens a new one', () => {
     const h = shellHarness();
     h.tray().click();
