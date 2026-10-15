@@ -48,6 +48,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   of them together; when full, the oldest learned IP makes room.
 - An address an app cached before the proxy started is learned on its next
   lookup.
+- An exact rule for a name under a wildcard (for example `www.example.com` →
+  Wi‑Fi under `*.example.com` → Ethernet) applies to that name's own records.
+  If the name is an alias (CNAME) of another name under the same wildcard,
+  macOS looks the alias target up separately and that lookup follows the
+  target's own rule. Planned fix in 0.3.1.
 - The builds are still signed ad hoc, not with a Developer ID and not
   notarized (see README → Download).
 - Not supported: IPv6 routes, VPN (`utun`) interfaces, per-application
