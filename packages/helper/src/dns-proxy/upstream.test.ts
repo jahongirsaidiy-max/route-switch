@@ -304,6 +304,63 @@ describe('queryUpstream over UDP', () => {
     expect(scheduler.pending()).toBe(0);
   });
 
+  it('waits past 2 s on a single server: a reply at 3.4 s is the answer (Real-Mac 0.3.0)', async () => {
+    const { network, scheduler, outcome, ids } = setup(['10.0.0.1']);
+    scheduler.advance(3400);
+    await flush();
+    expect(network.udpSockets).toHaveLength(1);
+    expect(network.udpSockets[0]?.closed).toBe(false);
+    expect(outcome.value).toBeUndefined();
+    // A spoofed reply is still dropped after the old 2 s mark.
+    network.udpSockets[0]?.deliver(answerFor((ids[0] ?? 0) ^ 1), { address: '10.0.0.1', port: 53 });
+    network.udpSockets[0]?.deliver(answerFor(ids[0] ?? 0), { address: '10.0.0.9', port: 53 });
+    await flush();
+    expect(outcome.value).toBeUndefined();
+    network.udpSockets[0]?.deliver(answerFor(ids[0] ?? 0), { address: '10.0.0.1', port: 53 });
+    await flush();
+    expect(outcome.value?.server).toBe('10.0.0.1');
+    expect(scheduler.pending()).toBe(0);
+  });
+
+  it('gives up on a single silent server at exactly 5 s', async () => {
+    const { network, scheduler, outcome } = setup(['10.0.0.1']);
+    scheduler.advance(4999);
+    await flush();
+    expect(outcome.value).toBeUndefined();
+    scheduler.advance(1);
+    await flush();
+    expect(outcome.value).toBeNull();
+    expect(network.udpSockets).toHaveLength(1);
+    expect(network.udpSockets[0]?.closed).toBe(true);
+    expect(scheduler.pending()).toBe(0);
+  });
+
+  it('with two servers, fails over at 2 s and gives the last one the remaining 3 s', async () => {
+    const { network, scheduler, outcome, ids } = setup(['10.0.0.1', '10.0.0.2']);
+    scheduler.advance(2000);
+    await flush();
+    expect(network.udpSockets[0]?.closed).toBe(true);
+    expect(network.udpSockets).toHaveLength(2);
+    scheduler.advance(2900);
+    await flush();
+    expect(network.udpSockets[1]?.closed).toBe(false);
+    network.udpSockets[1]?.deliver(answerFor(ids[1] ?? 0), { address: '10.0.0.2', port: 53 });
+    await flush();
+    expect(outcome.value?.server).toBe('10.0.0.2');
+    expect(scheduler.pending()).toBe(0);
+  });
+
+  it('with two silent servers, gives up at 5 s', async () => {
+    const { scheduler, outcome } = setup(['10.0.0.1', '10.0.0.2']);
+    scheduler.advance(4999);
+    await flush();
+    expect(outcome.value).toBeUndefined();
+    scheduler.advance(1);
+    await flush();
+    expect(outcome.value).toBeNull();
+    expect(scheduler.pending()).toBe(0);
+  });
+
   it('moves on at once when a send fails or the socket errors', async () => {
     const network = createFakeNetwork();
     network.sendError = 'EHOSTUNREACH';
@@ -399,11 +456,12 @@ describe('queryUpstream over TCP', () => {
     }
   });
 
-  it('times out a silent server after 2 s', async () => {
+  it('gives a single silent server the whole 5 s budget, then times out', async () => {
     const { network, scheduler, outcome } = setup(['10.0.0.1'], 'tcp');
-    scheduler.advance(1999);
+    scheduler.advance(4999);
     await flush();
     expect(network.dialled[0]?.destroyed).toBe(false);
+    expect(outcome.value).toBeUndefined();
     scheduler.advance(1);
     await flush();
     expect(outcome.value).toBeNull();

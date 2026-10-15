@@ -478,6 +478,35 @@ describe('createDnsProxy — answering over UDP', () => {
     expect(harness.scheduler.pending()).toBe(0);
   });
 
+  it('delivers a single slow server reply at 3.4 s and learns it (Real-Mac 0.3.0)', async () => {
+    const harness = await started({ resolveRule: () => ({ kind: 'learn', ruleId: RULE, servers: [UPSTREAM] }) });
+    await sendUdp(harness, query());
+    harness.advanceClock(3_400);
+    await flush();
+    expect(harness.listener().sent).toHaveLength(0);
+    await replyUpstream(harness, (id) => aAnswer(id));
+    await flush();
+    expect(harness.learnCalls).toEqual([{ ruleId: RULE, addresses: ['10.20.0.5'], ttl: 300 }]);
+    const sent = harness.listener().sent;
+    expect(sent).toHaveLength(1);
+    expect(rcodeOf(sent[0]?.data)).toBe(0);
+    expect(sent[0]?.data.readUInt16BE(0)).toBe(0xbeef);
+    expect(harness.scheduler.pending()).toBe(0);
+  });
+
+  it('SERVFAILs a single silent server at 5 s, not 2 s', async () => {
+    const harness = await started({ resolveRule: () => ({ kind: 'learn', ruleId: RULE, servers: [UPSTREAM] }) });
+    await sendUdp(harness, query());
+    harness.advanceClock(4_999);
+    await flush();
+    expect(harness.listener().sent).toHaveLength(0);
+    harness.advanceClock(1);
+    await flush();
+    expect(rcodeOf(harness.listener().sent[0]?.data)).toBe(RCODE_SERVFAIL);
+    expect(harness.learnCalls).toEqual([]);
+    expect(harness.scheduler.pending()).toBe(0);
+  });
+
   it('never passes a reply the parser rejects to the client: SERVFAIL instead', async () => {
     const harness = await started({ resolveRule: () => ({ kind: 'learn', ruleId: RULE, servers: [UPSTREAM] }) });
     await sendUdp(harness, query());
@@ -487,7 +516,10 @@ describe('createDnsProxy — answering over UDP', () => {
       good.writeUInt16BE(2, 6);
       return good;
     });
-    harness.advanceClock(2_000);
+    harness.advanceClock(4_999);
+    await flush();
+    expect(harness.listener().sent).toHaveLength(0);
+    harness.advanceClock(1);
     await flush();
     const sent = harness.listener().sent;
     expect(sent).toHaveLength(1);

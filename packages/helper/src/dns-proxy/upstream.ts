@@ -346,10 +346,12 @@ const tcpAttempt = (server: string, request: UpstreamRequest, timeoutMs: number,
 };
 
 /**
- * Forwards one query: servers in order, each for at most
- * `UPSTREAM_SERVER_TIMEOUT_MS`, all of them within
- * `UPSTREAM_TOTAL_TIMEOUT_MS`. The first accepted reply wins, whatever its
- * RCODE (NXDOMAIN is an answer, not a failure).
+ * Forwards one query: servers in order, all of them within
+ * `UPSTREAM_TOTAL_TIMEOUT_MS`. Every server but the last gets at most
+ * `UPSTREAM_SERVER_TIMEOUT_MS` before failover; the last one keeps waiting
+ * for whatever is left of the total budget (a single slow server that answers
+ * in 3-4 s is still an answer, not a SERVFAIL). The first accepted reply wins,
+ * whatever its RCODE (NXDOMAIN is an answer, not a failure).
  */
 export const queryUpstream = (request: UpstreamRequest, deps: UpstreamDeps): UpstreamCall => {
   let current: Attempt | null = null;
@@ -365,12 +367,16 @@ export const queryUpstream = (request: UpstreamRequest, deps: UpstreamDeps): Ups
 
   const result = (async (): Promise<UpstreamResult | null> => {
     try {
-      for (const server of request.servers) {
+      const last = request.servers.length - 1;
+      for (const [index, server] of request.servers.entries()) {
         if (flags.stopped) break;
+        // The last server has nothing to fail over to: its own timer is the
+        // total budget, which `totalTimer` cuts at the real deadline.
+        const timeoutMs = index === last ? UPSTREAM_TOTAL_TIMEOUT_MS : UPSTREAM_SERVER_TIMEOUT_MS;
         const attempt =
           request.transport === 'udp'
-            ? udpAttempt(server, request, UPSTREAM_SERVER_TIMEOUT_MS, deps)
-            : tcpAttempt(server, request, UPSTREAM_SERVER_TIMEOUT_MS, deps);
+            ? udpAttempt(server, request, timeoutMs, deps)
+            : tcpAttempt(server, request, timeoutMs, deps);
         current = attempt;
         const outcome = await attempt.done;
         current = null;

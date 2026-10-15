@@ -23,7 +23,7 @@ export const MAX_TCP_CONNECTIONS = 16;
 export const TCP_IDLE_MS = 10_000;
 /** Queries read from one TCP connection; the connection is closed on the next one. */
 export const MAX_QUERIES_PER_TCP_CONNECTION = 32;
-/** One upstream server gets this long to answer. */
+/** One upstream server gets this long to answer before failover to the next (the last server waits out the total budget). */
 export const UPSTREAM_SERVER_TIMEOUT_MS = 2_000;
 /** All upstream servers of one query together; then the client gets SERVFAIL. */
 export const UPSTREAM_TOTAL_TIMEOUT_MS = 5_000;
