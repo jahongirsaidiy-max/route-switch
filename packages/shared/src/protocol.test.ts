@@ -41,6 +41,7 @@ import {
   parseRequest,
   parseResult,
   parseServerMessage,
+  type DiagnosePrecedence,
   type ErrorCode,
   type OkResponseOf,
   type ParamsInputOf,
@@ -48,8 +49,9 @@ import {
   type RequestMethod,
   type RequestOf,
   type ResultOf,
+  type RuleReasonCode,
 } from './protocol';
-import { LIMITS, type Config, type ConfigInput } from './schema';
+import { LIMITS, type ClaimPrecedence, type Config, type ConfigInput, type lostClaimCode } from './schema';
 
 const uuid = (n: number): string => `00000000-0000-4000-8000-${n.toString(16).padStart(12, '0')}`;
 const AT = '2026-10-12T08:30:00.000Z';
@@ -201,7 +203,7 @@ describe('constants', () => {
   });
 
   it('pins the protocol version and the closed enumerations', () => {
-    expect(PROTOCOL_VERSION).toBe(3);
+    expect(PROTOCOL_VERSION).toBe(4);
     expect(RULE_STATUSES).toEqual(['active', 'pending', 'error', 'disabled']);
     expect(EVENT_LOG_LEVELS).toEqual(['info', 'warn', 'error']);
     expect(ERROR_CODES).toEqual([
@@ -225,6 +227,7 @@ describe('constants', () => {
       'network-change',
       'dns-refresh',
       'drift-check',
+      'dns-learned',
     ]);
     expect(RULE_REASON_CODES).toEqual([
       'rule-disabled',
@@ -243,6 +246,8 @@ describe('constants', () => {
       'addresses-truncated',
       'overridden-by-rule',
       'dns-server-excluded',
+      'shared-address',
+      'dns-proxy-unavailable',
     ]);
     expect(DNS_WARNING_CODES).toEqual(['other-interface-subnet', 'routed-via-other-interface']);
     expect(DNS_WARNING_SOURCES).toEqual(['interface', 'rule']);
@@ -351,6 +356,14 @@ describe('Request', () => {
     expect(message({ id: 1, method: 'test', target: '127.0.0.1' })).toBe('target: is invalid (loopback)');
     expect(message({ id: 1, method: 'diagnose', target: '127.0.0.1' })).toBe('target: is invalid (loopback)');
     expect(message({ id: 1, method: 'diagnose', target: '*.corp.local' })).toBe('target: is invalid (invalid-domain)');
+    const wildcardRule = (target: string) => ({ id: uuid(1), kind: 'domain', target, iface: 'ethernet' });
+    expect(message({ id: 1, method: 'setConfig', config: { version: 1, rules: [wildcardRule('*.corp.local')] } })).toBe('accepted');
+    for (const target of ['*.com', '*.*.corp.local', 'a.*.corp.local', '*', '*.Corp.local']) {
+      expect(message({ id: 1, method: 'setConfig', config: { version: 1, rules: [wildcardRule(target)] } })).toBe(
+        'config.rules.0.target: is invalid (invalid-wildcard-domain)',
+      );
+    }
+    expect(message({ id: 1, method: 'diagnose', target: '*.com' })).toBe('target: is invalid (invalid-domain)');
     expect(message({ id: 1, method: 'setConfig', config: { version: 1, rules: [], ifaceOverrides: { vpn: 'en5' } } })).toBe(
       'config.ifaceOverrides: has an unknown key',
     );
@@ -1471,5 +1484,18 @@ describe('hostile messages at the size of the line limit', () => {
     }
     const result = parseResult('test', testResultInput({ device: hostile, [hostile]: hostile }));
     expect(result.ok ? 'accepted' : result.error.message).toBe('device: has an invalid format');
+  });
+});
+
+describe('claim helpers (schema.ts) speak the protocol\'s words', () => {
+  it('returns only diagnose precedence codes and rule reason codes', () => {
+    expectTypeOf<ClaimPrecedence>().toExtend<DiagnosePrecedence>();
+    expectTypeOf<ReturnType<typeof lostClaimCode>>().toExtend<RuleReasonCode>();
+    for (const code of ['host-route', 'exact-domain', 'deeper-wildcard', 'config-order'] satisfies ClaimPrecedence[]) {
+      expect(DIAGNOSE_PRECEDENCE_CODES).toContain(code);
+    }
+    for (const code of ['overridden-by-rule', 'shared-address'] satisfies ReturnType<typeof lostClaimCode>[]) {
+      expect(RULE_REASON_CODES).toContain(code);
+    }
   });
 });

@@ -7,12 +7,19 @@ import {
   LIMITS,
   Rule,
   RuleKind,
+  claimOf,
+  claimPrecedence,
+  compareClaim,
   destinationKey,
   findDuplicateIds,
   findIfaceConflicts,
   findOverlaps,
+  lostClaimCode,
+  matchDomainRule,
   normalizeRuleTarget,
   normalizeTarget,
+  wildcardDepth,
+  type AddressClaim,
   type ConfigInput,
   type RuleInput,
 } from './schema';
@@ -187,7 +194,7 @@ describe('Rule', () => {
       expect(Rule.parse(rule({ kind: 'domain', target })).target).toBe(target);
     });
 
-    it.each(['../etc', '.corp.local', '*.corp.local', 'Corp.Local', 'corp.local.', 'corp..local', 'corp/local', '10.0.0.1'])(
+    it.each(['../etc', '.corp.local', 'Corp.Local', 'corp.local.', 'corp..local', 'corp/local', '10.0.0.1'])(
       'rejects %s',
       (target) => {
         expect(issuesOf(Rule.safeParse(rule({ kind: 'domain', target })))).toEqual(['target: custom']);
@@ -198,6 +205,35 @@ describe('Rule', () => {
       const target = `${'a.'.repeat(126)}ab`;
       expect(target).toHaveLength(254);
       expect(issuesOf(Rule.safeParse(rule({ kind: 'domain', target })))).toEqual(['target: too_big']);
+    });
+  });
+
+  describe('wildcard domain target', () => {
+    it.each(['*.example.com', '*.corp.local', '*.a.example.com'])('accepts %s and stores it as typed', (target) => {
+      expect(Rule.parse(rule({ kind: 'domain', target }))).toMatchObject({ kind: 'domain', target });
+    });
+
+    it.each(['*', '*.', '*.com', '**.example.com', '*.*.example.com', 'a.*.example.com', '*example.com', '*.Example.com', '*.example.com.'])(
+      'rejects %s with invalid-wildcard-domain',
+      (target) => {
+        const result = Rule.safeParse(rule({ kind: 'domain', target }));
+        expect(result.success ? [] : result.error.issues).toMatchObject([
+          { path: ['target'], params: { code: 'invalid-wildcard-domain' } },
+        ]);
+      },
+    );
+
+    it('keeps the kind: a wildcard domain never turns into a subnet', () => {
+      expect(normalizeRuleTarget('domain', '*.corp.local')).toEqual({ ok: true, value: { kind: 'domain', target: '*.corp.local' } });
+    });
+
+    it('takes a domain wildcard on an ip / subnet rule as an IP wildcard (refused)', () => {
+      expect(normalizeRuleTarget('ip', '*.corp.local')).toMatchObject({ ok: false, error: { code: 'invalid-wildcard' } });
+      expect(normalizeRuleTarget('subnet', '*.corp.local')).toMatchObject({ ok: false, error: { code: 'invalid-wildcard' } });
+    });
+
+    it('accepts the dns server on a wildcard rule', () => {
+      expect(Rule.parse(rule({ kind: 'domain', target: '*.corp.local', dns: '10.0.0.53' })).dns).toBe('10.0.0.53');
     });
   });
 
@@ -259,10 +295,10 @@ describe('Rule', () => {
       },
     );
 
-    it.each(['*.corp.local', '10.*.*.*', '*'])('still rejects %j in a domain rule as invalid-domain', (target) => {
+    it.each(['10.*.*.*', '*'])('rejects the IP wildcard %j in a domain rule as invalid-wildcard-domain', (target) => {
       const result = Rule.safeParse(rule({ kind: 'domain', target }));
       expect(result.success ? [] : result.error.issues).toMatchObject([
-        { code: 'custom', path: ['target'], params: { code: 'invalid-domain' } },
+        { code: 'custom', path: ['target'], params: { code: 'invalid-wildcard-domain' } },
       ]);
     });
   });
@@ -372,7 +408,8 @@ describe('normalizeTarget', () => {
     const codeOf = (result: ReturnType<typeof normalizeTarget>) => (result.ok ? null : result.error.code);
     expect(codeOf(normalizeTarget('ip', '192.*.1.*'))).toBe('invalid-wildcard');
     expect(codeOf(normalizeTarget('subnet', '224.*.*.*'))).toBe('multicast');
-    expect(codeOf(normalizeTarget('domain', '*.corp.local'))).toBe('invalid-domain');
+    expect(codeOf(normalizeTarget('domain', '*.com'))).toBe('invalid-wildcard-domain');
+    expect(normalizeTarget('domain', '*.corp.local')).toEqual({ ok: true, value: '*.corp.local' });
   });
 });
 
@@ -603,6 +640,29 @@ describe('Config', () => {
       expect(issuesOf(result)).toEqual(['rules.1.target: custom']);
     });
 
+    it('takes a wildcard and its base as two targets', () => {
+      const result = Config.safeParse(
+        config([
+          rule({ kind: 'domain', target: '*.example.com' }),
+          rule({ id: uuid(2), kind: 'domain', target: 'example.com', iface: 'wifi' }),
+          rule({ id: uuid(3), kind: 'domain', target: '*.a.example.com', iface: 'wifi' }),
+        ]),
+      );
+      expect(result.success).toBe(true);
+    });
+
+    it('rejects the same wildcard bound to two interfaces', () => {
+      const result = Config.safeParse(
+        config([
+          rule({ kind: 'domain', target: '*.example.com' }),
+          rule({ id: uuid(2), kind: 'domain', target: '*.example.com', iface: 'wifi' }),
+        ]),
+      );
+      expect(result.success ? [] : result.error.issues).toMatchObject([
+        { path: ['rules', 1, 'target'], params: { code: 'iface-conflict', first: 0, second: 1 } },
+      ]);
+    });
+
     it('rejects the conflict even when one of the rules is disabled', () => {
       const result = Config.safeParse(config([rule({ enabled: false }), rule({ id: uuid(2), iface: 'wifi' })]));
       expect(result.success).toBe(false);
@@ -684,6 +744,17 @@ describe('findIfaceConflicts', () => {
     ).toEqual([{ first: 0, second: 1 }]);
   });
 
+  it('keeps a wildcard apart from its base and pairs two equal wildcards', () => {
+    expect(
+      findIfaceConflicts([
+        { kind: 'domain', target: '*.example.com', iface: 'ethernet' },
+        { kind: 'domain', target: 'example.com', iface: 'wifi' },
+        { kind: 'domain', target: '*.example.com', iface: 'wifi' },
+        { kind: 'domain', target: '*.example.com', iface: 'ethernet' },
+      ]),
+    ).toEqual([{ first: 0, second: 2 }]);
+  });
+
   it('skips rules with an invalid target', () => {
     expect(
       findIfaceConflicts([
@@ -749,5 +820,141 @@ describe('findOverlaps', () => {
     const [overlap] = findOverlaps(parsed.rules);
     expect(overlap?.wider.id).toBe(uuid(1));
     expect(overlap?.narrower.id).toBe(uuid(2));
+  });
+});
+
+describe('matchDomainRule', () => {
+  type R = { readonly id: string; readonly kind: 'ip' | 'subnet' | 'domain'; readonly target: string; readonly enabled: boolean };
+  const d = (id: string, target: string, enabled = true): R => ({ id, kind: 'domain', target, enabled });
+  const idOf = (name: string, rules: readonly R[]): string | null => matchDomainRule(name, rules)?.rule.id ?? null;
+
+  const rules: readonly R[] = [
+    { id: 'net', kind: 'subnet', target: '10.0.0.0/8', enabled: true },
+    d('wild', '*.example.com'),
+    d('deep', '*.a.example.com'),
+    d('exact', 'b.example.com'),
+    d('apex', 'example.com'),
+    d('off', '*.c.example.com', false),
+    d('off-exact', 'x.example.com', false),
+  ];
+
+  it.each([
+    ['foo.example.com', 'wild'],
+    ['a.b.c.example.com', 'wild'],
+    ['a.example.com', 'wild'],
+    ['x.a.example.com', 'deep'],
+    ['y.x.a.example.com', 'deep'],
+    ['b.example.com', 'exact'],
+    ['z.b.example.com', 'wild'],
+    ['example.com', 'apex'],
+    ['q.c.example.com', 'wild'],
+    ['x.example.com', 'wild'],
+    ['FOO.Example.COM.', 'wild'],
+    ['B.EXAMPLE.COM', 'exact'],
+    ['Example.Com.', 'apex'],
+    ['other.org', null],
+    ['notexample.com', null],
+    ['fooexample.com', null],
+    ['example.com.evil', null],
+    ['', null],
+    ['*.example.com', null],
+    ['_sip.example.com', null],
+  ])('%s → %s', (name, id) => {
+    expect(idOf(name, rules)).toBe(id);
+  });
+
+  it('never lets *.B match B itself', () => {
+    expect(matchDomainRule('example.com', [d('w', '*.example.com')])).toBeNull();
+    expect(matchDomainRule('example.com.', [d('w', '*.example.com')])).toBeNull();
+    expect(matchDomainRule('a.example.com', [d('w', '*.a.example.com')])).toBeNull();
+  });
+
+  it('reports how the rule matched and where it is', () => {
+    expect(matchDomainRule('b.example.com', rules)).toEqual({ rule: rules[3], index: 3, via: 'domain' });
+    expect(matchDomainRule('x.a.example.com', rules)).toEqual({ rule: rules[2], index: 2, via: 'wildcard' });
+  });
+
+  it('prefers the exact rule even when it comes after the wildcard', () => {
+    expect(idOf('b.example.com', [d('w', '*.example.com'), d('e', 'b.example.com')])).toBe('e');
+    expect(idOf('b.example.com', [d('e', 'b.example.com'), d('w', '*.example.com')])).toBe('e');
+  });
+
+  it('prefers the deepest base whatever the config order', () => {
+    expect(idOf('x.a.example.com', [d('deep', '*.a.example.com'), d('wild', '*.example.com')])).toBe('deep');
+    expect(idOf('x.a.example.com', [d('wild', '*.example.com'), d('deep', '*.a.example.com')])).toBe('deep');
+  });
+
+  it('takes the earlier of two equal wildcards', () => {
+    expect(idOf('x.example.com', [d('first', '*.example.com'), d('second', '*.example.com')])).toBe('first');
+  });
+
+  it('skips disabled rules, ip / subnet rules and invalid targets', () => {
+    expect(idOf('x.example.com', [d('off', '*.example.com', false)])).toBeNull();
+    expect(idOf('x.example.com', [d('off', 'x.example.com', false), d('on', '*.example.com')])).toBe('on');
+    expect(idOf('x.example.com', [{ id: 'ip', kind: 'ip', target: 'x.example.com', enabled: true }])).toBeNull();
+    expect(idOf('x.example.com', [d('bad', '*.com'), d('bad2', 'a.*.example.com'), d('bad3', '*.*.example.com')])).toBeNull();
+  });
+
+  it('returns null for no rules', () => {
+    expect(matchDomainRule('x.example.com', [])).toBeNull();
+  });
+});
+
+describe('wildcardDepth', () => {
+  it.each([
+    ['*.example.com', 2],
+    ['*.a.example.com', 3],
+    ['example.com', 0],
+    ['*.com', 0],
+    ['10.0.0.0/8', 0],
+  ])('%s → %d', (target, depth) => {
+    expect(wildcardDepth(target)).toBe(depth);
+  });
+});
+
+describe('claim precedence', () => {
+  const explicit = (order: number): AddressClaim => ({ kind: 'explicit', depth: 0, order });
+  const exact = (order: number): AddressClaim => ({ kind: 'exact-domain', depth: 0, order });
+  const wildcard = (depth: number, order: number): AddressClaim => ({ kind: 'wildcard', depth, order });
+
+  it('classifies a rule claim', () => {
+    expect(claimOf({ kind: 'ip', target: '10.0.0.1' }, false, 4)).toEqual(explicit(4));
+    expect(claimOf({ kind: 'subnet', target: '10.0.0.1/32' }, false, 0)).toEqual(explicit(0));
+    expect(claimOf({ kind: 'domain', target: 'corp.local' }, true, 2)).toEqual(explicit(2));
+    expect(claimOf({ kind: 'domain', target: '*.corp.local' }, true, 2)).toEqual(explicit(2));
+    expect(claimOf({ kind: 'domain', target: 'corp.local' }, false, 1)).toEqual(exact(1));
+    expect(claimOf({ kind: 'domain', target: '*.a.corp.local' }, false, 3)).toEqual(wildcard(3, 3));
+  });
+
+  // Winner first: [winner, loser, precedence code].
+  it.each<[string, AddressClaim, AddressClaim, string]>([
+    ['explicit beats exact domain, even when later', explicit(9), exact(0), 'host-route'],
+    ['explicit beats a wildcard, even when later', explicit(9), wildcard(5, 0), 'host-route'],
+    ['exact domain beats a deeper, earlier wildcard', exact(9), wildcard(9, 0), 'exact-domain'],
+    ['deeper wildcard beats shallower, even when later', wildcard(3, 9), wildcard(2, 0), 'deeper-wildcard'],
+    ['equal wildcards: the earlier', wildcard(2, 1), wildcard(2, 2), 'config-order'],
+    ['two exact domains: the earlier', exact(0), exact(1), 'config-order'],
+    ['two explicit: the earlier', explicit(0), explicit(1), 'config-order'],
+  ])('%s', (_label, winner, loser, code) => {
+    expect(compareClaim(winner, loser)).toBeLessThan(0);
+    expect(compareClaim(loser, winner)).toBeGreaterThan(0);
+    expect(claimPrecedence(winner, loser)).toBe(code);
+  });
+
+  it('ignores depth outside wildcards', () => {
+    expect(compareClaim({ kind: 'exact-domain', depth: 5, order: 1 }, { kind: 'exact-domain', depth: 1, order: 0 })).toBeGreaterThan(0);
+    expect(compareClaim({ kind: 'explicit', depth: 5, order: 1 }, { kind: 'explicit', depth: 1, order: 0 })).toBeGreaterThan(0);
+  });
+
+  it('is 0 for the same claim and sorts winner first', () => {
+    expect(compareClaim(wildcard(2, 1), wildcard(2, 1))).toBe(0);
+    const claims = [wildcard(2, 0), exact(3), wildcard(4, 5), explicit(7), wildcard(4, 1), exact(1)];
+    expect([...claims].sort(compareClaim)).toEqual([explicit(7), exact(1), exact(3), wildcard(4, 1), wildcard(4, 5), wildcard(2, 0)]);
+  });
+
+  it('names the warning a losing wildcard carries', () => {
+    expect(lostClaimCode(explicit(0))).toBe('overridden-by-rule');
+    expect(lostClaimCode(exact(0))).toBe('shared-address');
+    expect(lostClaimCode(wildcard(3, 0))).toBe('shared-address');
   });
 });

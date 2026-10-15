@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 
-import { LAUNCHD_LABEL, LAUNCHD_SERVICE_TARGET, PATHS, RESOLVER_MARKER } from './paths';
+import { DNS_PROXY, LAUNCHD_LABEL, LAUNCHD_SERVICE_TARGET, PATHS, RESOLVER_MARKER } from './paths';
 
 describe('paths', () => {
   it('matches the file locations of the design document', () => {
@@ -37,5 +37,12 @@ describe('paths', () => {
     expect(LAUNCHD_SERVICE_TARGET).toBe('system/com.routeswitch.helper');
     expect(RESOLVER_MARKER).toBe('# managed-by: routeswitch');
     expect(RESOLVER_MARKER).not.toContain('\n');
+  });
+
+  it('puts the DNS proxy on loopback, on a privileged port that is not 53 (ADR-002)', () => {
+    expect(DNS_PROXY).toEqual({ address: '127.0.0.1', port: 954 });
+    expect(DNS_PROXY.port).toBeLessThan(1024);
+    expect(DNS_PROXY.port).not.toBe(53);
+    expect(Object.isFrozen(DNS_PROXY)).toBe(true);
   });
 });

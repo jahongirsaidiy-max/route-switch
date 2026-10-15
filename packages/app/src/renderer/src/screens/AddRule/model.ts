@@ -13,6 +13,7 @@ import {
   Rule,
   destinationKey,
   isIpWildcard,
+  isWildcardDomain,
   normalizeHostAddress,
   normalizeRuleTarget,
   parseIpv4Destination,
@@ -152,7 +153,7 @@ function fieldText(field: FormField, issue: IssueLike, input: string, i18n: I18n
   const validation = i18n.t.validation;
   const words = i18n.t.addRule.errors;
   if (field === 'target') {
-    if (code === 'invalid-domain') return domainText(input, i18n);
+    if (code === 'invalid-domain' || code === 'invalid-wildcard-domain') return domainText(input, i18n);
     if (isValidationCode(code)) return validation[code];
     if (issue.code === 'too_small') return words.targetEmpty;
     if (issue.code === 'too_big') return words.targetLong;
@@ -224,12 +225,19 @@ export function checkForm(form: RuleForm, id: string, config: Config | null, i18
     if (errors.target === undefined && !target.ok && typedTarget !== '') {
       errors.target = fieldText('target', { code: 'custom', path: ['target'], params: { code: target.error.code } }, typedTarget, i18n);
     }
+    // A wildcard domain passes the shared check but the form still refuses it (see below).
+    if (errors.target === undefined && form.kind === 'domain' && isWildcardDomain(typedTarget)) errors.target = words.wildcardDomain;
     // A refusal on a field the form does not show (the id) still blocks the save.
     const blocked = Object.keys(errors).length === 0;
     return { rule: null, errors, formError: blocked ? words.invalidRule : null, normalisedTarget, wildcardCidr, sameAs: null };
   }
 
   const rule = parsed.data;
+  // The shared schema accepts `*.corp.local` since protocol 4 (ADR-002); the form offers it only
+  // once the helper routes it (TASK-DELTA-29), so until then it is refused here as before.
+  if (rule.kind === 'domain' && isWildcardDomain(rule.target)) {
+    return { rule: null, errors: { target: words.wildcardDomain }, formError: null, normalisedTarget: null, wildcardCidr, sameAs: null };
+  }
   let formError: string | null = null;
   let sameAs: string | null = null;
 

@@ -18,6 +18,7 @@ export type ValidationCode =
   | 'prefix-too-wide'
   | 'invalid-domain'
   | 'invalid-wildcard'
+  | 'invalid-wildcard-domain'
   | 'invalid-destination'
   | 'default-route'
   | 'this-network'
@@ -93,9 +94,11 @@ const MESSAGES: Record<ValidationCode, string> = {
   'invalid-prefix': `Subnet prefix must be a number between ${String(MIN_SUBNET_PREFIX)} and ${String(IPV4_BITS)}`,
   'prefix-too-wide': `Subnet is too wide: the prefix must be between ${String(MIN_SUBNET_PREFIX)} and ${String(IPV4_BITS)}`,
   'invalid-domain':
-    'Must be a lower-case domain name (a-z, 0-9, "-" and "." only), e.g. corp.local; wildcards are not supported',
+    'Must be a lower-case domain name (a-z, 0-9, "-" and "." only), e.g. corp.local',
   'invalid-wildcard':
     'A wildcard must be four dot-separated parts with "*" only in the trailing parts, e.g. 10.*.*.* or 192.168.5.*',
+  'invalid-wildcard-domain':
+    'A wildcard domain must be "*." followed by a lower-case domain of at least two labels, e.g. *.corp.local',
   'invalid-destination': 'Must be an IPv4 address or an IPv4 subnet in CIDR form',
   'default-route': 'The default route (0.0.0.0/0) must never be changed',
   'this-network': '"This network" addresses (0.0.0.0/8) must never be routed',
@@ -310,6 +313,71 @@ export const normalizeDomain = (input: string): Normalised => {
   if (lastLabel === undefined || NUMERIC_LABEL.test(lastLabel)) return fail('invalid-domain');
 
   return ok(input);
+};
+
+/** What starts a wildcard domain target: `*.example.com` stands for every subdomain of `example.com`. */
+export const DOMAIN_WILDCARD_PREFIX = '*.';
+/**
+ * The fewest labels the base of a wildcard domain may have. `*.com` or
+ * `*.local` would send every name under a top-level domain through the DNS
+ * proxy and one interface (and `/etc/resolver/local` would take over all of
+ * Bonjour), so the base needs at least two labels (`*.corp.local`). There is
+ * no public-suffix list (no dependency): `*.co.uk` passes, by the same rule.
+ */
+export const MIN_WILDCARD_BASE_LABELS = 2;
+
+/** True when a domain input is meant as a wildcard: it contains `*` anywhere. Says nothing about validity. */
+export const isWildcardDomain = (input: string): boolean => input.includes('*');
+
+/**
+ * Validates a wildcard domain (ADR-002): exactly one leading `*.` and then a
+ * base that `normalizeDomain` accepts, with at least
+ * `MIN_WILDCARD_BASE_LABELS` labels, the whole at most 253 characters. It
+ * covers the subdomains of the base only, never the base itself.
+ *
+ * Everything else is `invalid-wildcard-domain`: a bare `*` or `*.`, a `*`
+ * that is not a whole leading label (`*example.com`, `**.example.com`), a
+ * second `*` anywhere (`*.*.example.com`, `a.*.example.com`), a one-label
+ * base (`*.com`) and a base that is not a valid domain (upper case, a
+ * trailing dot, `_`). Nothing is rewritten.
+ */
+export const normalizeWildcardDomain = (input: string): Normalised => {
+  if (input.length > MAX_DOMAIN_LENGTH || !input.startsWith(DOMAIN_WILDCARD_PREFIX)) return fail('invalid-wildcard-domain');
+  const base = input.slice(DOMAIN_WILDCARD_PREFIX.length);
+  // `normalizeDomain` refuses any `*` in the base (its character set has none).
+  if (!normalizeDomain(base).ok) return fail('invalid-wildcard-domain');
+  if (base.split('.').length < MIN_WILDCARD_BASE_LABELS) return fail('invalid-wildcard-domain');
+  return ok(input);
+};
+
+/** The base of a valid wildcard domain (`*.corp.local` → `corp.local`), or null for anything else. */
+export const wildcardBase = (target: string): string | null =>
+  normalizeWildcardDomain(target).ok ? target.slice(DOMAIN_WILDCARD_PREFIX.length) : null;
+
+/**
+ * A domain rule target: a wildcard (`*.corp.local`, see
+ * `normalizeWildcardDomain`) when it holds a `*`, an exact name
+ * (`normalizeDomain`) otherwise. `normalizeDomain` itself never accepts a
+ * `*`: resolver file names, lookups and diagnostics are always one concrete
+ * name.
+ */
+export const normalizeDomainTarget = (input: string): Normalised =>
+  isWildcardDomain(input) ? normalizeWildcardDomain(input) : normalizeDomain(input);
+
+/**
+ * A name as it arrives in a DNS question or is typed for a lookup, folded to
+ * the form rule targets use: lower case (DNS names compare without regard to
+ * ASCII case) and without one trailing dot (the root). Null when the result
+ * is not a valid exact domain (`normalizeDomain`), so a `*`, `_service`
+ * labels or an empty name never match a rule.
+ */
+export const normalizeQueryName = (name: string): string | null => {
+  if (name.length > MAX_DOMAIN_LENGTH + 1) return null;
+  // ASCII-only folding: `toLowerCase` would map non-ASCII letters (e.g. `İ`) into ASCII ones.
+  const folded = name.replace(/[A-Z]/g, (letter) => letter.toLowerCase());
+  const bare = folded.endsWith('.') ? folded.slice(0, -1) : folded;
+  const result = normalizeDomain(bare);
+  return result.ok ? result.value : null;
 };
 
 /**

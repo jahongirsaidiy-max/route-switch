@@ -124,6 +124,8 @@ export const en: Messages = {
     'addresses-truncated': 'Too many addresses — only some are routed',
     'overridden-by-rule': 'Some addresses are routed through another interface by another rule',
     'dns-server-excluded': 'Some addresses are DNS servers and are not routed',
+    'shared-address': 'Some learned addresses are routed through another interface by a more specific domain rule',
+    'dns-proxy-unavailable': 'The DNS proxy for wildcard domains is not running',
   },
 
   reconcileReason: {
@@ -134,6 +136,7 @@ export const en: Messages = {
     'network-change': 'when the network changed',
     'dns-refresh': 'when DNS was refreshed',
     'drift-check': 'during a periodic check',
+    'dns-learned': 'when a wildcard domain was resolved',
   },
 
   validation: {
@@ -143,6 +146,7 @@ export const en: Messages = {
     'prefix-too-wide': `The subnet is too wide: the prefix must be at least /${String(MIN_SUBNET_PREFIX)}.`,
     'invalid-domain': 'A domain may contain only lowercase Latin letters, digits, “-” and “.”, e.g. corp.local.',
     'invalid-wildcard': 'A wildcard “*” may stand only in the last octets, e.g. 10.*.*.* or 192.168.5.*.',
+    'invalid-wildcard-domain': 'A wildcard domain is “*.” followed by a domain of at least two parts, e.g. *.corp.local.',
     'invalid-destination': 'Enter an IPv4 address or a subnet in CIDR form.',
     'default-route': 'The default route (0.0.0.0/0) is never changed.',
     'this-network': '0.0.0.0/8 addresses are never routed.',

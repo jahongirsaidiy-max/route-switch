@@ -1,21 +1,28 @@
 import { describe, expect, it } from 'vitest';
 
 import {
+  DOMAIN_WILDCARD_PREFIX,
   FORBIDDEN_RANGES,
   MAX_DOMAIN_LENGTH,
   MIN_SUBNET_PREFIX,
+  MIN_WILDCARD_BASE_LABELS,
   cidrContains,
   cidrsOverlap,
   forbiddenDestinationReason,
   isForbiddenDestination,
   normalizeCidr,
   normalizeDomain,
+  normalizeDomainTarget,
   normalizeHostAddress,
   normalizeIpv4,
+  normalizeQueryName,
   normalizeSubnet,
+  normalizeWildcardDomain,
   isIpWildcard,
+  isWildcardDomain,
   parseIpWildcard,
   parseIpv4Destination,
+  wildcardBase,
   type Normalised,
 } from './cidr';
 
@@ -402,6 +409,143 @@ describe('normalizeDomain', () => {
     ['URL', 'https://corp.local'],
   ])('rejects %s', (_label, input) => {
     expect(codeOf(normalizeDomain(input))).toBe('invalid-domain');
+  });
+});
+
+describe('normalizeWildcardDomain', () => {
+  const label63 = 'a'.repeat(63);
+  /** A wildcard of exactly `length` characters: `*.` + a valid base. */
+  const wildcardOfLength = (length: number): string =>
+    `*.${label63}.${label63}.${label63}.${'a'.repeat(length - 2 - 3 * 64)}`;
+
+  it('pins the prefix and the minimum base depth', () => {
+    expect(DOMAIN_WILDCARD_PREFIX).toBe('*.');
+    expect(MIN_WILDCARD_BASE_LABELS).toBe(2);
+  });
+
+  it.each([
+    '*.example.com',
+    '*.corp.local',
+    '*.a.example.com',
+    '*.a-b.example-1.org',
+    '*.xn--80ak6aa92e.com',
+    '*.co.uk',
+    `*.${label63}.com`,
+    wildcardOfLength(MAX_DOMAIN_LENGTH),
+  ])('accepts %s unchanged', (input) => {
+    expect(valueOf(normalizeWildcardDomain(input))).toBe(input);
+    expect(valueOf(normalizeDomainTarget(input))).toBe(input);
+  });
+
+  it.each([
+    ['bare star', '*'],
+    ['star and dot', '*.'],
+    ['empty', ''],
+    ['no star', 'example.com'],
+    ['double star label', '**.example.com'],
+    ['two wildcard labels', '*.*.example.com'],
+    ['star inside the name', 'a.*.example.com'],
+    ['star glued to a label', '*example.com'],
+    ['star at the end', 'example.*'],
+    ['partial label wildcard', 'a*.example.com'],
+    ['star after the base', '*.example.com.*'],
+    ['one-label base (TLD)', '*.com'],
+    ['one-label base (.local)', '*.local'],
+    ['numeric last label', '*.corp.123'],
+    ['IPv4 base', '*.10.0.0.1'],
+    ['upper case base', '*.Example.com'],
+    ['trailing dot', '*.example.com.'],
+    ['leading dot', '.*.example.com'],
+    ['dot after the star missing a label', '*..example.com'],
+    ['underscore', '*.my_host.example.com'],
+    ['space', '* .example.com'],
+    ['trailing newline', '*.example.com\n'],
+    ['NUL byte', '*.example.com\u0000'],
+    ['non-ASCII base', '*.café.com'],
+    ['full-width star', '＊.example.com'],
+    ['slash', '*.corp/local.com'],
+    ['path traversal', '*./../etc'],
+    ['label of 64 characters', `*.${'a'.repeat(64)}.com`],
+    ['label ending with a hyphen', '*.corp-.local'],
+    ['more than 253 characters', wildcardOfLength(MAX_DOMAIN_LENGTH + 1)],
+  ])('rejects %s', (_label, input) => {
+    expect(codeOf(normalizeWildcardDomain(input))).toBe('invalid-wildcard-domain');
+  });
+
+  it('measures the length with the prefix: a base of 252 characters is valid alone, not behind "*."', () => {
+    const input = wildcardOfLength(MAX_DOMAIN_LENGTH + 1);
+    expect(normalizeDomain(input.slice(2)).ok).toBe(true);
+    expect(normalizeWildcardDomain(input).ok).toBe(false);
+  });
+});
+
+describe('normalizeDomainTarget', () => {
+  it('takes an exact name through normalizeDomain', () => {
+    expect(valueOf(normalizeDomainTarget('corp.local'))).toBe('corp.local');
+    expect(valueOf(normalizeDomainTarget('intranet'))).toBe('intranet');
+    expect(codeOf(normalizeDomainTarget('Corp.Local'))).toBe('invalid-domain');
+    expect(codeOf(normalizeDomainTarget('../etc'))).toBe('invalid-domain');
+  });
+
+  it('takes anything with a star through the wildcard rules', () => {
+    expect(valueOf(normalizeDomainTarget('*.corp.local'))).toBe('*.corp.local');
+    expect(codeOf(normalizeDomainTarget('a.*.corp.local'))).toBe('invalid-wildcard-domain');
+    expect(codeOf(normalizeDomainTarget('*'))).toBe('invalid-wildcard-domain');
+    expect(codeOf(normalizeDomainTarget('*.com'))).toBe('invalid-wildcard-domain');
+  });
+
+  it('never lets normalizeDomain accept a wildcard (resolver file names, lookups)', () => {
+    expect(codeOf(normalizeDomain('*.corp.local'))).toBe('invalid-domain');
+  });
+});
+
+describe('isWildcardDomain / wildcardBase', () => {
+  it.each([
+    ['*.example.com', true, 'example.com'],
+    ['*.a.example.com', true, 'a.example.com'],
+    ['a.*.example.com', true, null],
+    ['*.com', true, null],
+    ['*', true, null],
+    ['example.com', false, null],
+    ['', false, null],
+  ])('%s', (input, wildcard, base) => {
+    expect(isWildcardDomain(input)).toBe(wildcard);
+    expect(wildcardBase(input)).toBe(base);
+  });
+});
+
+describe('normalizeQueryName', () => {
+  it.each([
+    ['foo.example.com', 'foo.example.com'],
+    ['FOO.Example.COM', 'foo.example.com'],
+    ['foo.example.com.', 'foo.example.com'],
+    ['Foo.Example.Com.', 'foo.example.com'],
+    ['intranet', 'intranet'],
+  ])('folds %s to %s', (input, folded) => {
+    expect(normalizeQueryName(input)).toBe(folded);
+  });
+
+  it.each([
+    ['empty', ''],
+    ['root only', '.'],
+    ['two trailing dots', 'foo.example.com..'],
+    ['leading dot', '.foo.example.com'],
+    ['wildcard', '*.example.com'],
+    ['underscore (SRV)', '_ldap._tcp.example.com'],
+    ['non-ASCII', 'café.example.com'],
+    ['dotted I folds only in ASCII', 'İ.example.com'],
+    ['IPv4 address', '10.0.0.1'],
+    ['space', 'foo .example.com'],
+  ])('rejects %s', (_label, input) => {
+    expect(normalizeQueryName(input)).toBeNull();
+  });
+
+  it('accepts 253 characters plus the root dot, nothing longer', () => {
+    const name = `${'a'.repeat(63)}.${'a'.repeat(63)}.${'a'.repeat(63)}.${'a'.repeat(61)}`;
+    expect(name).toHaveLength(MAX_DOMAIN_LENGTH);
+    expect(normalizeQueryName(`${name}.`)).toBe(name);
+    expect(normalizeQueryName(`${name}a.`)).toBeNull();
+    expect(normalizeQueryName(`${name}..`)).toBeNull();
   });
 });
 

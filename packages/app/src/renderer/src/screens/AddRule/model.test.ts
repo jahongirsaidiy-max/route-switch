@@ -225,6 +225,14 @@ describe('IP wildcard (TASK-DELTA-15) — the shared normaliser decides, the for
     expect(check({ kind: 'domain', target: '*.corp.local' }).errors.target).toBe(WILDCARD_TEXT);
     expect(acceptedValues(form({ kind: 'domain', target: '*.corp.local' })).kind).toBe('domain');
   });
+
+  it('refuses every domain wildcard, valid for the shared schema or not, until the helper routes them (TASK-DELTA-29)', () => {
+    for (const target of ['*.corp.local', '*.a.corp.local', '*.com', 'a.*.corp.local', '*', '*.Corp.local']) {
+      const result = check({ kind: 'domain', target });
+      expect(result.errors.target).toBe(WILDCARD_TEXT);
+      expect(result.rule).toBeNull();
+    }
+  });
 });
 
 describe('acceptedValues', () => {

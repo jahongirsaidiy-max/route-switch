@@ -160,6 +160,8 @@ export const uz = {
     'addresses-truncated': "Manzillar juda ko'p — faqat bir qismi yo'naltirildi",
     'overridden-by-rule': "Ba'zi manzillar boshqa qoida orqali boshqa interfeysga yo'naltirilgan",
     'dns-server-excluded': "Ba'zi manzillar DNS server — ular yo'naltirilmaydi",
+    'shared-address': "O'rganilgan ba'zi manzillar aniqroq domen qoidasi bilan boshqa interfeys orqali yo'naltirilgan",
+    'dns-proxy-unavailable': 'Wildcard domenlar uchun DNS proxy ishlamayapti',
   } satisfies Readonly<Record<RuleReasonCode, string>>,
 
   /** What triggered the last reconcile, as the end of "Oxirgi qo'llash: 10:58 · …". */
@@ -171,6 +173,7 @@ export const uz = {
     'network-change': "tarmoq o'zgarganda",
     'dns-refresh': 'DNS yangilanganda',
     'drift-check': 'davriy tekshiruvda',
+    'dns-learned': 'wildcard domen resolve qilinganda',
   } satisfies Readonly<Record<ReconcileReason, string>>,
 
   /** One sentence per code of the shared validators. */
@@ -181,6 +184,7 @@ export const uz = {
     'prefix-too-wide': `Subnet juda keng: prefiks kamida /${String(MIN_SUBNET_PREFIX)} bo'lishi kerak.`,
     'invalid-domain': "Domen faqat kichik lotin harflari, raqamlar, «-» va «.» dan iborat bo'ladi, masalan corp.local.",
     'invalid-wildcard': "Wildcard'da «*» faqat oxirgi oktetlarda bo'ladi, masalan 10.*.*.* yoki 192.168.5.*.",
+    'invalid-wildcard-domain': "Wildcard domen — «*.» va kamida ikki qismli domen, masalan *.corp.local.",
     'invalid-destination': 'IPv4 manzil yoki CIDR subnet kiriting.',
     'default-route': "Default route (0.0.0.0/0) hech qachon o'zgartirilmaydi.",
     'this-network': '0.0.0.0/8 manzillari route qilinmaydi.',

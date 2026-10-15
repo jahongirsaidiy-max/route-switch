@@ -44,3 +44,13 @@ export const PATHS = {
 } as const;
 
 export type PathName = keyof typeof PATHS;
+
+/**
+ * The helper's loopback DNS forwarding proxy for wildcard domain rules
+ * (ADR-002). Port 954 is below 1024, so only root can bind it: while the
+ * helper restarts, no ordinary process can take the port and answer for the
+ * wildcard domains. Never 53 (local DNS servers, Internet Sharing). Written as
+ * `nameserver` + `port` into `/etc/resolver/<base>` of every enabled wildcard
+ * rule.
+ */
+export const DNS_PROXY = Object.freeze({ address: '127.0.0.1', port: 954 } as const);

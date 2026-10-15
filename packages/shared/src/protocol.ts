@@ -52,9 +52,12 @@ import { Config, DEVICE_NAME, IfaceRole, LIMITS, findDuplicateIds } from './sche
  * codes (TASK-DELTA-07). `3` — the read-only `diagnose` method,
  * `EngineState.dnsWarnings` (TASK-DELTA-17) and the `rate-limited` / `busy`
  * error codes of `diagnose`'s limits (TASK-DELTA-21; added before 0.2.0
- * shipped, so still `3`) — release 0.2.0.
+ * shipped, so still `3`) — release 0.2.0. `4` — wildcard domain rules
+ * (`*.corp.local`, ADR-002): the `shared-address` and `dns-proxy-unavailable`
+ * rule reason codes and the `dns-learned` reconcile reason
+ * (TASK-DELTA-24) — release 0.3.0.
  */
-export const PROTOCOL_VERSION = 3;
+export const PROTOCOL_VERSION = 4;
 
 /** Size bounds that keep every message serialisable within `MAX_LINE_BYTES`. */
 export const PROTOCOL_LIMITS = {
@@ -201,13 +204,17 @@ export type RuleStatus = z.infer<typeof RuleStatus>;
  *           gateway or the own address of an interface, so no route is added),
  *           `route-failed` (`route add` failed), `resolver-conflict` (an
  *           `/etc/resolver` file exists that is not ours), `resolver-failed`
- *           (writing the resolver file failed), `internal`.
+ *           (writing the resolver file failed), `dns-proxy-unavailable` (a
+ *           wildcard rule: the helper's DNS proxy cannot listen, so its
+ *           resolver file is not written), `internal`.
  * active:   warnings on a domain rule that works but not for every resolved
  *           address, in this order of precedence (the first that applies is
  *           the code, `reason` counts them all): `overridden-by-rule` (an
  *           address is routed by an explicit `ip` / `/32` rule or as the DNS
  *           server of another rule, through another interface),
- *           `dns-server-excluded` (an address is a DNS server and never
+ *           `shared-address` (a wildcard rule: an address it learned is
+ *           routed for an exact domain rule or a deeper wildcard, through
+ *           another interface; ADR-002 §3), `dns-server-excluded` (an address is a DNS server and never
  *           routed), `addresses-truncated` (more A records than the
  *           per-domain limit). With no address routed at all the rule is
  *           `error`, and any real error wins over a warning.
@@ -229,6 +236,8 @@ export const RULE_REASON_CODES = [
   'addresses-truncated',
   'overridden-by-rule',
   'dns-server-excluded',
+  'shared-address',
+  'dns-proxy-unavailable',
 ] as const;
 export const RuleReasonCode = z.enum(RULE_REASON_CODES);
 export type RuleReasonCode = z.infer<typeof RuleReasonCode>;
@@ -277,6 +286,8 @@ export const RECONCILE_REASONS = [
   'network-change',
   'dns-refresh',
   'drift-check',
+  /** The DNS proxy saw an answer for a wildcard rule and its addresses are being routed (ADR-002 §4). */
+  'dns-learned',
 ] as const;
 export const ReconcileReason = z.enum(RECONCILE_REASONS);
 export type ReconcileReason = z.infer<typeof ReconcileReason>;
@@ -1134,6 +1145,7 @@ const VALIDATION_CODES: Readonly<Record<ValidationCode | 'duplicate-id' | 'iface
   'prefix-too-wide': true,
   'invalid-domain': true,
   'invalid-wildcard': true,
+  'invalid-wildcard-domain': true,
   'invalid-destination': true,
   'default-route': true,
   'this-network': true,

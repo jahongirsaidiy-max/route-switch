@@ -247,7 +247,7 @@ describe('handshake failures', () => {
   });
 
   it('treats a 0.1.0 helper (protocol 2) as incompatible: it cannot diagnose', async () => {
-    expect(PROTOCOL_VERSION).toBe(3);
+    expect(PROTOCOL_VERSION).toBe(4);
     const h = setup();
     h.client.start();
     const socket = h.socket();
@@ -259,10 +259,32 @@ describe('handshake failures', () => {
       kind: 'incompatible',
       helperVersion: '0.1.0',
       protocolVersion: 2,
-      expectedProtocolVersion: 3,
+      expectedProtocolVersion: 4,
     });
     expect(socket.destroyed).toBe(true);
     expect(await h.client.request('diagnose', { target: 'corp.local' })).toMatchObject({ ok: false, code: 'not-connected' });
+  });
+
+  it('treats a 0.2.0 helper (protocol 3) as incompatible: it refuses wildcard domain rules', async () => {
+    const h = setup();
+    h.client.start();
+    const socket = h.socket();
+    socket.emit('connect');
+    await flush();
+    socket.receive(ok(0, { protocolVersion: 3, helperVersion: '0.2.0', state: engineState(1) }));
+    await flush();
+    expect(h.client.snapshot().status).toEqual({
+      kind: 'incompatible',
+      helperVersion: '0.2.0',
+      protocolVersion: 3,
+      expectedProtocolVersion: 4,
+    });
+    expect(socket.destroyed).toBe(true);
+    const config: Config = {
+      ...emptyConfig(),
+      rules: [{ id: '00000000-0000-4000-8000-000000000001', enabled: true, kind: 'domain', target: '*.corp.local', iface: 'ethernet', refreshSec: 600 }],
+    };
+    expect(await h.client.request('setConfig', { config })).toMatchObject({ ok: false, code: 'not-connected' });
   });
 
   it.each([

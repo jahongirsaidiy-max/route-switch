@@ -1273,7 +1273,8 @@ describe('reconcile: a rule refused because a connected route is in the way is n
 
   it('names exactly the event reasons; the periodic ones are the rest', () => {
     expect([...REFUSAL_RETRY_REASONS].sort()).toEqual(['config-change', 'enabled-change', 'manual', 'network-change', 'startup']);
-    expect(PERIODIC).toEqual(['dns-refresh', 'drift-check']);
+    // `dns-learned` (ADR-002) fires on DNS traffic: frequent, so it must not retry refused adds either.
+    expect(PERIODIC).toEqual(['dns-refresh', 'drift-check', 'dns-learned']);
   });
 
   it.each(PERIODIC)('runs no command on a %s pass and keeps showing the rule as connected-network', async (reason) => {
