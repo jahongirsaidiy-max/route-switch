@@ -1,9 +1,10 @@
 import { Config, EngineState, RECONCILE_REASONS, parseIpv4Destination, type ReconcileReason, type Rule } from '@routeswitch/shared';
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 
 import {
   CLEAR_CONCURRENCY,
   DEGRADED_ACCEPT_AFTER,
+  DNS_LOOKUP_CONCURRENCY,
   DNS_LOSS_GRACE,
   FAILURE_BACKOFF_AFTER,
   FAILURE_BACKOFF_BASE_MS,
@@ -36,6 +37,7 @@ import {
   type RouteAddResult,
   type RouteDeleteRequest,
   type RouteDeleteResult,
+  type RouteGetResult,
 } from './route';
 import { createFakeCommandRunner, type FakeCommandResponse } from './test-utils';
 
@@ -4872,5 +4874,327 @@ describe('clear', () => {
     };
     expect(await h.engine.clear()).toEqual({ removed: 0, forgotten: 0, failed: 1 });
     expect(h.engine.getApplied()).toHaveLength(1);
+  });
+});
+
+describe('DNS-server warnings (TASK-DELTA-19)', () => {
+  type Reported = NonNullable<DetectedInterfaces['dnsServers']>;
+  // A new object every time: the engine takes the DNS servers of one detection in once.
+  const withDns = (dnsServers: Reported, extra: Partial<DetectedInterfaces> = {}): DetectedInterfaces => ({
+    ...network(extra),
+    dnsServers,
+  });
+  const IN_WIFI_SUBNET: Reported = { ethernet: ['192.168.1.53'], wifi: ['192.168.1.1'] };
+  const OUTSIDE: Reported = { ethernet: ['198.51.100.53'], wifi: ['192.168.1.1'] };
+  const found = (iface: string): RouteGetResult => ({
+    ok: true,
+    outcome: 'found',
+    route: { target: '198.51.100.53', destination: 'default', mask: null, gateway: WIFI_GW, iface, flags: ['UP', 'GATEWAY'] },
+  });
+  const resolveDomain: DomainResolver = () => domainAnswer(['172.16.12.40']);
+
+  /** A harness whose route operations can look a route up; `answer` says what the table shows. */
+  const rig = (initial: Config, detections: FakeNetInfo['results'], withLookup = true) => {
+    const fake = createFakeRoutes();
+    const lookups: string[] = [];
+    const io: { answer: (server: string) => RouteGetResult | Promise<RouteGetResult> } = {
+      answer: () => found('en0'),
+    };
+    const routes: EngineDeps['routes'] = withLookup
+      ? {
+          routeAdd: (request) => fake.routeAdd(request),
+          routeDelete: (request) => fake.routeDelete(request),
+          routeGet: async (server) => {
+            lookups.push(server);
+            return io.answer(server);
+          },
+        }
+      : { routeAdd: (request) => fake.routeAdd(request), routeDelete: (request) => fake.routeDelete(request) };
+    const h = setup(initial, { netinfo: createFakeNetInfo(...detections), deps: { routes, resolveDomain } });
+    return { h, fake, lookups, io };
+  };
+
+  const SUBNET_WARNING = {
+    server: '192.168.1.53',
+    source: 'interface',
+    role: 'ethernet',
+    via: 'wifi',
+    code: 'other-interface-subnet',
+  } as const;
+
+  it('reports an interface server inside the other role subnet, without a lookup, and changes no rule or route', async () => {
+    const { h, fake, lookups } = rig(config([DOMAIN_RULE]), [withDns(IN_WIFI_SUBNET)]);
+    const outcome = await h.run('startup');
+    expect(outcome.state.dnsWarnings).toEqual([SUBNET_WARNING]);
+    expect(lookups).toEqual([]);
+    expect(fake.calls).toEqual([add('172.16.12.40', ETH_GW)]);
+    expect(ruleState(outcome, 5)).toMatchObject({ status: 'active', reasonCode: null });
+  });
+
+  it('drops the warning once an `ip` rule routes the server through its role, and says so once', async () => {
+    const { h, fake } = rig(config([DOMAIN_RULE]), [withDns(IN_WIFI_SUBNET), withDns(IN_WIFI_SUBNET), withDns(IN_WIFI_SUBNET)]);
+    await h.run('startup');
+    h.engine.setConfig(config([DOMAIN_RULE, rule(8, 'ip', '192.168.1.53', 'ethernet')]));
+    const outcome = await h.run('config-change');
+    expect(fake.calls).toContainEqual(add('192.168.1.53', ETH_GW));
+    expect(outcome.state).not.toHaveProperty('dnsWarnings');
+    expect(engineLogs(h.entries, 'info', 'DNS servers are reached through their own interfaces again')).toHaveLength(1);
+    await h.run('drift-check');
+    expect(engineLogs(h.entries, 'info', 'DNS servers are reached through their own interfaces again')).toHaveLength(1);
+  });
+
+  it('logs a standing warning at `warn` once, then at `debug`, and again at `warn` when it changes', async () => {
+    const MSG = 'a DNS server is reached through the other interface; add an `ip` rule for it';
+    const changed: Reported = { ethernet: ['192.168.1.54'], wifi: ['192.168.1.1'] };
+    const { h } = rig(config([DOMAIN_RULE]), [withDns(IN_WIFI_SUBNET), withDns(IN_WIFI_SUBNET), withDns(changed)]);
+    await h.run('startup');
+    await h.run('drift-check');
+    expect(engineLogs(h.entries, 'warn', MSG)).toHaveLength(1);
+    expect(engineLogs(h.entries, 'debug', MSG)).toHaveLength(1);
+    expect(engineLogs(h.entries, 'warn', MSG)[0]?.context).toMatchObject({ reason: 'startup', warnings: [SUBNET_WARNING] });
+    await h.run('drift-check');
+    expect(engineLogs(h.entries, 'warn', MSG)).toHaveLength(2);
+  });
+
+  it('asks the table for a server nothing else decides, once while the interface facts stay the same', async () => {
+    const moved = { wifi: iface('wifi', { ip: '192.168.1.24' }) };
+    const { h, lookups } = rig(config([DOMAIN_RULE]), [
+      withDns(OUTSIDE),
+      withDns(OUTSIDE),
+      withDns(OUTSIDE),
+      withDns(OUTSIDE, moved),
+      withDns(OUTSIDE, moved),
+      withDns(OUTSIDE, moved),
+    ]);
+    const first = await h.run('startup');
+    expect(first.state.dnsWarnings).toEqual([
+      { server: '198.51.100.53', source: 'interface', role: 'ethernet', via: 'wifi', code: 'routed-via-other-interface' },
+    ]);
+    expect(lookups).toEqual(['198.51.100.53']);
+    // A periodic pass, same facts: the answer is reused and the warning stays.
+    expect((await h.run('drift-check')).state.dnsWarnings).toHaveLength(1);
+    expect((await h.run('dns-refresh')).state.dnsWarnings).toHaveLength(1);
+    expect(lookups).toHaveLength(1);
+    // Interface facts changed: asked again.
+    await h.run('drift-check');
+    expect(lookups).toHaveLength(2);
+    // The monitor's network change: asked again, even with the same facts.
+    await h.run('network-change');
+    expect(lookups).toHaveLength(3);
+    // A forced pass (the "apply" button) as well.
+    await h.engine.reconcile('manual', { force: true });
+    expect(lookups).toHaveLength(4);
+    // The flag is used up by the pass that refreshed: the next periodic pass reuses the answer.
+    await h.run('drift-check');
+    expect(lookups).toHaveLength(4);
+  });
+
+  it('keeps a network change asked for during a pass, although the merged follow-up has another reason', async () => {
+    const { h, lookups, io } = rig(config([DOMAIN_RULE]), [withDns(OUTSIDE), withDns(OUTSIDE), withDns(OUTSIDE)]);
+    await h.run('startup');
+    expect(lookups).toHaveLength(1);
+    // The second pass is held inside its lookup while the monitor reports a change.
+    const gate = deferred();
+    io.answer = async () => {
+      await gate.promise;
+      return found('en0');
+    };
+    const running = h.engine.reconcile('network-change');
+    await vi.waitFor(() => {
+      expect(lookups).toHaveLength(2);
+    });
+    const merged = [h.engine.reconcile('network-change'), h.engine.reconcile('drift-check')];
+    gate.open();
+    await running;
+    const [followUp] = await Promise.all(merged);
+    // One follow-up pass, with the latest reason, that still looks the server up again.
+    expect(followUp?.state.lastReconcileReason).toBe('drift-check');
+    expect(lookups).toHaveLength(3);
+  });
+
+  it('says nothing when the table takes the server through its own role or another device', async () => {
+    for (const device of ['en5', 'utun3']) {
+      const { h, io } = rig(config([DOMAIN_RULE]), [withDns(OUTSIDE)]);
+      io.answer = () => found(device);
+      expect((await h.run('startup')).state).not.toHaveProperty('dnsWarnings');
+    }
+  });
+
+  it('treats a lookup that fails or throws as no answer (no warning), and logs it', async () => {
+    const { h, io } = rig(config([DOMAIN_RULE]), [withDns(OUTSIDE), withDns(OUTSIDE)]);
+    io.answer = (server) => ({ ok: false, outcome: 'not-found', target: server });
+    expect((await h.run('startup')).state).not.toHaveProperty('dnsWarnings');
+    expect(engineLogs(h.entries, 'debug', 'route lookup for a DNS server gave no route')).toHaveLength(1);
+
+    io.answer = () => {
+      throw new Error('runner gone');
+    };
+    expect((await h.run('network-change')).state).not.toHaveProperty('dnsWarnings');
+    expect(engineLogs(h.entries, 'error', 'route lookup for a DNS server threw')[0]?.context).toMatchObject({
+      dst: '198.51.100.53',
+      error: 'runner gone',
+    });
+  });
+
+  it('without a route lookup reports only what its own facts tell', async () => {
+    const subnet = rig(config([DOMAIN_RULE]), [withDns(IN_WIFI_SUBNET)], false);
+    expect((await subnet.h.run('startup')).state.dnsWarnings).toEqual([SUBNET_WARNING]);
+    const outside = rig(config([DOMAIN_RULE]), [withDns(OUTSIDE)], false);
+    expect((await outside.h.run('startup')).state).not.toHaveProperty('dnsWarnings');
+  });
+
+  it('keeps the previous warnings through an untrusted detection, and looks nothing up then', async () => {
+    const { h, lookups } = rig(config([DOMAIN_RULE]), [
+      withDns(OUTSIDE),
+      withDns({ ethernet: [], wifi: [] }, { degraded: true }),
+      withDns({ ethernet: [], wifi: [] }, { degraded: true }),
+    ]);
+    await h.run('startup');
+    expect(lookups).toHaveLength(1);
+    const held = await h.run('network-change');
+    expect(held.state.dnsWarnings).toHaveLength(1);
+    expect((await h.run('network-change')).state.dnsWarnings).toHaveLength(1);
+    expect(lookups).toHaveLength(1);
+  });
+
+  it('keeps them when the detection fails altogether, and in the state `clear()` publishes', async () => {
+    const { h } = rig(config([DOMAIN_RULE]), [
+      withDns(IN_WIFI_SUBNET),
+      () => {
+        throw new Error('detection broke');
+      },
+    ]);
+    await h.run('startup');
+    expect((await h.run('network-change')).state.dnsWarnings).toEqual([SUBNET_WARNING]);
+    await h.engine.clear();
+    expect(h.engine.getState().dnsWarnings).toEqual([SUBNET_WARNING]);
+    expectValid(h.engine.getState());
+  });
+
+  it('reports a rule `dns` server the engine could not route, with the rule id', async () => {
+    // The rule's server is the Wi-Fi gateway: the connected-subnet guard refuses its route.
+    const withGatewayDns = rule(5, 'domain', 'corp.local', 'ethernet', { dns: WIFI_GW });
+    const { h } = rig(config([withGatewayDns]), [withDns({ ethernet: [], wifi: [] })]);
+    const outcome = await h.run('startup');
+    expect(outcome.state.dnsWarnings).toEqual([
+      { server: WIFI_GW, source: 'rule', role: 'ethernet', via: 'wifi', ruleId: ruleId(5), code: 'other-interface-subnet' },
+    ]);
+  });
+
+  it('reports nothing for a rule `dns` server the engine routes, or with the global toggle off', async () => {
+    const withOwnDns = rule(5, 'domain', 'corp.local', 'ethernet', { dns: '192.168.1.53' });
+    const { h, fake } = rig(config([withOwnDns]), [withDns({ ethernet: [], wifi: [] }), withDns({ ethernet: [], wifi: [] })]);
+    const outcome = await h.run('startup');
+    expect(fake.calls).toContainEqual(add('192.168.1.53', ETH_GW));
+    expect(outcome.state).not.toHaveProperty('dnsWarnings');
+
+    const off = rig(config([DOMAIN_RULE], { enabled: false }), [withDns(IN_WIFI_SUBNET)]);
+    expect((await off.h.run('startup')).state).not.toHaveProperty('dnsWarnings');
+  });
+
+  it('runs at most DNS_LOOKUP_CONCURRENCY lookups at once and at most 16 per pass', async () => {
+    const many = Array.from({ length: 20 }, (_, index) => `198.51.100.${String(index + 1)}`);
+    const { h, lookups, io } = rig(config([DOMAIN_RULE]), [withDns({ ethernet: many.slice(0, 8), wifi: many.slice(8) })]);
+    let inFlight = 0;
+    let peak = 0;
+    io.answer = async () => {
+      inFlight += 1;
+      peak = Math.max(peak, inFlight);
+      await Promise.resolve();
+      await Promise.resolve();
+      inFlight -= 1;
+      return found('en0');
+    };
+    const outcome = await h.run('startup');
+    expect(peak).toBe(DNS_LOOKUP_CONCURRENCY);
+    // The engine keeps at most 8 servers per role; all 16 are looked up once.
+    expect(lookups).toHaveLength(16);
+    expect(new Set(lookups).size).toBe(16);
+    // Through Wi-Fi: wrong for the eight Ethernet servers only.
+    expect(outcome.state.dnsWarnings?.map((warning) => warning.role)).toEqual(Array.from({ length: 8 }, () => 'ethernet'));
+  });
+
+  it('looks a server up again when it needs a lookup again after an `ip` rule covered it for a while', async () => {
+    const coverRule = rule(8, 'ip', '198.51.100.53', 'ethernet');
+    const { h, lookups } = rig(config([DOMAIN_RULE]), [withDns(OUTSIDE), withDns(OUTSIDE), withDns(OUTSIDE)]);
+    await h.run('startup');
+    h.engine.setConfig(config([DOMAIN_RULE, coverRule]));
+    expect((await h.run('config-change')).state).not.toHaveProperty('dnsWarnings');
+    h.engine.setConfig(config([DOMAIN_RULE]));
+    expect((await h.run('config-change')).state.dnsWarnings).toHaveLength(1);
+    // Not the answer from before the rule: the table is asked again.
+    expect(lookups).toEqual(['198.51.100.53', '198.51.100.53']);
+  });
+
+  it('keeps the warnings in the state of a pass that failed unexpectedly', async () => {
+    let broken = false;
+    // A resolver answer the pass cannot handle: the engine's last line of defence publishes the state.
+    const h = setup(config([DOMAIN_RULE]), {
+      netinfo: createFakeNetInfo(withDns(IN_WIFI_SUBNET), withDns(IN_WIFI_SUBNET)),
+      deps: {
+        resolveDomain: () => (broken ? ({ destinations: null } as unknown as DomainTargets) : domainAnswer(['172.16.12.40'])),
+      },
+    });
+    expect((await h.run('startup')).state.dnsWarnings).toEqual([SUBNET_WARNING]);
+    broken = true;
+    const failed = await h.run('drift-check');
+    expect(engineLogs(h.entries, 'error', 'reconcile failed unexpectedly')).toHaveLength(1);
+    expect(failed.state.dnsWarnings).toEqual([SUBNET_WARNING]);
+  });
+
+  it('judges no rule server while the global toggle is off', async () => {
+    const withGatewayDns = rule(5, 'domain', 'corp.local', 'ethernet', { dns: WIFI_GW });
+    const { h } = rig(config([withGatewayDns], { enabled: false }), [withDns({ ethernet: [], wifi: [] })]);
+    expect((await h.run('startup')).state).not.toHaveProperty('dnsWarnings');
+  });
+
+  it('routes exactly as without the warnings (differential)', async () => {
+    const scenarios: readonly (readonly [Config, Reported, Partial<DetectedInterfaces>])[] = [
+      [config([DOMAIN_RULE]), IN_WIFI_SUBNET, {}],
+      [config([DOMAIN_RULE, HOST, WIFI_HOST]), OUTSIDE, {}],
+      [config([rule(5, 'domain', 'corp.local', 'ethernet', { dns: WIFI_GW }), NET]), OUTSIDE, {}],
+      [config([rule(5, 'domain', 'corp.local', 'ethernet', { dns: '192.168.1.53' }), rule(8, 'ip', '192.168.1.53', 'wifi')]), IN_WIFI_SUBNET, {}],
+      [config([DOMAIN_RULE, rule(8, 'ip', '198.51.100.53', 'ethernet')]), OUTSIDE, { wifi: down('wifi') }],
+      [config([DOMAIN_RULE, HOST]), IN_WIFI_SUBNET, { ethernet: noGateway('ethernet') }],
+    ];
+    for (const [initial, servers, extra] of scenarios) {
+      const reasons: readonly ReconcileReason[] = ['startup', 'drift-check', 'network-change', 'manual'];
+      const detections = reasons.map(() => withDns(servers, extra));
+      const withWarnings = rig(initial, detections, true);
+      const without = rig(initial, detections.map((detection) => ({ ...detection })), false);
+      for (const reason of reasons) {
+        const a = await withWarnings.h.run(reason);
+        const b = await without.h.run(reason);
+        expect(a.state.rules).toEqual(b.state.rules);
+        expect(a.summary).toEqual(b.summary);
+      }
+      expect(withWarnings.fake.calls).toEqual(without.fake.calls);
+      expect(withWarnings.h.engine.getApplied()).toEqual(without.h.engine.getApplied());
+    }
+  });
+});
+
+describe('buildEngineState — dnsWarnings', () => {
+  const base = {
+    helperVersion: '1.2.3',
+    seq: 1,
+    configRevision: 0,
+    config: config([]),
+    wire: { interfaces: { ethernet: { device: null, ip: null, gateway: null, up: false }, wifi: { device: null, ip: null, gateway: null, up: false } }, adapters: [] },
+    verdicts: new Map(),
+    applied: [],
+    lastApplyAt: null,
+    lastReconcileReason: null,
+  } as const;
+  const WARNING = { server: '192.168.1.53', source: 'interface', role: 'ethernet', via: 'wifi', code: 'other-interface-subnet' } as const;
+
+  it('leaves the field out when there is no warning, and copies the warnings otherwise', () => {
+    expect(buildEngineState(base)).not.toHaveProperty('dnsWarnings');
+    expect(buildEngineState({ ...base, dnsWarnings: [] })).not.toHaveProperty('dnsWarnings');
+    const warnings = [WARNING];
+    const state = buildEngineState({ ...base, dnsWarnings: warnings });
+    expect(state.dnsWarnings).toEqual([WARNING]);
+    expect(state.dnsWarnings?.[0]).not.toBe(WARNING);
+    expect(EngineState.safeParse(state).success).toBe(true);
   });
 });

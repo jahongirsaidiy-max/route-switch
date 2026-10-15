@@ -4,10 +4,11 @@
 // functions of the engine state (and the config, for each rule's interface);
 // the menu bar window and the rules window show the same words.
 
-import type { Config, EngineState, IfaceRole, RuleState } from '@routeswitch/shared';
+import type { Config, DnsWarning, EngineState, IfaceRole, RuleState } from '@routeswitch/shared';
 
-import { formatAgo } from './time';
+import type { I18n } from '../../../i18n';
 
+/** Product names: the same in every language. */
 const ROLE_NAMES: Readonly<Record<IfaceRole, string>> = { ethernet: 'Ethernet', wifi: 'Wi‑Fi' };
 
 /** A warning shown above a screen's rules. `id` is stable for one kind of warning (a React key). */
@@ -40,7 +41,8 @@ export function sameSubnetGateway(interfaces: EngineState['interfaces']): string
  * off (no rule is waiting then). Without the config the rules cannot be told
  * apart by interface, so the count is left out but the interface still is.
  */
-export function networkWarnings(state: EngineState, config: Config | null): NetworkWarning[] {
+export function networkWarnings(state: EngineState, config: Config | null, i18n: I18n): NetworkWarning[] {
+  const words = i18n.t.network;
   const warnings: NetworkWarning[] = [];
   if (state.enabled) {
     const waiting = state.rules.filter((rule) => rule.status === 'pending' && WAITING_FOR_INTERFACE.has(rule.reasonCode));
@@ -51,25 +53,65 @@ export function networkWarnings(state: EngineState, config: Config | null): Netw
       const known = config !== null;
       const mine = waiting.filter((rule) => ifaceOf.get(rule.ruleId) === role).length;
       if (known ? mine === 0 : waiting.length === 0 || (iface.up && iface.gateway !== null)) continue;
-      const problem = iface.device === null ? `${name} adapteri topilmadi` : iface.up ? `${name}'da gateway yo'q` : `${name} ulanmagan`;
+      const problem = iface.device === null ? words.adapterMissing(name) : iface.up ? words.noGateway(name) : words.notConnected(name);
       warnings.push({
         id: `waiting-${role}`,
         title: problem,
-        text: known
-          ? `${String(mine)} ta qoida kutilmoqda — interfeys ulanganda avtomatik qo'llanadi.`
-          : "Unga bog'langan qoidalar kutilmoqda — interfeys ulanganda avtomatik qo'llanadi.",
+        text: known ? words.rulesWaiting(mine) : words.rulesWaitingUncounted,
       });
     }
   }
   const gateway = sameSubnetGateway(state.interfaces);
   if (gateway !== null) {
-    warnings.push({
-      id: 'same-subnet',
-      title: 'Ethernet va Wi‑Fi bitta tarmoqda',
-      text: `Ikkalasining gateway'i ${gateway}: gateway orqali route ishonchsiz — trafik qaysi interfeysdan chiqishini tizim tanlaydi. Interfeyslardan birini boshqa tarmoqqa ulang.`,
-    });
+    warnings.push({ id: 'same-subnet', title: words.sameSubnetTitle, text: words.sameSubnetText(gateway) });
   }
   return warnings;
+}
+
+/** The role a DNS warning's server is wrongly reached through: there are two roles, so it is the other one. */
+const OTHER_ROLE: Readonly<Record<IfaceRole, IfaceRole>> = { ethernet: 'wifi', wifi: 'ethernet' };
+
+/** A DNS server reached through the wrong interface (`EngineState.dnsWarnings`), as a banner. */
+export interface DnsWarningBanner extends NetworkWarning {
+  readonly server: string;
+  /** The interface the server should be reached through: the rule the offer adds goes there. */
+  readonly role: IfaceRole;
+}
+
+/**
+ * The helper's DNS warnings, one banner per server (the first warning of a
+ * server wins: the helper lists an interface's own servers before the rules'),
+ * in the helper's order. Shown whatever routing's switch says: the warning
+ * is about the interfaces, not about a rule. The title names the interface
+ * (or the rule, by its domain from the config) the server belongs to; the
+ * text says why, by the helper's code.
+ */
+export function dnsWarningBanners(state: EngineState, config: Config | null, i18n: I18n): DnsWarningBanner[] {
+  const words = i18n.t.dnsWarnings;
+  const banners: DnsWarningBanner[] = [];
+  const seen = new Set<string>();
+  const targetOf = new Map(config?.rules.map((rule) => [rule.id, rule.target]) ?? []);
+  for (const warning of state.dnsWarnings ?? []) {
+    if (seen.has(warning.server)) continue;
+    seen.add(warning.server);
+    banners.push(dnsWarningBanner(warning, warning.ruleId === undefined ? null : (targetOf.get(warning.ruleId) ?? null), words));
+  }
+  return banners;
+}
+
+function dnsWarningBanner(warning: DnsWarning, ruleTarget: string | null, words: I18n['t']['dnsWarnings']): DnsWarningBanner {
+  const { server, role } = warning;
+  const name = ROLE_NAMES[role];
+  // `via` is null when the helper did not learn it; with two roles it can only be the other one.
+  const other = ROLE_NAMES[warning.via ?? OTHER_ROLE[role]];
+  const title =
+    warning.source === 'interface'
+      ? words.titleInterface(name, server, other)
+      : ruleTarget === null
+        ? words.titleRuleUnknown(server, other)
+        : words.titleRule(ruleTarget, server, other);
+  const text = warning.code === 'other-interface-subnet' ? words.textSubnet(server, name, other) : words.textRouted(server, name, other);
+  return { id: `dns-${server}`, title, text, server, role };
 }
 
 /** How many of the last known addresses are named; the rest are counted. */
@@ -87,14 +129,15 @@ export function lastKnownText(
   state: RuleState,
   now: number,
   shown = LAST_KNOWN_SHOWN,
+  i18n: I18n,
 ): string | null {
   if (state.status !== 'error' || rule.kind !== 'domain') return null;
   const addresses = state.appliedDestinations.filter((destination) => destination !== rule.dns);
-  if (addresses.length === 0) return "Oxirgi ma'lum IP yo'q — domen hozir yo'naltirilmayapti.";
+  if (addresses.length === 0) return i18n.t.network.lastKnownNone;
   const named = addresses.slice(0, shown).join(', ');
   const more = addresses.length > shown ? ` +${String(addresses.length - shown)}` : '';
-  const when = state.lastResolvedAt === null ? '' : ` · ${formatAgo(state.lastResolvedAt, now)}`;
-  return `Oxirgi ma'lum IP'lar (hali yo'naltirilmoqda): ${named}${more}${when}`;
+  const when = state.lastResolvedAt === null ? '' : ` · ${i18n.formatAgo(state.lastResolvedAt, now)}`;
+  return i18n.t.network.lastKnown(`${named}${more}`, when);
 }
 
 /**

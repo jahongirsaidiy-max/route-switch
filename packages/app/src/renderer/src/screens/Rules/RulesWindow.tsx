@@ -1,26 +1,37 @@
 // The rules window (`?view=rules`, 1040×680): a sidebar with the window's
-// sections — Qoidalar, Jurnal, Sozlamalar — and the helper's status, and the
+// sections — Qoidalar, Jurnal, Diagnostika, Sozlamalar, Yordam — and the helper's status, and the
 // chosen section beside it. The macOS title bar is the real one, so the
 // design's drawn traffic lights are not repeated. The design's "Interfeyslar"
 // and "DNS resolverlar" items have no screen in the MVP and are left out.
 // "Qoida qo'shish" and a row's "Tahrirlash" open the add-rule form as a modal
 // dialog over the window; the window behind it is `inert` until it closes, and
-// the focus then returns to the button that opened it.
+// the focus then returns to the button that opened it. A DNS warning's offer
+// opens it filled in — from the rules screen's banner, or from the menu bar's,
+// whose intent the main process keeps for this window (`takeRulesIntent`,
+// TASK-DELTA-21).
 
 import { useEffect, useRef, useState, type ComponentType, type ReactElement, type ReactNode } from 'react';
 
 import { HelperRecovery, requestReconnect, RouteIcon, StatusDot } from '../../components';
+import type { I18n } from '../../../../i18n';
+import { useConfig, type ConfigView } from '../../hooks/useConfig';
 import { useEngineState, type EngineStateView } from '../../hooks/useEngineState';
-import type { RsApi } from '../../rs';
-import { HELPER_STATUS_TEXT, helperNotice, type Feedback } from '../../text';
-import { AddRuleDialog, type RuleEditorTarget } from '../AddRule';
+import { useI18n } from '../../hooks/useI18n';
+import type { RsApi, RsRulesIntent } from '../../rs';
+import { helperNotice, helperStatusText, UZ, type Feedback } from '../../text';
+import type { IfaceRole, RulesWindowSection } from '@routeswitch/shared';
+
+import { AddRuleDialog, dnsWarningViews, requestedForm, type RuleEditorTarget, type RuleForm } from '../AddRule';
+import { DiagnosticsScreen } from '../Diagnostics';
+import { HelpScreen } from '../Help';
 import { useInstall } from '../Install';
 import { LogScreen } from '../Log';
 import { SettingsScreen } from '../Settings';
 import { RulesScreen } from './RulesScreen';
 import styles from './RulesWindow.module.css';
 
-export type RulesSection = 'rules' | 'log' | 'settings';
+/** The sidebar's sections: the shared list the main process checks a `section` intent against. */
+export type RulesSection = RulesWindowSection;
 
 function Svg({ children }: { readonly children: ReactNode }): ReactElement {
   return (
@@ -50,6 +61,16 @@ function LogIcon(): ReactElement {
   );
 }
 
+/** "Diagnostika" (not in the design): a magnifier, in the stroke of the design's icons. */
+function DiagnosticsIcon(): ReactElement {
+  return (
+    <Svg>
+      <circle cx="11" cy="11" r="6" />
+      <path d="m20 20-4.5-4.5M8.5 11h5" />
+    </Svg>
+  );
+}
+
 /** "Sozlamalar" icon of the design. */
 function SettingsIcon(): ReactElement {
   return (
@@ -60,23 +81,41 @@ function SettingsIcon(): ReactElement {
   );
 }
 
-export const SECTIONS: readonly { readonly id: RulesSection; readonly label: string; readonly icon: () => ReactElement }[] = [
-  { id: 'rules', label: 'Qoidalar', icon: () => <RouteIcon size={16} /> },
-  { id: 'log', label: 'Jurnal', icon: LogIcon },
-  { id: 'settings', label: 'Sozlamalar', icon: SettingsIcon },
+/** "Yordam" (not in the design): a question mark in a circle, in the stroke of the design's icons. */
+function HelpIcon(): ReactElement {
+  return (
+    <Svg>
+      <circle cx="12" cy="12" r="9" />
+      <path d="M9.5 9.5a2.5 2.5 0 0 1 4.9.7c0 1.7-2.4 2.1-2.4 3.6M12 17v.01" />
+    </Svg>
+  );
+}
+
+/** The sidebar's sections, in order; their names are `t.rules.sections`. */
+export const SECTIONS: readonly { readonly id: RulesSection; readonly icon: () => ReactElement }[] = [
+  { id: 'rules', icon: () => <RouteIcon size={16} /> },
+  { id: 'log', icon: LogIcon },
+  { id: 'diagnostics', icon: DiagnosticsIcon },
+  { id: 'settings', icon: SettingsIcon },
+  { id: 'help', icon: HelpIcon },
 ];
 
 /** What a section's screen gets from the window: the way into the add-rule form. */
 export interface SectionScreenProps {
-  readonly onAddRule: () => void;
+  /** Opens the add-rule form; filled in with `prefill` (a DNS warning's offer). */
+  readonly onAddRule: (prefill?: RuleForm) => void;
   readonly onEditRule: (id: string) => void;
+  /** Shows another section of this window (a link of the Help). */
+  readonly onOpenSection: (section: RulesSection) => void;
 }
 
 /** The screen of each section. */
 export const SECTION_SCREENS: Readonly<Record<RulesSection, ComponentType<SectionScreenProps>>> = {
   rules: ({ onAddRule, onEditRule }) => <RulesScreen onAddRule={onAddRule} onEditRule={onEditRule} />,
   log: () => <LogScreen />,
+  diagnostics: () => <DiagnosticsScreen />,
   settings: () => <SettingsScreen />,
+  help: ({ onOpenSection }) => <HelpScreen onOpenSection={onOpenSection} />,
 };
 
 export interface RulesWindowFrameProps {
@@ -95,6 +134,8 @@ export interface RulesWindowFrameProps {
   readonly installing?: boolean;
   /** How the last install ended. */
   readonly installFeedback?: Feedback | null;
+  /** The UI language (`useI18n()`); Uzbek when not given. */
+  readonly i18n?: I18n;
   readonly children: ReactNode;
 }
 
@@ -110,17 +151,19 @@ export function RulesWindowFrame({
   onInstall = () => undefined,
   installing = false,
   installFeedback = null,
+  i18n = UZ,
   children,
 }: RulesWindowFrameProps): ReactElement {
-  const helper = HELPER_STATUS_TEXT[engine.helper];
+  const t = i18n.t.rules;
+  const helper = helperStatusText(engine.helper, i18n);
   const connection = engine.connection;
   // The same words as the screens' notices, so every section says why and what to do.
-  const notice = helperNotice(engine);
+  const notice = helperNotice(engine, i18n);
   return (
     <div className={styles['window']} inert={inert || undefined}>
       <aside className={styles['sidebar']}>
-        <nav aria-label="Bo'limlar" className={styles['nav']}>
-          {SECTIONS.map(({ id, label, icon: Icon }) => (
+        <nav aria-label={t.sectionsNav} className={styles['nav']}>
+          {SECTIONS.map(({ id, icon: Icon }) => (
             <button
               key={id}
               type="button"
@@ -131,7 +174,7 @@ export function RulesWindowFrame({
               }}
             >
               <Icon />
-              {label}
+              {t.sections[id]}
             </button>
           ))}
         </nav>
@@ -140,7 +183,7 @@ export function RulesWindowFrame({
             <StatusDot tone={helper.tone} label={helper.text} size="sm" />
             <span>{helper.text}</span>
           </div>
-          {connection?.kind === 'connected' ? <div>root daemon · v{connection.helperVersion}</div> : null}
+          {connection?.kind === 'connected' ? <div>{t.helperDaemon(connection.helperVersion)}</div> : null}
           {notice === null || notice.text === '' ? null : <p className={styles['helperText']}>{notice.text}</p>}
           {onReconnect === undefined ? null : (
             <HelperRecovery
@@ -150,6 +193,7 @@ export function RulesWindowFrame({
               onInstall={onInstall}
               installing={installing}
               size="sm"
+              i18n={i18n}
             />
           )}
           {[reconnectFeedback, installFeedback].map((line, index) =>
@@ -164,6 +208,71 @@ export function RulesWindowFrame({
       <div className={styles['main']}>{children}</div>
     </div>
   );
+}
+
+/** How long this window holds a DNS offer while its state or config is still on the way. */
+export const DNS_OFFER_WAIT_MS = 60_000;
+
+/** A menu bar DNS offer (`RsRulesIntent` of kind `dns-offer`) and when this window received it. */
+export interface PendingDnsOffer {
+  readonly server: string;
+  readonly role: IfaceRole;
+  readonly receivedAt: number;
+}
+
+export type DnsOfferStep =
+  /** The state or the config is not here yet: ask again when they change. */
+  | { readonly kind: 'wait' }
+  /** Nothing to open: waited too long, a form is already open, or this window's state offers no such rule (any more). */
+  | { readonly kind: 'drop' }
+  | { readonly kind: 'open'; readonly form: RuleForm };
+
+/**
+ * What a menu bar DNS offer does in this window. It opens the form only with
+ * the offer this window's own state makes for the same server and role
+ * (`requestedForm`): the intent names a warning, it does not carry a rule.
+ * A form that is open is never replaced (it may hold the user's typing).
+ */
+export function dnsOfferStep(
+  pending: PendingDnsOffer,
+  engine: EngineStateView,
+  config: ConfigView,
+  editorOpen: boolean,
+  now: number,
+  i18n: I18n = UZ,
+): DnsOfferStep {
+  if (now - pending.receivedAt > DNS_OFFER_WAIT_MS || editorOpen) return { kind: 'drop' };
+  // The add-rule button is off with an unreadable config; so is the offer.
+  if (engine.helper === 'config-unreadable') return { kind: 'drop' };
+  const state = engine.helper === 'connected' ? engine.state : null;
+  if (state === null || (config.config === null && (config.phase === 'idle' || config.phase === 'loading'))) return { kind: 'wait' };
+  const form = requestedForm(pending, dnsWarningViews(state, config.config, i18n));
+  return form === null ? { kind: 'drop' } : { kind: 'open', form };
+}
+
+/**
+ * Delivers the intents the main process keeps for this window: one that
+ * arrived before this window subscribed (taken once, at start), then one
+ * each time `onRulesIntent` says another is waiting. Each is taken once
+ * (`takeRulesIntent`); a failed take is no intent. Returns the unsubscribe.
+ */
+export function followRulesIntents(rs: Pick<RsApi, 'takeRulesIntent' | 'onRulesIntent'>, deliver: (intent: RsRulesIntent) => void): () => void {
+  let stopped = false;
+  const take = () => {
+    void rs.takeRulesIntent().then(
+      (result) => {
+        if (!stopped && result.ok && result.value !== null) deliver(result.value);
+      },
+      // The preload never rejects; a page without a main process has no intents.
+      () => undefined,
+    );
+  };
+  const unsubscribe = rs.onRulesIntent(take);
+  take();
+  return () => {
+    stopped = true;
+    unsubscribe();
+  };
 }
 
 /** The element that had the focus, so it can get it back; null when there is none to return to. */
@@ -185,7 +294,7 @@ export interface RulesWindowProps {
   readonly screens?: Readonly<Record<RulesSection, ComponentType<SectionScreenProps>>>;
   readonly editorScreen?: ComponentType<{ readonly editor: RuleEditorTarget; readonly onClose: () => void }>;
   /** The preload API; `window.rs` in the app. */
-  readonly rs?: Pick<RsApi, 'getState' | 'onState' | 'reconnectHelper' | 'installHelper'>;
+  readonly rs?: Pick<RsApi, 'getState' | 'onState' | 'getConfig' | 'reconnectHelper' | 'installHelper' | 'takeRulesIntent' | 'onRulesIntent'>;
 }
 
 /** The screen of the rules window (`?view=rules`). */
@@ -197,13 +306,15 @@ export function RulesWindow({
 }: RulesWindowProps): ReactElement {
   const rs = given ?? window.rs;
   const engine = useEngineState(rs);
+  const config = useConfig(rs);
+  const i18n = useI18n();
   const [reconnecting, setReconnecting] = useState(false);
   const [reconnectFeedback, setReconnectFeedback] = useState<Feedback | null>(null);
   const reconnect = () => {
     if (reconnecting) return;
     setReconnecting(true);
     setReconnectFeedback(null);
-    void requestReconnect(rs).then((line) => {
+    void requestReconnect(rs, i18n).then((line) => {
       setReconnectFeedback(line);
       setReconnecting(false);
     });
@@ -229,6 +340,29 @@ export function RulesWindow({
     setEditor(null);
     setReturning(true);
   };
+
+  // What the window is opened for (TASK-DELTA-21): a section at once; a DNS offer once the state and the config are here.
+  const [pending, setPending] = useState<PendingDnsOffer | null>(null);
+  useEffect(
+    () =>
+      followRulesIntents(rs, (intent) => {
+        if (intent.kind === 'section') setSection(intent.section);
+        else setPending({ server: intent.server, role: intent.role, receivedAt: Date.now() });
+      }),
+    [rs],
+  );
+  useEffect(() => {
+    if (pending === null) return;
+    const step = dnsOfferStep(pending, engine, config, editor !== null, Date.now(), i18n);
+    if (step.kind === 'wait') return;
+    setPending(null);
+    if (step.kind === 'open') {
+      // As `open`: the focus goes back to what had it once the form closes.
+      opener.current = focusedElement(globalThis.document);
+      setSection('rules');
+      setEditor({ mode: 'add', prefill: step.form });
+    }
+  }, [pending, engine, config, editor, i18n]);
   const Screen = screens[section];
   return (
     <>
@@ -243,14 +377,16 @@ export function RulesWindow({
         onInstall={installing.install}
         installing={installing.installing}
         installFeedback={installing.feedback}
+        i18n={i18n}
       >
         <Screen
-          onAddRule={() => {
-            open({ mode: 'add' });
+          onAddRule={(prefill) => {
+            open(prefill === undefined ? { mode: 'add' } : { mode: 'add', prefill });
           }}
           onEditRule={(id) => {
             open({ mode: 'edit', id });
           }}
+          onOpenSection={setSection}
         />
       </RulesWindowFrame>
       {/* Keyed by what it edits: another rule opens a fresh form. */}

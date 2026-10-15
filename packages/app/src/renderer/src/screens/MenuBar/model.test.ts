@@ -12,6 +12,7 @@ import {
   ruleNotice,
   statusLine,
 } from './model';
+import { i18nFor } from '../../../../i18n';
 import { RULE_REASON_TEXT } from '../../text';
 
 const withRules = (rules: EngineState['rules'], extra: Partial<EngineState> = {}): EngineState => ({ ...STATE, rules, ...extra });
@@ -198,5 +199,50 @@ describe('interfacesKey', () => {
       { ...STATE.interfaces, ethernet: { device: 'en5', ip: null, gateway: null, up: false } },
     ];
     for (const variant of variants) expect(interfacesKey(variant)).not.toBe(base);
+  });
+});
+
+describe('in Russian and English (TASK-DELTA-12)', () => {
+  const ru = i18nFor('ru');
+  const en = i18nFor('en');
+  const rule = (id: string) => {
+    const found = CONFIG.rules.find((entry) => entry.id === id);
+    if (found === undefined) throw new Error(id);
+    return found;
+  };
+  const stateOf = (id: string) => STATE.rules.find((entry) => entry.ruleId === id) ?? null;
+
+  it('ruleDetail: the DNS server, and what a domain resolved to (plural, time ago)', () => {
+    expect(ruleDetail(rule(ID.dnsDomain), stateOf(ID.dnsDomain), NOW, ru)).toBe('DNS: 10.20.0.10');
+    expect(ruleDetail(rule(ID.domain), stateOf(ID.domain), NOW, ru)).toBe('3 IP · 2 минуты назад');
+    expect(ruleDetail(rule(ID.domain), stateOf(ID.domain), NOW, en)).toBe('3 IPs · 2 min ago');
+    const one = { ...(stateOf(ID.domain) ?? ruleState(ID.domain)), appliedDestinations: ['10.0.0.5/32'] };
+    expect(ruleDetail(rule(ID.domain), one, NOW, en)).toMatch(/^1 IP · /);
+    // The user's note is never translated.
+    expect(ruleDetail(rule(ID.subnet), stateOf(ID.subnet), NOW, en)).toBe('Ichki tarmoq');
+  });
+
+  it('ruleNotice: the reason in the language', () => {
+    const state = ruleState(ID.subnet, { status: 'error', reasonCode: 'route-failed' });
+    expect(ruleNotice(state, rule(ID.subnet), NOW, en)).toEqual({ kind: 'status', status: 'error', text: en.t.ruleReason['route-failed'] });
+    expect(ruleNotice(state, rule(ID.subnet), NOW, ru)?.text).toBe(ru.t.ruleReason['route-failed']);
+  });
+
+  it('statusLine: last apply, its trigger and the error count, with plurals', () => {
+    expect(statusLine(STATE, NOW, ru)).toEqual({ tone: 'success', text: 'Последнее применение: 10:58 · при изменении сети', errors: null });
+    expect(statusLine(STATE, NOW, en).text).toBe('Last applied: 10:58 · when the network changed');
+    const failing = (count: number) =>
+      withRules(Array.from({ length: count }, (_, i) => ruleState(`r${String(i)}`, { status: 'error', reasonCode: 'route-failed' })));
+    expect(statusLine(failing(1), NOW, ru).errors).toBe('Ошибка в 1 правиле');
+    expect(statusLine(failing(2), NOW, ru).errors).toBe('Ошибка в 2 правилах');
+    expect(statusLine(failing(1), NOW, en).errors).toBe('1 rule failing');
+    expect(statusLine(failing(2), NOW, en).errors).toBe('2 rules failing');
+    expect(statusLine({ ...STATE, lastApplyAt: null }, NOW, en).text).toBe('Not applied yet');
+    expect(statusLine({ ...STATE, enabled: false }, NOW, ru).text).toBe('Маршрутизация выключена — правила не применяются');
+  });
+
+  it('menuRules passes the language to every row', () => {
+    const rows = menuRules(CONFIG, STATE, NOW, MENU_RULE_LIMIT, en).shown;
+    expect(rows.find((row) => row.id === ID.domain)?.detail).toBe('3 IPs · 2 min ago');
   });
 });

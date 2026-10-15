@@ -218,8 +218,26 @@ export interface DomainResolverService {
   /** Resolves when no lookup is running or queued. Does not wait for scheduled refreshes or retries. */
   readonly whenIdle: () => Promise<void>;
   readonly stats: () => DomainResolverStats;
+  /**
+   * Read-only look at what a rule's lookup knows, for `diagnose`: the cached
+   * addresses (null before the first answer) and the servers the lookup asks.
+   * Null when the rule has no lookup (unknown, disabled, not a domain rule,
+   * not asked about yet). Starts nothing and changes nothing.
+   */
+  readonly peek: (ruleId: string) => CachedDomain | null;
   /** Cancels every lookup and timer and forgets everything. Afterwards `resolveDomain` starts nothing. */
   readonly stop: () => void;
+}
+
+/** What `peek` reports about a rule's lookup. */
+export interface CachedDomain {
+  /** The addresses of the last answer as served (sorted, at most `LIMITS.maxIpsPerDomain`); null before the first answer. */
+  readonly addresses: readonly string[] | null;
+  /** True when the last answer had more usable addresses than are served. */
+  readonly truncated: boolean;
+  /** The servers the lookup asks, in order; empty for the system resolvers. */
+  readonly servers: readonly string[];
+  readonly source: ServerSource;
 }
 
 // ---------------------------------------------------------------------------
@@ -294,6 +312,99 @@ const outcomeOfRejection = (error: unknown): LookupOutcome => {
   if (code === 'ENODATA') return { kind: 'answer', raw: [] };
   if (code === 'ENOTFOUND') return { kind: 'failure', reason: 'the DNS server does not know the name (ENOTFOUND)' };
   return { kind: 'failure', reason: code === null ? 'the DNS lookup failed' : `the DNS lookup failed (${code})` };
+};
+
+// ---------------------------------------------------------------------------
+// One-shot probe (diagnostics)
+// ---------------------------------------------------------------------------
+
+/** Time a diagnostic probe may take, all included. */
+export const PROBE_TIMEOUT_MS = 3000;
+
+export type ProbeOutcome = 'ok' | 'timeout' | 'refused' | 'error';
+
+export interface ProbeResult {
+  readonly outcome: ProbeOutcome;
+  /** Time to the outcome, in whole milliseconds. */
+  readonly ms: number;
+  /** The usable addresses of an `ok` answer (as `sanitizeAnswer` keeps them); empty otherwise. */
+  readonly addresses: readonly string[];
+  /** True when the answer had more usable addresses than were kept. */
+  readonly truncated: boolean;
+}
+
+export interface ProbeDeps {
+  readonly createResolver?: DnsResolverFactory | undefined;
+  readonly setTimer?: SetTimer | undefined;
+  readonly clearTimer?: ClearTimer | undefined;
+  /** Monotonic milliseconds; defaults to `performance.now`. */
+  readonly monotonicNow?: (() => number) | undefined;
+}
+
+const PROBE_OUTCOMES: Readonly<Record<string, ProbeOutcome>> = {
+  ETIMEOUT: 'timeout',
+  ECANCELLED: 'timeout',
+  EREFUSED: 'refused',
+};
+
+/**
+ * Asks one server for the A records of one name, once: a resolver of its own
+ * with a single try, cut off after `PROBE_TIMEOUT_MS` whatever happens. Never
+ * rejects. `ENODATA` (the name has no A records) is an `ok` answer with no
+ * addresses. `server` and `name` must already be validated (a routable IPv4
+ * address and a domain).
+ */
+export const probeDns = (server: string, name: string, deps: ProbeDeps = {}): Promise<ProbeResult> => {
+  const createResolver = deps.createResolver ?? createSystemResolver;
+  const setTimer = deps.setTimer ?? realSetTimer;
+  const clearTimer = deps.clearTimer ?? realClearTimer;
+  const monotonicNow = deps.monotonicNow ?? (() => performance.now());
+  const startedAt = monotonicNow();
+  return new Promise<ProbeResult>((resolve) => {
+    let done = false;
+    let resolver: DnsResolverLike | null = null;
+    const finish = (outcome: ProbeOutcome, raw: unknown = []): void => {
+      if (done) return;
+      done = true;
+      clearTimer(timer);
+      const answer = outcome === 'ok' ? sanitizeAnswer(raw) : null;
+      const ms = Math.min(PROBE_TIMEOUT_MS, Math.max(0, Math.round(monotonicNow() - startedAt)));
+      if (outcome === 'ok' && answer === null) {
+        resolve({ outcome: 'error', ms, addresses: [], truncated: false });
+        return;
+      }
+      resolve({
+        outcome,
+        ms,
+        addresses: answer?.addresses ?? [],
+        truncated: answer !== null && answer.usable > answer.addresses.length,
+      });
+    };
+    const timer = setTimer(() => {
+      try {
+        resolver?.cancel();
+      } catch {
+        // Cancelling is best effort; the probe is over either way.
+      }
+      finish('timeout');
+    }, PROBE_TIMEOUT_MS);
+    try {
+      resolver = createResolver({ timeout: PROBE_TIMEOUT_MS, tries: 1 });
+      resolver.setServers([server]);
+      Promise.resolve(resolver.resolve4(name)).then(
+        (raw) => {
+          finish('ok', raw);
+        },
+        (error: unknown) => {
+          const code = errorCodeOf(error);
+          if (code === 'ENODATA') finish('ok', []);
+          else finish(code === null ? 'error' : (PROBE_OUTCOMES[code] ?? 'error'));
+        },
+      );
+    } catch {
+      finish('error');
+    }
+  });
 };
 
 // ---------------------------------------------------------------------------
@@ -1340,10 +1451,23 @@ export const createDomainResolver = (deps: DomainResolverDeps): DomainResolverSe
     notifyIdle();
   };
 
+  const peek = (ruleId: string): CachedDomain | null => {
+    if (stopped) return null;
+    const entry = entries.get(subscriptions.get(ruleId)?.key ?? '');
+    if (entry === undefined) return null;
+    return {
+      addresses: entry.answer === null ? null : entry.addresses.slice(0, LIMITS.maxIpsPerDomain),
+      truncated: entry.answer !== null && entry.answer.usable > LIMITS.maxIpsPerDomain,
+      servers: entry.servers,
+      source: entry.source,
+    };
+  };
+
   return {
     resolveDomain,
     syncConfig,
     refreshAll,
+    peek,
     whenIdle: () =>
       new Promise<void>((resolve) => {
         idleWaiters.push(resolve);

@@ -1,5 +1,6 @@
 // The main-process side of `window.rs`: one `ipcMain.handle` per method of the
-// renderer API (`src/renderer/src/rs.d.ts`) and the `rs:state` push.
+// renderer API (`src/renderer/src/rs.d.ts`) and the `rs:state`, `rs:log` and
+// `rs:language` pushes, and `rs:rulesIntent` to the rules window.
 //
 // The renderer is treated as untrusted. Every call is checked, in this order:
 // it must come from the top frame of the app's own page; its arguments must
@@ -14,9 +15,12 @@
 
 import {
   Config as ConfigSchema,
+  DiagnoseRequest,
   describeIssues,
   findStructureViolation,
+  Language,
   Rule,
+  RulesWindowIntent,
   SetEnabledRequest,
   TestRequest,
   type Config,
@@ -28,19 +32,27 @@ import type {
   RsConnection,
   RsInvokeChannel,
   RsInvokeChannels,
+  RsLanguage,
+  RsLanguageChannel,
   RsLogChannel,
   RsResult,
+  RsRulesIntent,
+  RsRulesIntentChannel,
   RsSnapshot,
   RsStateChannel,
 } from '../renderer/src/rs';
 import { readConfigFile, writeConfigFile, type ConfigFileSystem } from './configFile';
 import { createConnectionJournal } from './connectionJournal';
+import { createDiagnoser, type NameLookup, type Timers } from './diagnose';
 import type { HelperClient, HelperStatus } from './helperClient';
 import type { Installer } from './installer';
 import { createLogBuffer, type LogBuffer } from './logBuffer';
 import type { Logger } from './logger';
+import type { PreferencesStore } from './preferences';
+import type { RulesBackupStore } from './rulesBackup';
 import { isAllowedNavigation } from './security';
 import type { Settings } from './settings';
+import { VIEW_PARAM, type WindowView } from './windows';
 
 // `RsConnection` is the renderer's copy of `HelperStatus`; this line fails to
 // compile as soon as the two drift apart.
@@ -48,6 +60,20 @@ const toConnection = (status: HelperStatus): RsConnection => status;
 
 export const STATE_CHANNEL: RsStateChannel = 'rs:state';
 export const LOG_CHANNEL: RsLogChannel = 'rs:log';
+export const LANGUAGE_CHANNEL: RsLanguageChannel = 'rs:language';
+export const RULES_INTENT_CHANNEL: RsRulesIntentChannel = 'rs:rulesIntent';
+
+/** How long an intent waits for the rules window to take it (TASK-DELTA-21). */
+export const RULES_INTENT_TTL_MS = 60_000;
+
+/** The view of the app page at `url` (`?view=`), or null when it names none. */
+export function viewOf(url: string): string | null {
+  try {
+    return new URL(url).searchParams.get(VIEW_PARAM);
+  } catch {
+    return null;
+  }
+}
 
 /** The channels handled here, in the order of the renderer API. */
 export const INVOKE_CHANNELS = [
@@ -59,6 +85,7 @@ export const INVOKE_CHANNELS = [
   'rs:setEnabled',
   'rs:apply',
   'rs:test',
+  'rs:diagnose',
   'rs:import',
   'rs:applyImport',
   'rs:export',
@@ -70,10 +97,17 @@ export const INVOKE_CHANNELS = [
   'rs:copyServiceOrderCommand',
   'rs:uninstall',
   'rs:openRulesWindow',
+  'rs:takeRulesIntent',
   'rs:reconnect',
   'rs:resetConfig',
   'rs:installHelper',
   'rs:removeHelper',
+  'rs:getLanguage',
+  'rs:setLanguage',
+  'rs:getBackup',
+  'rs:restoreBackup',
+  'rs:deleteBackup',
+  'rs:dismissBackup',
 ] as const satisfies readonly RsInvokeChannel[];
 
 /** What "Bo'sh config bilan boshlash" stores in place of a config the helper cannot load. */
@@ -115,6 +149,10 @@ export interface IpcDeps {
   readonly logBuffer?: LogBuffer;
   /** The login item and the network service order (settings screen). */
   readonly settings: Settings;
+  /** The UI language, kept in `userData/preferences.json`; every change is pushed to the windows as `rs:language`. */
+  readonly preferences: Pick<PreferencesStore, 'language' | 'setLanguage' | 'onLanguage' | 'dismissedBackupAt' | 'setDismissedBackupAt'>;
+  /** The app's copy of the last config it saw (`userData/rules-backup.json`, TASK-DELTA-16). */
+  readonly backup: Pick<RulesBackupStore, 'read' | 'remove'>;
   /** Runs the app's own install / uninstall script as root after the system password dialog (`installer.ts`). */
   readonly installer: Installer;
   /** Opens the rules window or brings it to the front (`WindowManager.openRules`). Main process only, no helper call. */
@@ -127,6 +165,10 @@ export interface IpcDeps {
   readonly newToken?: () => string;
   /** Milliseconds since the epoch, for the age of a waiting import and the time of the app's journal lines; `Date.now` by default. */
   readonly now?: () => number;
+  /** "Diagnostika": the system resolver for a name no rule covers, with the user's rights; `dns.lookup` by default. */
+  readonly lookupName?: NameLookup;
+  /** Timers of that lookup's 3 s limit; the real ones by default. */
+  readonly diagnoseTimers?: Timers;
 }
 
 /** `dialog.showOpenDialog` / `dialog.showSaveDialog`, reduced to the chosen path. */
@@ -139,6 +181,11 @@ export interface ConfigDialogs {
 export const IMPORT_TTL_MS = 10 * 60 * 1000;
 
 export interface IpcRegistration {
+  /**
+   * The main process's own way into `rs:openRulesWindow`: the same intent
+   * slot and signal (the tray menu's "Yordam" opens the Help section).
+   */
+  readonly openRulesWindow: (intent?: RsRulesIntent) => void;
   /** Removes the handlers and the helper-client subscriptions. Idempotent. */
   readonly dispose: () => void;
 }
@@ -165,6 +212,12 @@ type ArgsResult<A> = { readonly ok: true; readonly value: A } | { readonly ok: f
 /** Checks the argument list of one call: exactly as many values as `schemas`, each one parsed by its schema. */
 type ArgsParser<A> = (args: readonly unknown[]) => ArgsResult<A>;
 
+/** Like `argumentsOf(a)`, but the one argument may also be left out (not `undefined`: absent). */
+function optionalArgumentOf<A>(a: Schema<A>): ArgsParser<readonly [] | readonly [A]> {
+  const one = argumentsOf(a);
+  return (args) => (args.length === 0 ? { ok: true, value: [] } : one(args));
+}
+
 function argumentsOf(): ArgsParser<readonly []>;
 function argumentsOf<A>(a: Schema<A>): ArgsParser<readonly [A]>;
 function argumentsOf<A, B>(a: Schema<A>, b: Schema<B>): ArgsParser<readonly [A, B]>;
@@ -189,11 +242,17 @@ const RuleId: Schema<string> = Rule.in.shape.id;
 const Flag: Schema<boolean> = SetEnabledRequest.shape.enabled;
 /** One routable IPv4 address, normalised (forbidden destinations refused, ADR-001). */
 const TestTarget: Schema<string> = TestRequest.shape.target;
+/** A routable IPv4 address or a domain, normalised exactly as the helper's `diagnose` takes it (no wildcard, no URL). */
+const DiagnoseTarget: Schema<string> = DiagnoseRequest.shape.target;
 const RuleArgument: Schema<Rule> = Rule;
 /** The token of a waiting import: a UUID, like a rule id. */
 const ImportToken: Schema<string> = Rule.in.shape.id;
 /** Device overrides per role: only `ethernet` / `wifi` keys, each an `en*` name. Required (no `undefined`). */
 const IfaceOverrides: Schema<RsIfaceOverrides> = ConfigSchema.shape.ifaceOverrides.unwrap();
+/** A UI language: exactly `uz`, `ru` or `en`. */
+const LanguageArgument: Schema<RsLanguage> = Language;
+/** What the rules window is opened for: a section, or a DNS offer by routable server and role (shared, strict). */
+const IntentArgument: Schema<RsRulesIntent> = RulesWindowIntent;
 
 const ARGUMENTS = {
   'rs:getState': argumentsOf(),
@@ -204,6 +263,7 @@ const ARGUMENTS = {
   'rs:setEnabled': argumentsOf(Flag),
   'rs:apply': argumentsOf(),
   'rs:test': argumentsOf(TestTarget),
+  'rs:diagnose': argumentsOf(DiagnoseTarget),
   'rs:import': argumentsOf(),
   'rs:applyImport': argumentsOf(ImportToken),
   'rs:export': argumentsOf(),
@@ -214,16 +274,26 @@ const ARGUMENTS = {
   'rs:getServiceOrder': argumentsOf(),
   'rs:copyServiceOrderCommand': argumentsOf(),
   'rs:uninstall': argumentsOf(),
-  'rs:openRulesWindow': argumentsOf(),
+  'rs:openRulesWindow': optionalArgumentOf(IntentArgument),
+  'rs:takeRulesIntent': argumentsOf(),
   'rs:reconnect': argumentsOf(),
   'rs:resetConfig': argumentsOf(),
   'rs:installHelper': argumentsOf(),
   'rs:removeHelper': argumentsOf(),
+  'rs:getLanguage': argumentsOf(),
+  'rs:setLanguage': argumentsOf(LanguageArgument),
+  'rs:getBackup': argumentsOf(),
+  'rs:restoreBackup': argumentsOf(),
+  'rs:deleteBackup': argumentsOf(),
+  'rs:dismissBackup': argumentsOf(),
 } as const satisfies Readonly<Record<RsInvokeChannel, ArgsParser<readonly unknown[]>>>;
 
 type ParsedArgs<C extends RsInvokeChannel> = (typeof ARGUMENTS)[C] extends ArgsParser<infer A> ? A : never;
 
 type Handlers = { readonly [C in RsInvokeChannel]: (args: ParsedArgs<C>) => Promise<RsResult<RsInvokeChannels[C]['value']>> };
+
+/** Channels answered to one window only; any other page of the app gets `forbidden`. */
+const ONLY_FOR_VIEW: Partial<Readonly<Record<RsInvokeChannel, WindowView>>> = { 'rs:takeRulesIntent': 'rules' };
 
 const isTrustedSender = (event: InvokeEvent, entryUrl: string): boolean => {
   // A frame that is gone, or one whose properties cannot be read, is not trusted.
@@ -239,7 +309,7 @@ const isTrustedSender = (event: InvokeEvent, entryUrl: string): boolean => {
 type RuleEdit = (rules: Config['rules']) => RuleInput[] | null;
 
 export function registerIpcHandlers(deps: IpcDeps): IpcRegistration {
-  const { ipcMain, helperClient, entryUrl, settings } = deps;
+  const { ipcMain, helperClient, entryUrl, settings, preferences } = deps;
   const logger = deps.logger.child({ component: 'ipc' });
   // Everything below can be triggered by the page at will, so each kind of
   // line has its own rate-limit budget.
@@ -277,6 +347,48 @@ export function registerIpcHandlers(deps: IpcDeps): IpcRegistration {
   const configFs = deps.configFs;
   const newToken = deps.newToken ?? (() => globalThis.crypto.randomUUID());
   const now = deps.now ?? Date.now;
+
+  // -- what the rules window is opened for (TASK-DELTA-21) ---------------------
+  // One intent waits at a time (the last wins), until the rules window takes it or a minute passes.
+  let rulesIntent: { readonly intent: RsRulesIntent; readonly at: number } | null = null;
+  const intentLog = logger.limited('ipc-rules-intent');
+  /** Tells the rules window (and no other) that an intent is waiting; a new window takes it on load instead. */
+  const pushToRulesWindow = (): void => {
+    let recipients: readonly StateRecipient[];
+    try {
+      recipients = deps.listRecipients();
+    } catch (error) {
+      intentLog.error('Could not list the windows to tell of a waiting intent', { detail: error });
+      return;
+    }
+    for (const recipient of recipients) {
+      try {
+        if (recipient.isDestroyed()) continue;
+        const url = recipient.getURL();
+        if (!isAllowedNavigation(url, entryUrl) || viewOf(url) !== 'rules') continue;
+        recipient.send(RULES_INTENT_CHANNEL, null);
+      } catch (error) {
+        intentLog.error('Could not tell the rules window of a waiting intent', { detail: error });
+      }
+    }
+  };
+  /**
+   * Opens (or brings forward) the rules window, keeping `intent` for it first:
+   * a new window takes it once it has loaded. `source` is the IPC channel or
+   * `tray` (the tray menu's "Yordam", TASK-DELTA-22).
+   */
+  const openRulesWindow = (intent: RsRulesIntent | undefined, source: string): void => {
+    if (intent !== undefined) rulesIntent = { intent, at: now() };
+    deps.openRulesWindow();
+    if (intent !== undefined) pushToRulesWindow();
+    // The kind (and a section's name) only: a DNS offer's server is the user's network, not for the log above debug.
+    windowLog.info('Rules window requested', {
+      channel: source,
+      intent: intent?.kind ?? null,
+      ...(intent?.kind === 'section' ? { section: intent.section } : {}),
+    });
+  };
+
   // At most one system file dialog at a time; a second click is answered `busy`.
   let dialogOpen = false;
   const withDialog = async <T>(task: () => Promise<RsResult<T>>): Promise<RsResult<T>> => {
@@ -320,6 +432,29 @@ export function registerIpcHandlers(deps: IpcDeps): IpcRegistration {
       if (saved.ok) changeLog.info('Config imported', { channel: 'rs:applyImport', rules: waiting.config.rules.length });
       return saved;
     });
+
+  // -- the rules backup (TASK-DELTA-16) ---------------------------------------
+  // A restore is an import whose file is the app's own backup: the same
+  // preview, the same one-use token, the same `applyImport`. Nothing reaches
+  // the helper before the user's "Almashtirish".
+  const backupLog = logger.limited('ipc-rules-backup');
+
+  const restoreBackup = async (): Promise<RsResult<RsInvokeChannels['rs:restoreBackup']['value']>> => {
+    const backup = await deps.backup.read();
+    if (backup === null) return failure('no-backup', 'The app holds no rules backup');
+    // Checked when it was read; checked again here, as for a file, before it can be sent.
+    const violation = findStructureViolation(backup.config);
+    const parsed = violation === null ? ConfigSchema.safeParse(backup.config) : null;
+    if (parsed === null || !parsed.success) {
+      pendingImport = null;
+      backupLog.warn('Refused the rules backup', { channel: 'rs:restoreBackup' });
+      return failure('invalid-config', 'The rules backup does not hold a valid config');
+    }
+    const token = newToken();
+    pendingImport = { token, config: parsed.data, at: now() };
+    backupLog.info('Rules backup read for restore', { channel: 'rs:restoreBackup', rules: parsed.data.rules.length, savedAt: backup.savedAt });
+    return { ok: true, value: { token, config: parsed.data } };
+  };
 
   const exportConfig = () =>
     withDialog(async (): Promise<RsResult<RsInvokeChannels['rs:export']['value']>> => {
@@ -365,6 +500,26 @@ export function registerIpcHandlers(deps: IpcDeps): IpcRegistration {
     return result;
   };
 
+  // -- diagnostics (TASK-DELTA-20) --------------------------------------------
+  // One at a time: a second click while one runs is answered `busy`, so a
+  // page cannot pile up lookups and helper requests.
+  const diagnoser = createDiagnoser({
+    request: helperClient.request,
+    logger,
+    ...(deps.lookupName === undefined ? {} : { lookup: deps.lookupName }),
+    ...(deps.diagnoseTimers === undefined ? {} : { timers: deps.diagnoseTimers }),
+  });
+  let diagnosing = false;
+  const diagnose = async (target: string): Promise<RsResult<RsInvokeChannels['rs:diagnose']['value']>> => {
+    if (diagnosing) return failure('busy', 'A diagnosis is already running');
+    diagnosing = true;
+    try {
+      return await diagnoser(target);
+    } finally {
+      diagnosing = false;
+    }
+  };
+
   const handlers: Handlers = {
     'rs:getState': () => {
       const { status, state } = helperClient.snapshot();
@@ -399,6 +554,8 @@ export function registerIpcHandlers(deps: IpcDeps): IpcRegistration {
       }),
     'rs:apply': () => serially(() => helperClient.request('apply')),
     'rs:test': ([target]) => helperClient.request('test', { target }),
+    // Read-only; the target is logged at debug only (`diagnose.ts`).
+    'rs:diagnose': ([target]) => diagnose(target),
     // The system dialogs of this process choose the file; the page never sends or sees a path.
     'rs:import': () => importConfig(),
     'rs:applyImport': ([token]) => applyImport(token),
@@ -428,10 +585,15 @@ export function registerIpcHandlers(deps: IpcDeps): IpcRegistration {
         return result;
       }),
     // A window of this process; the helper is not involved. A throw is answered `internal` below.
-    'rs:openRulesWindow': () => {
-      deps.openRulesWindow();
-      windowLog.info('Rules window requested', { channel: 'rs:openRulesWindow' });
+    'rs:openRulesWindow': ([intent]) => {
+      openRulesWindow(intent, 'rs:openRulesWindow');
       return Promise.resolve({ ok: true, value: null });
+    },
+    'rs:takeRulesIntent': () => {
+      const waiting = rulesIntent;
+      rulesIntent = null;
+      const fresh = waiting !== null && now() - waiting.at <= RULES_INTENT_TTL_MS ? waiting.intent : null;
+      return Promise.resolve({ ok: true, value: fresh });
     },
     // "Qayta ulanish": the client ignores it while a connection is open or being opened.
     'rs:reconnect': () => {
@@ -451,6 +613,28 @@ export function registerIpcHandlers(deps: IpcDeps): IpcRegistration {
       }),
     'rs:installHelper': () => setUpHelper('rs:installHelper', deps.installer.install),
     'rs:removeHelper': () => setUpHelper('rs:removeHelper', deps.installer.uninstall),
+    // The app's own preference: no helper round trip, and it works while the helper is away.
+    'rs:getLanguage': async () => ({ ok: true, value: await preferences.language() }),
+    'rs:setLanguage': async ([language]) => ({ ok: true, value: await preferences.setLanguage(language) }),
+    // The app's own file: answered without the helper. The page learns how many rules, not which.
+    'rs:getBackup': async () => {
+      const backup = await deps.backup.read();
+      if (backup === null) return { ok: true, value: null };
+      const dismissed = (await preferences.dismissedBackupAt()) === backup.savedAt;
+      return { ok: true, value: { savedAt: backup.savedAt, ruleCount: backup.config.rules.length, dismissed } };
+    },
+    'rs:restoreBackup': () => restoreBackup(),
+    'rs:deleteBackup': async () => {
+      const removed = await deps.backup.remove();
+      backupLog.info('Rules backup removal requested', { channel: 'rs:deleteBackup', ok: removed });
+      return removed ? { ok: true, value: null } : failure('write-failed', 'The rules backup could not be removed');
+    },
+    // Only the backup on disk now can be turned down: the page names none.
+    'rs:dismissBackup': async () => {
+      const backup = await deps.backup.read();
+      if (backup !== null) await preferences.setDismissedBackupAt(backup.savedAt);
+      return { ok: true, value: null };
+    },
   };
 
   const register = (channel: RsInvokeChannel): void => {
@@ -462,6 +646,11 @@ export function registerIpcHandlers(deps: IpcDeps): IpcRegistration {
       if (!isTrustedSender(event, entryUrl)) {
         senderLog.warn('Refused a call that did not come from the app page', { channel });
         return failure('forbidden', 'Calls are answered only for the app page');
+      }
+      const onlyFor = ONLY_FOR_VIEW[channel];
+      if (onlyFor !== undefined && viewOf(event.senderFrame?.url ?? '') !== onlyFor) {
+        senderLog.warn('Refused a call from another window of the app', { channel });
+        return failure('forbidden', `Calls on this channel are answered only for the ${onlyFor} window`);
       }
       // Bounded walk first: zod does not stop early on an oversized array.
       const violation = findStructureViolation(args);
@@ -492,11 +681,12 @@ export function registerIpcHandlers(deps: IpcDeps): IpcRegistration {
   // -- pushes: rs:state, rs:log ----------------------------------------------
 
   /** Sends to every window that shows the app's page; a failure is logged, never thrown into the sender. */
-  const PUSHED: Readonly<Record<RsStateChannel | RsLogChannel, string>> = {
+  const PUSHED: Readonly<Record<RsStateChannel | RsLogChannel | RsLanguageChannel, string>> = {
     'rs:state': 'the state',
     'rs:log': 'a journal entry',
+    'rs:language': 'the language',
   };
-  const broadcast = (channel: RsStateChannel | RsLogChannel, payload: unknown): void => {
+  const broadcast = (channel: RsStateChannel | RsLogChannel | RsLanguageChannel, payload: unknown): void => {
     let recipients: readonly StateRecipient[];
     try {
       recipients = deps.listRecipients();
@@ -525,8 +715,8 @@ export function registerIpcHandlers(deps: IpcDeps): IpcRegistration {
     broadcast(STATE_CHANNEL, snapshot);
   };
 
-  // The app's own journal lines: the helper cannot report that it is gone.
-  const connectionJournal = createConnectionJournal({ logBuffer, now });
+  // The app's own journal lines: the helper cannot report that it is gone. In the UI language of the moment.
+  const connectionJournal = createConnectionJournal({ logBuffer, now, language: () => preferences.language() });
 
   const unsubscribes = [
     helperClient.onStatus(push),
@@ -539,10 +729,18 @@ export function registerIpcHandlers(deps: IpcDeps): IpcRegistration {
     logBuffer.subscribe((entry) => {
       broadcast(LOG_CHANNEL, entry);
     }),
+    // Every window (the popover and the rules window) switches language at once, without a reload.
+    preferences.onLanguage((language) => {
+      broadcast(LANGUAGE_CHANNEL, language);
+    }),
   ];
 
   let disposed = false;
   return {
+    openRulesWindow: (intent) => {
+      if (disposed) return;
+      openRulesWindow(intent, 'tray');
+    },
     dispose: () => {
       if (disposed) return;
       disposed = true;

@@ -11,11 +11,14 @@ import trayError1x from '../../resources/tray/trayErrorTemplate.png?asset';
 import trayError2x from '../../resources/tray/trayErrorTemplate@2x.png?asset';
 import trayOff1x from '../../resources/tray/trayOffTemplate.png?asset';
 import trayOff2x from '../../resources/tray/trayOffTemplate@2x.png?asset';
+import { i18nFor, type Messages } from '../i18n';
 import { startApp } from './bootstrap';
 import { createDevelopmentRuntime } from './development';
 import { createHelperClient } from './helperClient';
 import { createInstaller, HELPER_RESOURCES_DIR, runWithExecFile } from './installer';
 import { createJsonLinesSink, createLogger } from './logger';
+import { createPreferences } from './preferences';
+import { createRulesBackup } from './rulesBackup';
 import { createSettings, listServiceOrderWithNetworksetup } from './settings';
 import { loadTrayImage, startShell } from './tray';
 
@@ -48,6 +51,23 @@ startApp({
     // Bundled next to the main process by electron-vite (`?asset`), so the
     // paths hold in development and inside the packaged app alike.
     const imageDeps = { createEmpty: () => nativeImage.createEmpty(), readFile: (file: string) => readFileSync(file) };
+    // Per user, in the app's own data directory; read on the first `language()`.
+    // The tray, the dialogs and the password prompt speak its language.
+    const preferences = createPreferences({
+      dir: app.getPath('userData'),
+      preferredLanguages: () => app.getPreferredSystemLanguages(),
+      logger,
+    });
+    // The last config the helper reported, per user (0600): offered back after a
+    // reinstall with an empty config, only through the import preview (TASK-DELTA-16).
+    const rulesBackup = createRulesBackup({
+      dir: app.getPath('userData'),
+      uid: process.getuid?.() ?? -1,
+      helperClient,
+      logger,
+    });
+    /** The words of the main process in the current UI language. */
+    const words = async (): Promise<Messages> => i18nFor(await preferences.language()).t;
     return startShell(
       {
         createTray: (image) => new Tray(image),
@@ -66,6 +86,8 @@ startApp({
         quit: () => {
           app.quit();
         },
+        preferences,
+        rulesBackup,
         settings: createSettings({
           loginItem: {
             get: () => app.getLoginItemSettings().openAtLogin,
@@ -82,7 +104,7 @@ startApp({
         configDialogs: {
           chooseImportFile: async () => {
             const options: Electron.OpenDialogOptions = {
-              title: 'Config import',
+              title: (await words()).dialogs.importTitle,
               properties: ['openFile'],
               filters: [{ name: 'JSON', extensions: ['json'] }],
             };
@@ -92,7 +114,7 @@ startApp({
           },
           chooseExportFile: async () => {
             const options: Electron.SaveDialogOptions = {
-              title: 'Config export',
+              title: (await words()).dialogs.exportTitle,
               defaultPath: path.join(app.getPath('documents'), 'routeswitch-config.json'),
               filters: [{ name: 'JSON', extensions: ['json'] }],
               properties: ['createDirectory', 'showOverwriteConfirmation'],
@@ -107,6 +129,7 @@ startApp({
           resourcesDir: app.isPackaged ? path.join(process.resourcesPath, HELPER_RESOURCES_DIR) : null,
           uid: process.getuid?.() ?? -1,
           run: runWithExecFile,
+          language: () => preferences.language(),
           logger,
         }),
         logger,

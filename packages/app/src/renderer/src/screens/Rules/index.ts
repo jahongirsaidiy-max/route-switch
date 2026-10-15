@@ -5,6 +5,8 @@ export {
   notesById,
   overlapWarnings,
   ROW_FILTER_LABELS,
+  ROW_FILTERS,
+  rowFilterLabels,
   rowDetail,
   rowStatus,
   ruleRows,
@@ -16,6 +18,7 @@ export {
 } from './model';
 export {
   ADD_RULE_UNAVAILABLE,
+  DnsWarningBanner,
   RulesPanel,
   RulesScreen,
   type RulesPanelProps,

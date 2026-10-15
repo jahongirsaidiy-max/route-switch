@@ -1,17 +1,14 @@
 import type { RuleStatus } from '@routeswitch/shared';
 import type { ReactElement } from 'react';
 
+import type { I18n } from '../../../i18n';
+import { UZ } from '../text';
 import styles from './StatusBadge.module.css';
 
 export type StatusTone = 'success' | 'warning' | 'danger' | 'neutral';
 
-/** The visible words for a rule status (`EngineState.rules[].status`). */
-export const RULE_STATUS_LABELS: Readonly<Record<RuleStatus, string>> = {
-  active: 'Faol',
-  pending: 'Kutilmoqda',
-  error: 'Xato',
-  disabled: "O'chirilgan",
-};
+/** The visible words for a rule status (`EngineState.rules[].status`) in Uzbek; `i18n.t.components.ruleStatus` in a screen's language. */
+export const RULE_STATUS_LABELS: Readonly<Record<RuleStatus, string>> = UZ.t.components.ruleStatus;
 
 export const RULE_STATUS_TONES: Readonly<Record<RuleStatus, StatusTone>> = {
   active: 'success',
@@ -24,11 +21,13 @@ export interface StatusBadgeProps {
   readonly status: RuleStatus;
   /** Why the rule is in this status (already translated); shown as a tooltip and read by screen readers. */
   readonly detail?: string;
+  /** The UI language (`useI18n()` of the screen); Uzbek when not given. */
+  readonly i18n?: I18n | undefined;
 }
 
 /** A rule's status as a small tag, in the style of the design's DEFAULT tag. */
-export function StatusBadge({ status, detail }: StatusBadgeProps): ReactElement {
-  const label = RULE_STATUS_LABELS[status];
+export function StatusBadge({ status, detail, i18n = UZ }: StatusBadgeProps): ReactElement {
+  const label = i18n.t.components.ruleStatus[status];
   return (
     <span className={styles['badge']} data-tone={RULE_STATUS_TONES[status]} data-status={status} title={detail}>
       <span className={styles['badgeDot']} aria-hidden="true" />

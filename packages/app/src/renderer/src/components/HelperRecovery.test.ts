@@ -1,6 +1,7 @@
 import { createElement, isValidElement, type ReactElement, type ReactNode } from 'react';
 import { describe, expect, it, vi } from 'vitest';
 
+import { i18nFor } from '../../../i18n';
 import type { RsApi } from '../rs';
 import { INSTALL_TEXT } from '../text';
 import { Banner } from './Banner';
@@ -108,5 +109,23 @@ describe('Banner', () => {
     expect(html).toContain('<button>y</button>');
     expect(html).toContain('data-size="compact"');
     expect(html).toContain('data-tone="danger"');
+  });
+});
+
+describe('HelperRecovery and requestReconnect in every language (TASK-DELTA-14)', () => {
+  it.each([
+    ['ru', 'Переподключиться', 'Проверить снова', 'Установить helper', 'Переустановить helper'],
+    ['en', 'Reconnect', 'Check again', 'Install the helper', 'Reinstall the helper'],
+  ] as const)('%s: the buttons and the install hint', (locale, reconnect, recheck, install, reinstall) => {
+    const i18n = i18nFor(locale);
+    expect(buttonsOf(HelperRecovery(props({ i18n }))).map((button) => button.props.children)).toEqual([reconnect]);
+    expect(buttonsOf(HelperRecovery(props({ recovery: 'install', i18n }))).map((button) => button.props.children)).toEqual([recheck, install]);
+    expect(buttonsOf(HelperRecovery(props({ recovery: 'reinstall', i18n }))).map((button) => button.props.children)).toEqual([recheck, reinstall]);
+    expect(renderMarkup(createElement(HelperRecovery, props({ recovery: 'install', installing: true, i18n })))).toContain(i18n.t.install.waiting);
+  });
+
+  it('a refused reconnect is worded in the language given', async () => {
+    const refused = { reconnectHelper: () => Promise.resolve({ ok: false, code: 'forbidden', error: 'x' } as const) };
+    expect(await requestReconnect(refused, i18nFor('en'))).toEqual({ tone: 'danger', text: i18nFor('en').t.errors.forbidden });
   });
 });

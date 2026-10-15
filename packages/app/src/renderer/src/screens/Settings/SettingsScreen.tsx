@@ -1,13 +1,17 @@
-// "Sozlamalar": login item, Ethernet adapter override, Wi‑Fi as the default
+// "Sozlamalar": the UI language (TASK-DELTA-11), login item, Ethernet adapter override, Wi‑Fi as the default
 // channel (a command shown for the user to run — the app never runs it,
-// decision GAP-04) and removing the helper. The design has no settings screen
-// (GAP-01): it follows the rules window — page header, bordered cards.
+// decision GAP-04), the rules backup (TASK-DELTA-16) and removing the helper. The design has no settings screen
+// (GAP-01): it follows the rules window — page header, bordered cards. The
+// words are in the UI language (`t.settings`, TASK-DELTA-14); the command
+// itself is shown as `networksetup` takes it.
 
 import type { Config } from '@routeswitch/shared';
 import { useCallback, useEffect, useRef, useState, type ReactElement, type Ref } from 'react';
 
-import { Button, ROLE_LABELS, StatusDot, Toggle } from '../../components';
+import { LANGUAGE_NAMES, LANGUAGE_PICKER_TITLE, LOCALES, isLocale, type I18n, type Locale } from '../../../../i18n';
+import { Button, StatusDot, Toggle } from '../../components';
 import { useEngineState, type EngineStateView } from '../../hooks/useEngineState';
+import { useI18n } from '../../hooks/useI18n';
 import { browserShowSignal, readOnShow, type ShowSignal, type ShownReader } from '../../hooks/windowShown';
 import type { RsApi, RsServiceOrder } from '../../rs';
 import {
@@ -19,10 +23,26 @@ import {
   type Feedback,
   type SettingsApi,
 } from './actions';
-import { errorText, HELPER_STATUS_TEXT } from '../../text';
+import { errorText, helperStatusText, UZ } from '../../text';
+import {
+  backupKey,
+  INITIAL_BACKUP_VIEW,
+  removeBackup,
+  useBackup,
+  type BackupApi,
+  type BackupView,
+} from '../Rules/recovery';
+import {
+  cancelPreview,
+  confirmPreview,
+  INITIAL_TRANSFER_UI,
+  previewQuestion,
+  startRestore,
+  type TransferUiState,
+} from '../Rules/transfer';
 import styles from './SettingsScreen.module.css';
 
-export type SettingsSection = 'login' | 'ethernet' | 'wifi' | 'helper';
+export type SettingsSection = 'language' | 'login' | 'ethernet' | 'wifi' | 'backup' | 'helper';
 
 export interface ServiceOrderView {
   readonly phase: 'loading' | 'ready' | 'failed';
@@ -32,6 +52,11 @@ export interface ServiceOrderView {
 
 export interface SettingsPanelProps {
   readonly engine: EngineStateView;
+  /** The UI language in force (`useI18n().locale`). */
+  readonly language: Locale;
+  /** The language card's hint, in the language in force (`t.settingsLanguage.hint`). */
+  readonly languageHint: string;
+  readonly onSelectLanguage: (language: Locale) => void;
   /** Null while it is being read or when it could not be read. */
   readonly openAtLogin: boolean | null;
   /** The stored overrides; undefined when the config has not been read (no helper). */
@@ -49,6 +74,23 @@ export interface SettingsPanelProps {
   readonly onConfirmUninstall: () => void;
   /** The "Helper'ni o'chirish" button, so the focus can return to it after the question closes. */
   readonly uninstallRef?: Ref<HTMLButtonElement> | undefined;
+  /** The rules backup (TASK-DELTA-16); `loading` when not given. */
+  readonly backup?: BackupView | undefined;
+  /** The helper's config now, for the restore preview's counts; null when not read. */
+  readonly config?: Config | null | undefined;
+  /** Milliseconds since the epoch, for the backup's time. */
+  readonly now?: number | undefined;
+  /** The restore's preview and its outcome (the import flow of the rules window). */
+  readonly restore?: TransferUiState | undefined;
+  readonly confirmingBackupRemoval?: boolean | undefined;
+  readonly onRestoreBackup?: (() => void) | undefined;
+  readonly onConfirmRestore?: ((token: string) => void) | undefined;
+  readonly onCancelRestore?: (() => void) | undefined;
+  readonly onAskRemoveBackup?: (() => void) | undefined;
+  readonly onCancelRemoveBackup?: (() => void) | undefined;
+  readonly onConfirmRemoveBackup?: (() => void) | undefined;
+  /** The UI language (`useI18n()`); Uzbek when not given. */
+  readonly i18n?: I18n | undefined;
 }
 
 const AUTO = '';
@@ -62,9 +104,115 @@ function FeedbackLine({ feedback }: { readonly feedback: Feedback | null | undef
   );
 }
 
+/**
+ * "Qoidalar zaxirasi": what the app's backup holds, "Zaxiradan tiklash" (the
+ * import preview, then "Almashtirish") and "Zaxirani o'chirish" (after a question).
+ */
+function BackupCard(props: SettingsPanelProps & { readonly i18n: I18n; readonly connected: boolean }): ReactElement {
+  const { i18n, busy } = props;
+  const words = i18n.t.backup.settings;
+  const backup = props.backup ?? INITIAL_BACKUP_VIEW;
+  const restore = props.restore ?? INITIAL_TRANSFER_UI;
+  const info = backup.info;
+  const now = props.now ?? Date.now();
+  const preview = restore.preview;
+  const removing = busy.has('backup');
+  return (
+    <section className={styles['card']} aria-labelledby="settings-backup">
+      <h2 id="settings-backup" className={styles['cardTitle']}>
+        {words.title}
+      </h2>
+      <p className={styles['hint']}>{words.hint}</p>
+      <p className={styles['status']} role="status">
+        {backup.phase === 'loading' ? words.loading : info === null ? words.none : words.summary(info.ruleCount, i18n.formatTime(info.savedAt, now))}
+      </p>
+      {info !== null && !props.connected ? <p className={styles['hint']}>{words.needsHelper}</p> : null}
+      {preview !== null ? (
+        <div
+          key={preview.token}
+          className={styles['confirm']}
+          role="alertdialog"
+          aria-labelledby="settings-restore-question"
+          onKeyDown={(event) => {
+            if (event.key === 'Escape') props.onCancelRestore?.();
+          }}
+        >
+          <p id="settings-restore-question" className={styles['confirmText']}>
+            {previewQuestion(preview, props.config ?? null, now, i18n)}
+          </p>
+          <div className={styles['actions']}>
+            <Button
+              variant="primary"
+              busy={restore.phase === 'applying'}
+              onClick={() => {
+                props.onConfirmRestore?.(preview.token);
+              }}
+            >
+              {i18n.t.rules.replace}
+            </Button>
+            {/* The safe choice takes the focus (WAI-ARIA alertdialog). */}
+            <Button autoFocus onClick={() => {
+              props.onCancelRestore?.();
+            }} busy={restore.phase === 'applying'}>
+              {words.cancel}
+            </Button>
+          </div>
+        </div>
+      ) : props.confirmingBackupRemoval === true ? (
+        <div
+          className={styles['confirm']}
+          role="alertdialog"
+          aria-labelledby="settings-backup-question"
+          onKeyDown={(event) => {
+            if (event.key === 'Escape' && !removing) props.onCancelRemoveBackup?.();
+          }}
+        >
+          <p id="settings-backup-question" className={styles['confirmText']}>
+            {words.removeQuestion}
+          </p>
+          <div className={styles['actions']}>
+            <Button variant="primary" onClick={() => {
+              props.onConfirmRemoveBackup?.();
+            }} busy={removing}>
+              {words.removeConfirm}
+            </Button>
+            <Button autoFocus onClick={() => {
+              props.onCancelRemoveBackup?.();
+            }} busy={removing}>
+              {words.cancel}
+            </Button>
+          </div>
+        </div>
+      ) : (
+        <div className={styles['actions']}>
+          <Button
+            variant="primary"
+            onClick={() => {
+              props.onRestoreBackup?.();
+            }}
+            disabled={info === null || info.ruleCount === 0 || !props.connected}
+            busy={restore.phase !== 'idle'}
+          >
+            {words.restore}
+          </Button>
+          <Button onClick={() => {
+              props.onAskRemoveBackup?.();
+            }} disabled={info === null}>
+            {words.remove}
+          </Button>
+        </div>
+      )}
+      <FeedbackLine feedback={restore.feedback} />
+      <FeedbackLine feedback={props.feedback.backup} />
+    </section>
+  );
+}
+
 /** The settings for given data; `SettingsScreen` supplies the live data and the actions. */
 export function SettingsPanel(props: SettingsPanelProps): ReactElement {
   const { engine, serviceOrder, busy, feedback } = props;
+  const i18n = props.i18n ?? UZ;
+  const words = i18n.t.settings;
   const state = engine.state;
   const connected = engine.helper === 'connected' && state !== null;
   // The helper also removes itself when its stored config is unreadable (it answers every method but two).
@@ -79,34 +227,60 @@ export function SettingsPanel(props: SettingsPanelProps): ReactElement {
   const ethernetBusy = busy.has('ethernet');
   // An override naming an adapter that is not plugged in stays selectable, so the select shows the truth.
   const missingOverride = override !== null && !choices.some((adapter) => adapter.device === override);
-  const helperStatus = HELPER_STATUS_TEXT[engine.helper];
+  const helperStatus = helperStatusText(engine.helper, i18n);
   const order = serviceOrder.order;
 
   return (
     <section className={styles['screen']} aria-labelledby="settings-title">
       <header className={styles['header']}>
         <h1 id="settings-title" className={styles['title']}>
-          Sozlamalar
+          {words.title}
         </h1>
-        <p className={styles['subtitle']}>Ilova va helper sozlamalari. Qoidalar helper'da saqlanadi.</p>
+        <p className={styles['subtitle']}>{words.subtitle}</p>
       </header>
 
       <div className={styles['sections']}>
+        <section className={styles['card']} aria-labelledby="settings-language">
+          {/* The title reads the same in every language, and each option is in its own: findable whatever language is on. */}
+          <h2 id="settings-language" className={styles['cardTitle']}>
+            {LANGUAGE_PICKER_TITLE}
+          </h2>
+          <p className={styles['hint']}>{props.languageHint}</p>
+          <div className={styles['field']}>
+            <select
+              name="language"
+              aria-labelledby="settings-language"
+              className={`${styles['select'] ?? ''} ${styles['selectText'] ?? ''}`}
+              value={props.language}
+              aria-disabled={busy.has('language') ? true : undefined}
+              aria-busy={busy.has('language') || undefined}
+              onChange={(event) => {
+                if (busy.has('language') || !isLocale(event.target.value)) return;
+                props.onSelectLanguage(event.target.value);
+              }}
+            >
+              {LOCALES.map((locale) => (
+                <option key={locale} value={locale} lang={locale}>
+                  {LANGUAGE_NAMES[locale]}
+                </option>
+              ))}
+            </select>
+          </div>
+          <FeedbackLine feedback={feedback.language} />
+        </section>
+
         <section className={styles['card']} aria-labelledby="settings-login">
           <div className={styles['row']}>
             <div className={styles['text']}>
               <h2 id="settings-login" className={styles['cardTitle']}>
-                Login'da ishga tushirish
+                {words.login.title}
               </h2>
-              <p className={styles['hint']}>
-                Kompyuterga kirganda RouteSwitch menu bar'da ochiladi. Route'lar ilovasiz ham ishlayveradi — ularni helper ushlab
-                turadi.
-              </p>
+              <p className={styles['hint']}>{words.login.hint}</p>
             </div>
             <Toggle
               checked={props.openAtLogin === true}
               onChange={props.onToggleLogin}
-              label="Login'da ishga tushirish"
+              label={words.login.title}
               disabled={props.openAtLogin === null && !busy.has('login')}
               busy={busy.has('login')}
             />
@@ -116,14 +290,11 @@ export function SettingsPanel(props: SettingsPanelProps): ReactElement {
 
         <section className={styles['card']} aria-labelledby="settings-ethernet">
           <h2 id="settings-ethernet" className={styles['cardTitle']}>
-            {ROLE_LABELS.ethernet} adapteri
+            {words.ethernet.title}
           </h2>
-          <p className={styles['hint']}>
-            Odatda birinchi IP manzili bor, Wi‑Fi bo'lmagan adapter olinadi
-            {detected === null ? '' : ` (hozir: ${detected})`}. Bir nechta adapter bo'lsa, keraklisini tanlang.
-          </p>
+          <p className={styles['hint']}>{words.ethernet.hint(detected)}</p>
           <label className={styles['field']}>
-            <span className={styles['label']}>Ethernet roli uchun adapter</span>
+            <span className={styles['label']}>{words.ethernet.fieldLabel}</span>
             <select
               className={styles['select']}
               value={override ?? AUTO}
@@ -135,48 +306,45 @@ export function SettingsPanel(props: SettingsPanelProps): ReactElement {
                 props.onSelectEthernet(event.target.value === AUTO ? null : event.target.value);
               }}
             >
-              <option value={AUTO}>Avtomatik</option>
+              <option value={AUTO}>{words.ethernet.auto}</option>
               {choices.map((adapter) => (
                 <option key={adapter.device} value={adapter.device}>
-                  {[adapter.device, adapter.port, adapter.ip ?? "IP yo'q"].join(' · ')}
+                  {[adapter.device, adapter.port, adapter.ip ?? words.ethernet.noIp].join(' · ')}
                 </option>
               ))}
-              {missingOverride ? <option value={override}>{override} · ulanmagan</option> : null}
+              {missingOverride ? <option value={override}>{words.ethernet.notConnected(override)}</option> : null}
             </select>
           </label>
-          {connected ? null : <p className={styles['hint']}>Helper ulanganda tanlash mumkin.</p>}
+          {connected ? null : <p className={styles['hint']}>{words.ethernet.needsHelper}</p>}
           <FeedbackLine feedback={feedback.ethernet} />
         </section>
 
         <section className={styles['card']} aria-labelledby="settings-wifi">
           <h2 id="settings-wifi" className={styles['cardTitle']}>
-            Wi‑Fi'ni default qilish
+            {words.wifi.title}
           </h2>
-          <p className={styles['hint']}>
-            Qoidaga tushmagan trafik xizmatlar tartibidagi birinchi ulangan tarmoqdan ketadi. Bu tartibni o'zgartirish administrator
-            huquqini talab qiladi, shuning uchun RouteSwitch buyruqni faqat ko'rsatadi — uni Terminal'da o'zingiz bajarasiz.
-          </p>
+          <p className={styles['hint']}>{words.wifi.hint}</p>
           {serviceOrder.phase === 'loading' ? (
             <p className={styles['hint']} role="status">
-              Xizmatlar tartibi o'qilmoqda…
+              {words.wifi.loading}
             </p>
           ) : null}
           {serviceOrder.phase === 'failed' ? (
             <p className={styles['feedback']} data-tone="danger" role="alert">
-              Xizmatlar tartibini o'qib bo'lmadi.
+              {words.wifi.failed}
             </p>
           ) : null}
           {order !== null && order.command === null ? (
-            <p className={styles['hint']}>Wi‑Fi xizmati topilmadi.</p>
+            <p className={styles['hint']}>{words.wifi.notFound}</p>
           ) : null}
           {order !== null && order.command !== null ? (
             <>
               <p className={styles['status']} data-ok={order.wifiFirst}>
                 {order.wifiFirst
-                  ? `${order.wifiService ?? 'Wi‑Fi'} allaqachon birinchi — default kanal Wi‑Fi.`
-                  : `Hozir birinchi: ${order.services.find((service) => service.enabled)?.name ?? '—'}.`}
+                  ? words.wifi.alreadyFirst(order.wifiService ?? 'Wi‑Fi')
+                  : words.wifi.currentFirst(order.services.find((service) => service.enabled)?.name ?? '—')}
               </p>
-              <pre className={styles['command']} aria-label="Wi‑Fi'ni birinchi qiladigan buyruq">
+              <pre className={styles['command']} aria-label={words.wifi.commandLabel}>
                 <code>{order.command}</code>
               </pre>
             </>
@@ -188,18 +356,20 @@ export function SettingsPanel(props: SettingsPanelProps): ReactElement {
               disabled={order?.command === null || order === null}
               busy={busy.has('wifi')}
             >
-              Nusxalash
+              {words.wifi.copy}
             </Button>
             <Button onClick={props.onRefreshOrder} busy={serviceOrder.phase === 'loading'}>
-              Yangilash
+              {words.wifi.refresh}
             </Button>
           </div>
           <FeedbackLine feedback={serviceOrder.feedback} />
         </section>
 
+        <BackupCard {...props} i18n={i18n} connected={connected} />
+
         <section className={styles['card']} aria-labelledby="settings-helper">
           <h2 id="settings-helper" className={styles['cardTitle']}>
-            Helper
+            {words.helper.title}
           </h2>
           <div className={styles['helperStatus']}>
             <StatusDot tone={helperStatus.tone} label={helperStatus.text} size="sm" />
@@ -208,10 +378,7 @@ export function SettingsPanel(props: SettingsPanelProps): ReactElement {
               {engine.connection?.kind === 'connected' ? ` · v${engine.connection.helperVersion}` : ''}
             </span>
           </div>
-          <p className={styles['hint']}>
-            O'chirish administrator parolini so'raydi: helper qo'shgan barcha route'lar va resolver fayllari olib tashlanadi, root
-            daemon to'xtaydi va uning fayllari — config (qoidalar) va log ham — o'chadi. Qoidalar kerak bo'lsa, avval Export qiling.
-          </p>
+          <p className={styles['hint']}>{words.helper.hint}</p>
           {props.confirmingUninstall ? (
             <div
               className={styles['confirm']}
@@ -222,22 +389,22 @@ export function SettingsPanel(props: SettingsPanelProps): ReactElement {
               }}
             >
               <p id="settings-uninstall-question" className={styles['confirmText']}>
-                Helper rostdan ham o'chirilsinmi?
+                {words.helper.question}
               </p>
               <div className={styles['actions']}>
                 <Button variant="primary" onClick={props.onConfirmUninstall} busy={busy.has('helper')}>
-                  Ha, o'chirish
+                  {words.helper.confirm}
                 </Button>
                 {/* The safe choice takes the focus (WAI-ARIA alertdialog); busy, not disabled, so it keeps it. */}
                 <Button autoFocus onClick={props.onCancelUninstall} busy={busy.has('helper')}>
-                  Bekor qilish
+                  {words.helper.cancel}
                 </Button>
               </div>
             </div>
           ) : (
             <div className={styles['actions']}>
               <Button ref={props.uninstallRef} onClick={props.onAskUninstall} disabled={!canUninstall}>
-                Helper'ni o'chirish
+                {words.helper.uninstall}
               </Button>
             </div>
           )}
@@ -250,15 +417,32 @@ export function SettingsPanel(props: SettingsPanelProps): ReactElement {
 
 export interface SettingsScreenProps {
   /** The preload API; `window.rs` in the app. */
-  readonly rs?: SettingsApi & Pick<RsApi, 'getState' | 'onState'>;
+  readonly rs?: SettingsApi & BackupApi & Pick<RsApi, 'getState' | 'onState' | 'setLanguage' | 'restoreBackup' | 'applyImport' | 'deleteBackup'>;
+}
+
+/**
+ * Sets the UI language. Every window then switches through `onLanguage`, this
+ * one included, so a success needs no words; a refusal does, in the language
+ * still in force.
+ */
+export async function chooseLanguage(rs: Pick<RsApi, 'setLanguage'>, language: Locale, i18n: I18n): Promise<Feedback | null> {
+  const result = await rs.setLanguage(language);
+  return result.ok ? null : { tone: 'danger', text: errorText(result.code, i18n) };
 }
 
 /** The settings screen of the rules window. */
 export function SettingsScreen({ rs: given }: SettingsScreenProps): ReactElement {
   const rs = given ?? window.rs;
+  const i18n = useI18n();
+  // Effects read the language through a ref: a language change must not read the settings again.
+  const i18nRef = useRef(i18n);
+  useEffect(() => {
+    i18nRef.current = i18n;
+  }, [i18n]);
   const engine = useEngineState(rs);
   const [openAtLogin, setOpenAtLoginValue] = useState<boolean | null>(null);
   const [overrides, setOverrides] = useState<Config['ifaceOverrides'] | null | undefined>(undefined);
+  const [currentConfig, setCurrentConfig] = useState<Config | null>(null);
   const [serviceOrder, setServiceOrder] = useState<ServiceOrderView>({ phase: 'loading', order: null, feedback: null });
   const [busy, setBusy] = useState<ReadonlySet<SettingsSection>>(new Set());
   const [confirmingUninstall, setConfirmingUninstall] = useState(false);
@@ -290,7 +474,7 @@ export function SettingsScreen({ rs: given }: SettingsScreenProps): ReactElement
     void rs.getSettings().then((result) => {
       if (!live) return;
       if (result.ok) setOpenAtLoginValue(result.value.openAtLogin);
-      else say('login', { tone: 'danger', text: errorText(result.code) });
+      else say('login', { tone: 'danger', text: errorText(result.code, i18nRef.current) });
     });
     return () => {
       live = false;
@@ -302,12 +486,14 @@ export function SettingsScreen({ rs: given }: SettingsScreenProps): ReactElement
   useEffect(() => {
     if (configRevision === null) {
       setOverrides(undefined);
+      setCurrentConfig(null);
       return undefined;
     }
     let live = true;
     void rs.getConfig().then((result) => {
       if (!live) return;
       setOverrides(result.ok ? (result.value.ifaceOverrides ?? null) : undefined);
+      setCurrentConfig(result.ok ? result.value : null);
     });
     return () => {
       live = false;
@@ -317,7 +503,7 @@ export function SettingsScreen({ rs: given }: SettingsScreenProps): ReactElement
   // The service order: on open, on "Yangilash" and whenever the window is shown again (the command was run in Terminal).
   const orderReader = useRef<ShownReader | null>(null);
   useEffect(() => {
-    const reader = followServiceOrderView(rs, setServiceOrder, browserShowSignal(window, document));
+    const reader = followServiceOrderView(rs, setServiceOrder, browserShowSignal(window, document), () => i18nRef.current);
     orderReader.current = reader;
     return () => {
       reader.stop();
@@ -328,9 +514,72 @@ export function SettingsScreen({ rs: given }: SettingsScreenProps): ReactElement
     orderReader.current?.refresh();
   }, []);
 
+  // The rules backup (TASK-DELTA-16): read on every connection and config revision, and when the window is shown.
+  const backup = useBackup(rs, backupKey(engine));
+  const [confirmingBackupRemoval, setConfirmingBackupRemoval] = useState(false);
+  const [restore, setRestore] = useState<TransferUiState>(INITIAL_TRANSFER_UI);
+  const latestRestore = useRef(restore);
+  latestRestore.current = restore;
+  const updateRestore = useCallback((change: (state: TransferUiState) => TransferUiState) => {
+    latestRestore.current = change(latestRestore.current);
+    setRestore(latestRestore.current);
+  }, []);
+  const [now, setNow] = useState(() => Date.now());
+  useEffect(() => {
+    setNow(Date.now());
+  }, [backup.view]);
+
   return (
     <SettingsPanel
       engine={engine}
+      backup={backup.view}
+      config={currentConfig}
+      now={now}
+      restore={restore}
+      confirmingBackupRemoval={confirmingBackupRemoval}
+      onRestoreBackup={() => {
+        const info = backup.view.info;
+        if (info === null) return;
+        setConfirmingBackupRemoval(false);
+        void startRestore(rs, info.savedAt, updateRestore, () => latestRestore.current, () => i18nRef.current);
+      }}
+      onConfirmRestore={(token) => {
+        void confirmPreview(rs, token, updateRestore, () => latestRestore.current, () => i18nRef.current);
+      }}
+      onCancelRestore={() => {
+        cancelPreview(updateRestore);
+      }}
+      onAskRemoveBackup={() => {
+        updateRestore((state) => (state.preview === null || state.phase === 'applying' ? state : { ...state, preview: null }));
+        setConfirmingBackupRemoval(true);
+      }}
+      onCancelRemoveBackup={() => {
+        setConfirmingBackupRemoval(false);
+      }}
+      onConfirmRemoveBackup={() => {
+        mark('backup', true);
+        void removeBackup(rs, i18n).then((line) => {
+          say('backup', line);
+          setConfirmingBackupRemoval(false);
+          mark('backup', false);
+          backup.reload();
+        });
+      }}
+      i18n={i18n}
+      language={i18n.locale}
+      languageHint={i18n.t.settingsLanguage.hint}
+      onSelectLanguage={(language) => {
+        mark('language', true);
+        void chooseLanguage(rs, language, i18n).then((line) => {
+          setFeedback((current) => {
+            const next = { ...current };
+            if (line === null) delete next.language;
+            else next.language = line;
+            return next;
+          });
+          mark('language', false);
+        });
+      }}
       openAtLogin={openAtLogin}
       overrides={overrides}
       serviceOrder={serviceOrder}
@@ -339,7 +588,7 @@ export function SettingsScreen({ rs: given }: SettingsScreenProps): ReactElement
       feedback={feedback}
       onToggleLogin={(next) => {
         mark('login', true);
-        void setOpenAtLogin(rs, next).then(({ openAtLogin: value, feedback: line }) => {
+        void setOpenAtLogin(rs, next, i18n).then(({ openAtLogin: value, feedback: line }) => {
           if (value !== null) setOpenAtLoginValue(value);
           say('login', line);
           mark('login', false);
@@ -347,14 +596,14 @@ export function SettingsScreen({ rs: given }: SettingsScreenProps): ReactElement
       }}
       onSelectEthernet={(device) => {
         mark('ethernet', true);
-        void saveEthernetOverride(rs, device).then((line) => {
+        void saveEthernetOverride(rs, device, i18n).then((line) => {
           say('ethernet', line);
           mark('ethernet', false);
         });
       }}
       onCopyCommand={() => {
         mark('wifi', true);
-        void copyServiceOrderCommand(rs).then(({ order, feedback: line }) => {
+        void copyServiceOrderCommand(rs, i18n).then(({ order, feedback: line }) => {
           setServiceOrder((current) => ({
             phase: order === null ? current.phase : 'ready',
             order: order ?? current.order,
@@ -374,7 +623,7 @@ export function SettingsScreen({ rs: given }: SettingsScreenProps): ReactElement
       uninstallRef={uninstallButton}
       onConfirmUninstall={() => {
         mark('helper', true);
-        void uninstallHelper(rs).then((line) => {
+        void uninstallHelper(rs, i18n).then((line) => {
           say('helper', line);
           setConfirmingUninstall(false);
           mark('helper', false);
@@ -394,6 +643,8 @@ export function followServiceOrderView(
   rs: Pick<RsApi, 'getServiceOrder'>,
   update: (next: (current: ServiceOrderView) => ServiceOrderView) => void,
   onShow: ShowSignal,
+  /** The UI language at the time of the answer; Uzbek when not given. */
+  language: () => I18n = () => UZ,
 ): ShownReader {
   return readOnShow(
     (cause) => {
@@ -404,7 +655,7 @@ export function followServiceOrderView(
       update(() =>
         result.ok
           ? { phase: 'ready', order: result.value, feedback: null }
-          : { phase: 'failed', order: null, feedback: { tone: 'danger', text: errorText(result.code) } },
+          : { phase: 'failed', order: null, feedback: { tone: 'danger', text: errorText(result.code, language()) } },
       );
     },
     onShow,

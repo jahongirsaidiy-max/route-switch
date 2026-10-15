@@ -12,6 +12,7 @@ import {
   DEFAULT_TIMEOUT_MS,
   isAllowedBinary,
   MAX_EXPECTED_EXIT_CODES,
+  REDACTED_ARG,
   MAX_OUTPUT_BYTES,
   MAX_STREAM_LINE_LENGTH,
   MAX_TIMEOUT_MS,
@@ -303,6 +304,10 @@ describe('process options', () => {
       'expectedExitCodes longer than the cap',
       { expectedExitCodes: Array.from({ length: MAX_EXPECTED_EXIT_CODES + 1 }, () => 1) },
     ],
+    ['redactArgsFrom below 0', { redactArgsFrom: -1 }],
+    ['redactArgsFrom past the arguments', { redactArgsFrom: 2 }],
+    ['redactArgsFrom that is a fraction', { redactArgsFrom: 0.5 }],
+    ['redactArgsFrom that is a string', { redactArgsFrom: '0' as unknown as number }],
   ])('rejects %s', async (_label, options) => {
     const { runner, calls, entries } = setup();
 
@@ -635,6 +640,41 @@ describe.skipIf(process.platform !== 'darwin')('real execFile (read-only command
 
     expect(result.ok).toBe(false);
     expect(result.stdout).not.toContain('uid=');
+  });
+});
+
+describe('redacted arguments', () => {
+  it('logs the command at info with the private arguments replaced, and the real ones at debug only', async () => {
+    const { runner, calls, entries } = setup({ stdout: 'route to: 192.0.2.7\n' });
+    const result = await runner.run('/sbin/route', ['-n', 'get', '-host', '192.0.2.7'], { redactArgsFrom: 3 });
+    expect(calls[0]?.args).toEqual(['-n', 'get', '-host', '192.0.2.7']);
+    expect(result.args).toEqual(['-n', 'get', '-host', '192.0.2.7']);
+    const info = entries.filter((entry) => entry.level !== 'debug');
+    expect(info).toMatchObject([{ level: 'info', msg: 'command finished', context: { args: ['-n', 'get', '-host', REDACTED_ARG] } }]);
+    expect(JSON.stringify(info)).not.toContain('192.0.2.7');
+    expect(entries.filter((entry) => entry.level === 'debug')).toMatchObject([
+      { msg: 'command arguments', context: { args: ['-n', 'get', '-host', '192.0.2.7'], stdout: 'route to: 192.0.2.7\n' } },
+    ]);
+  });
+
+  it('a failure is reported without the arguments, the output or a system message', async () => {
+    const nonzero = setup({ error: { message: 'Command failed: 192.0.2.7', code: 2 }, stderr: 'route: 192.0.2.7: bad\n' });
+    await nonzero.runner.run('/sbin/route', ['-n', 'get', '-host', '192.0.2.7'], { redactArgsFrom: 3 });
+    const spawn = setup({ error: { message: 'spawn /sbin/route 192.0.2.7 ENOENT', code: 'ENOENT' } });
+    await spawn.runner.run('/sbin/route', ['-n', 'get', '-host', '192.0.2.7'], { redactArgsFrom: 3 });
+    for (const entries of [nonzero.entries, spawn.entries]) {
+      const loud = entries.filter((entry) => entry.level !== 'debug');
+      expect(loud).toHaveLength(1);
+      expect(loud[0]?.context?.['args']).toEqual(['-n', 'get', '-host', REDACTED_ARG]);
+      expect(JSON.stringify(loud)).not.toContain('192.0.2.7');
+      expect(JSON.stringify(entries.filter((entry) => entry.level === 'debug'))).toContain('192.0.2.7');
+    }
+  });
+
+  it('redacts nothing without the option', async () => {
+    const { runner, entries } = setup();
+    await runner.run('/sbin/route', ['-n', 'get', '-host', '192.0.2.7']);
+    expect(only(entries)).toMatchObject({ level: 'info', context: { args: ['-n', 'get', '-host', '192.0.2.7'] } });
   });
 });
 

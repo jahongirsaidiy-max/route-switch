@@ -740,6 +740,10 @@ describe('run --once: domain rules', () => {
     expect(dnsArgv(h)).toEqual([['--dns']]);
     expect(h.routeArgv()).toEqual([
       ['-n', 'add', '-host', '203.0.113.7', '192.168.1.1'],
+      // The Ethernet servers are outside both connected subnets: the DNS-server warning asks the
+      // table which way they go (TASK-DELTA-19), once for both passes (read-only `route -n get`).
+      ['-n', 'get', '-host', '10.20.0.10'],
+      ['-n', 'get', '-host', '10.20.0.11'],
       ['-n', 'add', '-host', '198.51.100.20', ETH_GW],
     ]);
     expect(code).toBe(EXIT_CODES.ok);

@@ -5,11 +5,14 @@
 
 import type {
   Config,
+  DiagnoseResult,
   EngineState,
   ErrorCode,
   EventLogLevel,
   IfaceRole,
+  Language,
   RuleInput,
+  RulesWindowIntent,
   SetConfigResult,
   StateResult,
   TestResult,
@@ -97,6 +100,9 @@ export interface RsServiceOrder {
   readonly command: string | null;
 }
 
+/** A UI language: `uz`, `ru` or `en` (the shared `Language` enum). */
+export type RsLanguage = Language;
+
 /** Device overrides of the roles (`Config.ifaceOverrides`): a role without one is detected automatically. */
 export type RsIfaceOverrides = Partial<Record<IfaceRole, string>>;
 
@@ -121,7 +127,8 @@ export type RsIfaceOverrides = Partial<Record<IfaceRole, string>>;
  * - `import-expired` — `applyImport`: the token is unknown, used or older than
  *   10 minutes (choose the file again); nothing was sent;
  * - `write-failed`   — `exportConfig`: the file could not be written; the chosen
- *   path is left as it was;
+ *   path is left as it was; `deleteBackup`: the backup could not be removed;
+ * - `no-backup`      — `restoreBackup`: the app holds no rules backup; nothing was sent;
  * - `install-unavailable` — `installHelper` / `removeHelper`: the app holds no
  *   usable helper package (not packaged, a file missing, a symbolic link, or
  *   writable by another user); nothing was run;
@@ -152,6 +159,7 @@ export type RsErrorCode =
   | 'file-not-json'
   | 'import-expired'
   | 'write-failed'
+  | 'no-backup'
   | 'install-unavailable'
   | 'install-cancelled'
   | 'install-denied'
@@ -174,6 +182,18 @@ export interface RsImportPreview {
   readonly token: string;
   /** The config as the shared schema parsed it (normalised). It replaces the stored one as a whole. */
   readonly config: Config;
+}
+
+/**
+ * The app's copy of the last config it saw (`userData/rules-backup.json`,
+ * TASK-DELTA-16), as the page may know it: no rule, only how many.
+ */
+export interface RsBackupInfo {
+  /** When the app wrote it (ISO, UTC). */
+  readonly savedAt: string;
+  readonly ruleCount: number;
+  /** The user turned down the restore offer for exactly this backup (a newer backup is offered again). */
+  readonly dismissed: boolean;
 }
 
 /** A config written by `exportConfig`. */
@@ -199,6 +219,43 @@ export type RsResult<T> =
       readonly detail?: string;
     };
 
+/**
+ * How the main process resolved a name no enabled domain rule covers (the
+ * helper answered `name-not-covered`): the system resolver, with the user's
+ * rights (`dns.lookup`, IPv4 only, 3 s).
+ * - `ok`        — it gave addresses (some may be `excluded`);
+ * - `not-found` — the name does not exist or has no IPv4 address;
+ * - `timeout`   — no answer within 3 s;
+ * - `failed`    — the lookup failed otherwise.
+ */
+export type RsLookupOutcome = 'ok' | 'not-found' | 'timeout' | 'failed';
+
+/** One address of a resolved name and the helper's `diagnose` of it; `code` when that call failed. */
+export type RsDiagnosedAddress =
+  | { readonly address: string; readonly ok: true; readonly result: DiagnoseResult }
+  | { readonly address: string; readonly ok: false; readonly code: RsErrorCode };
+
+/** The app's own lookup of a name the helper does not resolve. */
+export interface RsNameLookup {
+  readonly outcome: RsLookupOutcome;
+  /** At most 8, in the resolver's order, each diagnosed one after the other. */
+  readonly addresses: readonly RsDiagnosedAddress[];
+  /** The resolver gave more routable addresses than 8; the rest were not diagnosed. */
+  readonly truncated: boolean;
+  /** Addresses that are never routed (loopback, link-local, …) and were left out. */
+  readonly excluded: number;
+}
+
+/**
+ * What `diagnose` returns: the helper's answer for the target as asked and,
+ * only when the helper did not resolve the name (`name-not-covered`), the
+ * app's lookup of it with an answer per address.
+ */
+export interface RsDiagnosis {
+  readonly result: DiagnoseResult;
+  readonly lookup: RsNameLookup | null;
+}
+
 /** Removes the subscription it was returned for. Calling it again does nothing. */
 export type RsUnsubscribe = () => void;
 
@@ -217,6 +274,16 @@ export interface RsApi {
   apply(): Promise<RsResult<StateResult>>;
   /** Which interface the system would use for one IPv4 address (`route -n get`). Read-only. */
   test(target: string): Promise<RsResult<TestResult>>;
+  /**
+   * Explains how traffic to a host or IPv4 address leaves the machine
+   * (read-only): the matching rule and why, the kernel's route for each
+   * address against the rule's interface, the rule's DNS server and whether it
+   * answers. `target` is a bare IPv4 address or domain, as `diagnose` takes it
+   * (the page strips a URL down to its host first). A name no enabled domain
+   * rule covers is resolved by the main process with the user's rights and
+   * each address diagnosed. `busy` while another diagnosis runs.
+   */
+  diagnose(target: string): Promise<RsResult<RsDiagnosis>>;
   /**
    * Asks the user for a config file (system dialog of the main process), reads
    * and checks it with the shared `Config` schema, and returns it for a
@@ -277,9 +344,25 @@ export interface RsApi {
   /**
    * Opens the rules window, or brings the open one to the front ("Qoidalarni
    * boshqarish" of the menu bar window). Main process only: nothing is sent to
-   * the helper. The value is null.
+   * the helper. The value is null. With `intent` (checked with the shared
+   * `RulesWindowIntent`; anything else is `invalid-input` and nothing opens),
+   * the main process keeps it for the rules window — a minute at most, the
+   * last one wins — and tells that window through `onRulesIntent`; the window
+   * takes it with `takeRulesIntent` (TASK-DELTA-21).
    */
-  openRulesWindow(): Promise<RsResult<null>>;
+  openRulesWindow(intent?: RsRulesIntent): Promise<RsResult<null>>;
+  /**
+   * The intent waiting for the rules window, once: it is gone after this call.
+   * Null when there is none (or it is older than a minute). Answered to the
+   * rules window only (`forbidden` elsewhere).
+   */
+  takeRulesIntent(): Promise<RsResult<RsRulesIntent | null>>;
+  /**
+   * Calls `listener` when an intent is waiting (sent to the rules window only;
+   * no value — take it with `takeRulesIntent`). Subscribe first, then take
+   * once for one that arrived before.
+   */
+  onRulesIntent(listener: () => void): RsUnsubscribe;
   /**
    * Tries to connect to the helper now instead of waiting for the next
    * automatic attempt ("Qayta ulanish"). The value is null; the outcome
@@ -308,6 +391,36 @@ export interface RsApi {
    * `uninstall.sh`; then `uninstallHelper` is the way (files stay).
    */
   removeHelper(): Promise<RsResult<RsHelperSetupResult>>;
+  /**
+   * The UI language (`uz`, `ru`, `en`), kept by the main process in
+   * `userData/preferences.json`; on a first start, from the system's
+   * preferred languages.
+   */
+  getLanguage(): Promise<RsResult<RsLanguage>>;
+  /**
+   * Sets and stores the UI language; every open window hears of it through
+   * `onLanguage`. The value is the language now in force (it holds for this
+   * run even when the file could not be written; that is logged).
+   */
+  setLanguage(language: RsLanguage): Promise<RsResult<RsLanguage>>;
+  /**
+   * Calls `listener` with every new language. Nothing is replayed: subscribe
+   * first, then call `getLanguage`.
+   */
+  onLanguage(listener: (language: RsLanguage) => void): RsUnsubscribe;
+  /** The rules backup the app keeps (TASK-DELTA-16); null when there is none. Works without the helper. */
+  getBackup(): Promise<RsResult<RsBackupInfo | null>>;
+  /**
+   * Reads the backup for a restore: like `importConfig` without the dialog —
+   * the config (checked again with the shared schema) and a one-use token for
+   * `applyImport`, 10 minutes. Nothing reaches the helper before
+   * `applyImport`. `no-backup` when there is none.
+   */
+  restoreBackup(): Promise<RsResult<RsImportPreview>>;
+  /** Removes the backup. `write-failed` when the file could not be removed. */
+  deleteBackup(): Promise<RsResult<null>>;
+  /** Turns down the restore offer for the current backup (kept in the preferences). Nothing is removed. */
+  dismissBackup(): Promise<RsResult<null>>;
 }
 
 /** Channel -> arguments and value of the call behind it. Main and preload are typed against this table. */
@@ -320,6 +433,7 @@ export interface RsInvokeChannels {
   'rs:setEnabled': { readonly args: readonly [on: boolean]; readonly value: StateResult };
   'rs:apply': { readonly args: readonly []; readonly value: StateResult };
   'rs:test': { readonly args: readonly [target: string]; readonly value: TestResult };
+  'rs:diagnose': { readonly args: readonly [target: string]; readonly value: RsDiagnosis };
   'rs:import': { readonly args: readonly []; readonly value: RsImportPreview | null };
   'rs:applyImport': { readonly args: readonly [token: string]; readonly value: SetConfigResult };
   'rs:export': { readonly args: readonly []; readonly value: RsExportResult | null };
@@ -330,11 +444,18 @@ export interface RsInvokeChannels {
   'rs:getServiceOrder': { readonly args: readonly []; readonly value: RsServiceOrder };
   'rs:copyServiceOrderCommand': { readonly args: readonly []; readonly value: RsServiceOrder };
   'rs:uninstall': { readonly args: readonly []; readonly value: UninstallResult };
-  'rs:openRulesWindow': { readonly args: readonly []; readonly value: null };
+  'rs:openRulesWindow': { readonly args: readonly [] | readonly [intent: RsRulesIntent]; readonly value: null };
+  'rs:takeRulesIntent': { readonly args: readonly []; readonly value: RsRulesIntent | null };
   'rs:reconnect': { readonly args: readonly []; readonly value: null };
   'rs:resetConfig': { readonly args: readonly []; readonly value: SetConfigResult };
   'rs:installHelper': { readonly args: readonly []; readonly value: RsHelperSetupResult };
   'rs:removeHelper': { readonly args: readonly []; readonly value: RsHelperSetupResult };
+  'rs:getLanguage': { readonly args: readonly []; readonly value: RsLanguage };
+  'rs:setLanguage': { readonly args: readonly [language: RsLanguage]; readonly value: RsLanguage };
+  'rs:getBackup': { readonly args: readonly []; readonly value: RsBackupInfo | null };
+  'rs:restoreBackup': { readonly args: readonly []; readonly value: RsImportPreview };
+  'rs:deleteBackup': { readonly args: readonly []; readonly value: null };
+  'rs:dismissBackup': { readonly args: readonly []; readonly value: null };
 }
 
 export type RsInvokeChannel = keyof RsInvokeChannels;
@@ -344,6 +465,15 @@ export type RsStateChannel = 'rs:state';
 
 /** The channel the main process sends every new journal entry on. */
 export type RsLogChannel = 'rs:log';
+
+/** The channel the main process sends every new UI language on. */
+export type RsLanguageChannel = 'rs:language';
+
+/** The channel that tells the rules window an intent is waiting (`takeRulesIntent`). No value. */
+export type RsRulesIntentChannel = 'rs:rulesIntent';
+
+/** What the rules window is opened for: a section, or a DNS warning's add-rule offer (shared `RulesWindowIntent`). */
+export type RsRulesIntent = RulesWindowIntent;
 
 declare global {
   interface Window {

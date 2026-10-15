@@ -91,6 +91,13 @@
   font-size: var(--rs-text-small);
 }
 
+/* The language picker: names of languages, not device names — the body font. */
+.selectText {
+  max-width: 240px;
+  font-family: var(--rs-font-sans);
+  font-size: var(--rs-text-body);
+}
+
 .select:focus-visible {
   outline: none;
   border-color: var(--rs-color-accent);

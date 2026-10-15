@@ -102,50 +102,86 @@ const refuse = (code: ConfigFileFailure['code'], error: string, issue?: RsConfig
 
 const BOM = '﻿';
 
-/** Reads and checks a config file the user chose. Never throws. */
-export async function readConfigFile(file: string, fs: ConfigFileSystem = nodeConfigFileSystem): Promise<ReadConfigResult> {
+/** A bounded read: the bytes of a regular file of at most `maxBytes`, or why not. */
+export type BoundedReadResult =
+  | { readonly ok: true; readonly bytes: Uint8Array }
+  | { readonly ok: false; readonly code: 'file-missing' | 'file-unreadable' | 'file-not-regular' | 'file-too-large'; readonly error: string };
+
+const errorCodeOf = (error: unknown): string =>
+  typeof error === 'object' && error !== null && 'code' in error ? String(error.code) : 'unknown';
+
+/**
+ * Reads a regular file of at most `maxBytes`, never more than one byte past
+ * it (the file may grow after `stat`). `noFollow` refuses a symbolic link at
+ * the last component (`O_NOFOLLOW`): for the app's own files, never for a
+ * file the user chose. The open never blocks on a FIFO. Never throws.
+ */
+export async function readBoundedFile(
+  file: string,
+  maxBytes: number,
+  options: { readonly noFollow: boolean },
+  fs: ConfigFileSystem = nodeConfigFileSystem,
+): Promise<BoundedReadResult> {
   let handle: ConfigFileHandle;
   try {
-    // Non-blocking: a FIFO or device the user picked must not hang the open.
-    handle = await fs.open(file, constants.O_RDONLY | constants.O_NONBLOCK);
-  } catch {
-    return refuse('file-unreadable', 'The file could not be opened');
+    handle = await fs.open(file, constants.O_RDONLY | constants.O_NONBLOCK | (options.noFollow ? constants.O_NOFOLLOW : 0));
+  } catch (error) {
+    const code = errorCodeOf(error);
+    return code === 'ENOENT'
+      ? { ok: false, code: 'file-missing', error: 'The file does not exist' }
+      : { ok: false, code: 'file-unreadable', error: `The file could not be opened (${code})` };
   }
-  let bytes: Uint8Array;
   try {
     const stat = await handle.stat();
-    if (!stat.isFile()) return refuse('file-not-regular', 'Not a regular file');
-    if (stat.size > MAX_CONFIG_FILE_BYTES) return refuse('file-too-large', `Larger than ${String(MAX_CONFIG_FILE_BYTES)} bytes`);
-    // Read at most one byte past the limit: the file may have grown since `stat`.
-    const buffer = new Uint8Array(MAX_CONFIG_FILE_BYTES + 1);
+    if (!stat.isFile()) return { ok: false, code: 'file-not-regular', error: 'Not a regular file' };
+    if (stat.size > maxBytes) return { ok: false, code: 'file-too-large', error: `Larger than ${String(maxBytes)} bytes` };
+    const buffer = new Uint8Array(maxBytes + 1);
     let total = 0;
     for (;;) {
       const { bytesRead } = await handle.read(buffer, total, buffer.length - total, null);
       if (bytesRead === 0) break;
       total += bytesRead;
-      if (total > MAX_CONFIG_FILE_BYTES) return refuse('file-too-large', `Larger than ${String(MAX_CONFIG_FILE_BYTES)} bytes`);
+      if (total > maxBytes) return { ok: false, code: 'file-too-large', error: `Larger than ${String(maxBytes)} bytes` };
     }
-    bytes = buffer.subarray(0, total);
+    return { ok: true, bytes: buffer.subarray(0, total) };
   } catch {
-    return refuse('file-unreadable', 'The file could not be read');
+    return { ok: false, code: 'file-unreadable', error: 'The file could not be read' };
   } finally {
     await handle.close().catch(() => undefined);
   }
+}
 
+/** UTF-8 (a leading BOM allowed) JSON, or why not. Never throws. */
+export function parseJsonBytes(
+  bytes: Uint8Array,
+): { readonly ok: true; readonly value: unknown } | { readonly ok: false; readonly code: 'file-not-text' | 'file-not-json'; readonly error: string } {
   let text: string;
   try {
     text = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(bytes);
   } catch {
-    return refuse('file-not-text', 'Not UTF-8 text');
+    return { ok: false, code: 'file-not-text', error: 'Not UTF-8 text' };
   }
   if (text.startsWith(BOM)) text = text.slice(BOM.length);
-
-  let value: unknown;
   try {
-    value = JSON.parse(text);
+    return { ok: true, value: JSON.parse(text) as unknown };
   } catch {
-    return refuse('file-not-json', 'Not JSON');
+    return { ok: false, code: 'file-not-json', error: 'Not JSON' };
   }
+}
+
+/** Reads and checks a config file the user chose. Never throws. */
+export async function readConfigFile(file: string, fs: ConfigFileSystem = nodeConfigFileSystem): Promise<ReadConfigResult> {
+  // Non-blocking: a FIFO or device the user picked must not hang the open.
+  const read = await readBoundedFile(file, MAX_CONFIG_FILE_BYTES, { noFollow: false }, fs);
+  if (!read.ok) {
+    if (read.code === 'file-missing' || read.code === 'file-unreadable') {
+      return refuse('file-unreadable', read.code === 'file-missing' ? 'The file could not be opened' : read.error);
+    }
+    return refuse(read.code, read.error);
+  }
+  const json = parseJsonBytes(read.bytes);
+  if (!json.ok) return refuse(json.code, json.error);
+  const value = json.value;
   // Bounded walk first: zod does not stop early on an oversized array.
   const violation = findStructureViolation(value);
   if (violation !== null) {
@@ -156,7 +192,7 @@ export async function readConfigFile(file: string, fs: ConfigFileSystem = nodeCo
     const [first] = parsed.error.issues;
     return refuse('invalid-config', describeIssues(parsed.error), first === undefined ? undefined : issueOf(first));
   }
-  return { ok: true, config: parsed.data, bytes: bytes.length };
+  return { ok: true, config: parsed.data, bytes: read.bytes.length };
 }
 
 /** The text of an exported config: the stored config, indented, one trailing newline. */
@@ -165,21 +201,22 @@ export const configFileText = (config: Config): string => `${JSON.stringify(conf
 export type WriteConfigResult = { readonly ok: true; readonly bytes: number } | { readonly ok: false; readonly error: string };
 
 /**
- * Writes `config` to `file` atomically: a fresh temporary file in the same
- * directory (created exclusively, mode 0644, synced) is renamed over `file`.
- * On any failure the temporary file is removed and `file` is left as it was.
+ * Writes `text` to `file` atomically: a fresh temporary file in the same
+ * directory (created exclusively, never through a symbolic link, with `mode`,
+ * synced) is renamed over `file`. On any failure the temporary file is
+ * removed and `file` is left as it was. Never throws.
  */
-export async function writeConfigFile(
+export async function writeTextFileAtomic(
   file: string,
-  config: Config,
+  text: string,
+  mode: number,
   fs: ConfigFileSystem = nodeConfigFileSystem,
   newId: () => string = randomUUID,
 ): Promise<WriteConfigResult> {
-  const text = configFileText(config);
   const temporary = path.join(path.dirname(file), `.${path.basename(file)}.${newId()}.tmp`);
   let created = false;
   try {
-    const handle = await fs.open(temporary, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, 0o644);
+    const handle = await fs.open(temporary, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, mode);
     created = true;
     try {
       await handle.writeFile(text, { encoding: 'utf8' });
@@ -191,7 +228,16 @@ export async function writeConfigFile(
     return { ok: true, bytes: Buffer.byteLength(text) };
   } catch (error) {
     if (created) await fs.unlink(temporary).catch(() => undefined);
-    const code = typeof error === 'object' && error !== null && 'code' in error ? String(error.code) : 'unknown';
-    return { ok: false, error: `The file could not be written (${code})` };
+    return { ok: false, error: `The file could not be written (${errorCodeOf(error)})` };
   }
+}
+
+/** Writes `config` to `file` atomically (`writeTextFileAtomic`, mode 0644: an export is the user's file). */
+export async function writeConfigFile(
+  file: string,
+  config: Config,
+  fs: ConfigFileSystem = nodeConfigFileSystem,
+  newId: () => string = randomUUID,
+): Promise<WriteConfigResult> {
+  return writeTextFileAtomic(file, configFileText(config), 0o644, fs, newId);
 }

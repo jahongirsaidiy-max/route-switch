@@ -181,6 +181,12 @@ export interface HelperTimeouts {
   readonly mutateMs: number;
   /** `uninstall`: removes routes, resolver files and the daemon. */
   readonly uninstallMs: number;
+  /**
+   * `diagnose`: route lookups and one DNS probe. The helper gives up after
+   * 8 s and answers `operation-failed`, so this only fires when the helper
+   * does not answer at all.
+   */
+  readonly diagnoseMs: number;
 }
 
 export const DEFAULT_TIMEOUTS: HelperTimeouts = {
@@ -189,6 +195,7 @@ export const DEFAULT_TIMEOUTS: HelperTimeouts = {
   testMs: 10_000,
   mutateMs: 30_000,
   uninstallMs: 60_000,
+  diagnoseMs: 12_000,
 };
 
 const TIMEOUT_CLASS: Readonly<Record<RequestMethod, keyof HelperTimeouts>> = {
@@ -199,6 +206,7 @@ const TIMEOUT_CLASS: Readonly<Record<RequestMethod, keyof HelperTimeouts>> = {
   setEnabled: 'mutateMs',
   apply: 'mutateMs',
   uninstall: 'uninstallMs',
+  diagnose: 'diagnoseMs',
 };
 
 /** Wait before reconnecting after a connection was lost, and between the first attempts. */

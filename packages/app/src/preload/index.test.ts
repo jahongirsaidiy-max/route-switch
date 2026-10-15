@@ -37,6 +37,7 @@ const INVOKES = [
   ['setEnabled', [true], 'rs:setEnabled'],
   ['apply', [], 'rs:apply'],
   ['test', ['10.1.2.3'], 'rs:test'],
+  ['diagnose', ['corp.local'], 'rs:diagnose'],
   ['importConfig', [], 'rs:import'],
   ['applyImport', [RULE.id], 'rs:applyImport'],
   ['exportConfig', [], 'rs:export'],
@@ -48,10 +49,18 @@ const INVOKES = [
   ['copyServiceOrderCommand', [], 'rs:copyServiceOrderCommand'],
   ['uninstallHelper', [], 'rs:uninstall'],
   ['openRulesWindow', [], 'rs:openRulesWindow'],
+  ['openRulesWindow', [{ kind: 'dns-offer', server: '10.0.0.53', role: 'ethernet' }], 'rs:openRulesWindow'],
+  ['takeRulesIntent', [], 'rs:takeRulesIntent'],
   ['reconnectHelper', [], 'rs:reconnect'],
   ['resetConfig', [], 'rs:resetConfig'],
   ['installHelper', [], 'rs:installHelper'],
   ['removeHelper', [], 'rs:removeHelper'],
+  ['getLanguage', [], 'rs:getLanguage'],
+  ['setLanguage', ['ru'], 'rs:setLanguage'],
+  ['getBackup', [], 'rs:getBackup'],
+  ['restoreBackup', [], 'rs:restoreBackup'],
+  ['deleteBackup', [], 'rs:deleteBackup'],
+  ['dismissBackup', [], 'rs:dismissBackup'],
 ] as const;
 
 describe('preload', () => {
@@ -59,9 +68,10 @@ describe('preload', () => {
     expect([...electron.exposed.keys()]).toEqual(['rs']);
   });
 
-  it('every method but the two subscriptions is in INVOKES (a new method cannot go untested)', () => {
+  it('every method but the four subscriptions is in INVOKES (a new method cannot go untested)', () => {
     const invokes = INVOKES.map(([method]) => method as string);
-    expect(Object.keys(rs).filter((key) => key !== 'onState' && key !== 'onLog').sort()).toEqual([...invokes].sort());
+    const subscriptions = ['onState', 'onLog', 'onLanguage', 'onRulesIntent'];
+    expect(Object.keys(rs).filter((key) => !subscriptions.includes(key)).sort()).toEqual([...new Set(invokes)].sort());
   });
 
   it.each(INVOKES)('%s is a bare invoke on %s with the arguments unchanged', async (method, args, channel) => {
@@ -116,5 +126,38 @@ describe('preload', () => {
 
     unsubscribe();
     expect(electron.removeListener).toHaveBeenCalledWith('rs:log', forward);
+  });
+
+  it('onLanguage delivers the language without the event object, and the returned function unsubscribes', () => {
+    const received: unknown[][] = [];
+    const unsubscribe = rs.onLanguage((...args: unknown[]) => {
+      received.push(args);
+    });
+    const [channel, forward] = electron.on.mock.lastCall ?? [];
+    expect(channel).toBe('rs:language');
+    forward?.({ sender: 'ipc-renderer-event' }, 'en');
+    expect(received).toEqual([['en']]);
+
+    unsubscribe();
+    expect(electron.removeListener).toHaveBeenCalledWith('rs:language', forward);
+  });
+
+  it('openRulesWindow without an intent sends no argument at all (the main process counts them)', async () => {
+    electron.invoke.mockResolvedValueOnce({ ok: true, value: null });
+    await rs.openRulesWindow();
+    expect(electron.invoke.mock.lastCall).toEqual(['rs:openRulesWindow']);
+  });
+
+  it('onRulesIntent calls the listener with nothing (the intent is taken with takeRulesIntent), and unsubscribes', () => {
+    const received: unknown[][] = [];
+    const unsubscribe = rs.onRulesIntent((...args: unknown[]) => {
+      received.push(args);
+    });
+    const [channel, forward] = electron.on.mock.lastCall ?? [];
+    expect(channel).toBe('rs:rulesIntent');
+    forward?.({ sender: 'ipc-renderer-event' }, { kind: 'section', section: 'log' });
+    expect(received).toEqual([[]]);
+    unsubscribe();
+    expect(electron.removeListener).toHaveBeenCalledWith('rs:rulesIntent', forward);
   });
 });

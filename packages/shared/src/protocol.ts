@@ -1,6 +1,15 @@
 import { z } from 'zod';
 
-import { normalizeHostAddress, normalizeIpv4, normalizeSubnet, type Normalised, type ValidationCode } from './cidr';
+import {
+  MAX_DOMAIN_LENGTH,
+  normalizeDomain,
+  normalizeHostAddress,
+  normalizeIpv4,
+  normalizeSubnet,
+  type Normalised,
+  type ValidationCode,
+} from './cidr';
+import { PATHS } from './paths';
 import { Config, DEVICE_NAME, IfaceRole, LIMITS, findDuplicateIds } from './schema';
 
 /**
@@ -38,8 +47,14 @@ import { Config, DEVICE_NAME, IfaceRole, LIMITS, findDuplicateIds } from './sche
  * longer string): an older peer refuses the whole message before any schema
  * runs, so such a field is a breaking change too and needs a bump.
  * Reported by `status`; the app offers to reinstall the helper on a mismatch.
+ *
+ * History: `2` — `overridden-by-rule` and `dns-server-excluded` rule reason
+ * codes (TASK-DELTA-07). `3` — the read-only `diagnose` method,
+ * `EngineState.dnsWarnings` (TASK-DELTA-17) and the `rate-limited` / `busy`
+ * error codes of `diagnose`'s limits (TASK-DELTA-21; added before 0.2.0
+ * shipped, so still `3`) — release 0.2.0.
  */
-export const PROTOCOL_VERSION = 2;
+export const PROTOCOL_VERSION = 3;
 
 /** Size bounds that keep every message serialisable within `MAX_LINE_BYTES`. */
 export const PROTOCOL_LIMITS = {
@@ -56,6 +71,12 @@ export const PROTOCOL_LIMITS = {
   /** Hardware port name of an adapter, e.g. `USB 10/100/1000 LAN`. */
   adapterPortMaxLength: 100,
   helperVersionMaxLength: 64,
+  /** Entries of `EngineState.dnsWarnings`. */
+  maxDnsWarnings: 16,
+  /** Addresses listed in a `diagnose` result: the per-domain limit. */
+  maxDiagnoseAddresses: LIMITS.maxIpsPerDomain,
+  /** `dns.ms` of a `diagnose` result. The probe itself gives up after 3 s. */
+  maxDiagnoseDnsMs: 60_000,
 } as const;
 
 // ---------------------------------------------------------------------------
@@ -261,6 +282,59 @@ export const ReconcileReason = z.enum(RECONCILE_REASONS);
 export type ReconcileReason = z.infer<typeof ReconcileReason>;
 
 /**
+ * Why a DNS server is reached through the wrong interface:
+ * - `other-interface-subnet`    — the server lies in the subnet the other
+ *                                 role is directly connected to;
+ * - `routed-via-other-interface` — `route -n get -host <server>` names the
+ *                                 other role's device.
+ */
+export const DNS_WARNING_CODES = ['other-interface-subnet', 'routed-via-other-interface'] as const;
+export const DnsWarningCode = z.enum(DNS_WARNING_CODES);
+export type DnsWarningCode = z.infer<typeof DnsWarningCode>;
+
+/** Where the DNS server of a warning comes from: an interface's own servers, or a rule's `dns`. */
+export const DNS_WARNING_SOURCES = ['interface', 'rule'] as const;
+export const DnsWarningSource = z.enum(DNS_WARNING_SOURCES);
+export type DnsWarningSource = z.infer<typeof DnsWarningSource>;
+
+/**
+ * A DNS server that should be reached through `role` but is not, and that no
+ * rule routes through `role`. Interface level: it never changes a rule's
+ * status. `ruleId` is present exactly when `source` is `rule`.
+ */
+export const DnsWarning = z
+  .object({
+    server: Ipv4Address,
+    source: DnsWarningSource,
+    /** The role the server belongs to: the interface that announced it, or the rule's interface. */
+    role: IfaceRole,
+    /** The role the server is actually reached through, or null when that is not known. */
+    via: IfaceRole.nullable(),
+    ruleId: z.uuid().optional(),
+    code: DnsWarningCode,
+  })
+  .check((ctx) => {
+    const { source, ruleId, role, via } = ctx.value;
+    if ((source === 'rule') !== (ruleId !== undefined)) {
+      ctx.issues.push({
+        code: 'custom',
+        message: 'A DNS warning carries a ruleId exactly when its source is a rule',
+        input: ruleId,
+        path: ['ruleId'],
+      });
+    }
+    if (via === role) {
+      ctx.issues.push({
+        code: 'custom',
+        message: 'A DNS warning cannot be reached through its own role',
+        input: via,
+        path: ['via'],
+      });
+    }
+  });
+export type DnsWarning = z.infer<typeof DnsWarning>;
+
+/**
  * Everything the UI renders, computed by the helper's engine after each
  * reconcile. Sent in the `state` event, in the `status` result and in the
  * result of every mutating method.
@@ -303,6 +377,11 @@ export const EngineState = z
     /** End of the last reconcile; null before the first one. */
     lastApplyAt: IsoTimestamp.nullable(),
     lastReconcileReason: ReconcileReason.nullable(),
+    /**
+     * DNS servers reached through the wrong interface (protocol 3). Absent
+     * means none, as from a helper that does not check them.
+     */
+    dnsWarnings: z.array(DnsWarning).max(PROTOCOL_LIMITS.maxDnsWarnings).optional(),
   })
   .check((ctx) => {
     const { rules, adapters } = ctx.value;
@@ -346,6 +425,7 @@ export const REQUEST_METHODS = [
   'setEnabled',
   'test',
   'uninstall',
+  'diagnose',
 ] as const;
 export const RequestMethod = z.enum(REQUEST_METHODS);
 export type RequestMethod = z.infer<typeof RequestMethod>;
@@ -390,6 +470,53 @@ export const TestRequest = z.strictObject({ id: RequestId, method: z.literal('te
 /** Removes every applied route and managed resolver file, then the helper itself. */
 export const UninstallRequest = z.strictObject({ id: RequestId, method: z.literal('uninstall') });
 
+/** What a `diagnose` target is. */
+export const DIAGNOSE_TARGET_KINDS = ['ip', 'domain'] as const;
+export const DiagnoseTargetKind = z.enum(DIAGNOSE_TARGET_KINDS);
+export type DiagnoseTargetKind = z.infer<typeof DiagnoseTargetKind>;
+
+const LOOKS_LIKE_IPV4 = /^[\d.]+$/;
+
+/**
+ * The kind of a `diagnose` target as typed: digits and dots only is an IPv4
+ * address (a domain's last label is never numeric), anything else a domain.
+ */
+export const diagnoseTargetKind = (target: string): DiagnoseTargetKind =>
+  LOOKS_LIKE_IPV4.test(target) ? 'ip' : 'domain';
+
+/**
+ * Validates a `diagnose` target: a routable IPv4 address (not a forbidden
+ * destination, ADR-001) or a domain as `normalizeDomain` accepts it. A
+ * wildcard (`*`) is refused in either form, whatever later releases accept as
+ * a rule target: diagnostics are always about one concrete name or address.
+ * Nothing is rewritten.
+ */
+export const normalizeDiagnoseTarget = (input: string): Normalised => {
+  if (diagnoseTargetKind(input) === 'ip') return normalizeHostAddress(input);
+  // Refused with the same verdict `normalizeDomain` gives any invalid name.
+  if (input.includes('*')) return normalizeDomain('');
+  return normalizeDomain(input);
+};
+
+const DiagnoseTarget = z
+  .string()
+  .max(MAX_DOMAIN_LENGTH)
+  .transform((value, ctx) => {
+    const result = normalizeDiagnoseTarget(value);
+    if (result.ok) return result.value;
+    ctx.issues.push({ code: 'custom', message: result.error.message, input: value, params: result.error });
+    return z.NEVER;
+  });
+
+/**
+ * Explains how traffic to one address or name would leave the machine:
+ * which rule covers it and why, the route the kernel actually holds, the DNS
+ * server of the rule and whether it answers. Read-only. The helper resolves a
+ * domain only when an enabled domain rule covers it; any other name is
+ * answered with the note `name-not-covered` and resolved by the app instead.
+ */
+export const DiagnoseRequest = z.strictObject({ id: RequestId, method: z.literal('diagnose'), target: DiagnoseTarget });
+
 /** Any message the app may send to the helper. */
 export const Request = z.discriminatedUnion('method', [
   StatusRequest,
@@ -399,6 +526,7 @@ export const Request = z.discriminatedUnion('method', [
   SetEnabledRequest,
   TestRequest,
   UninstallRequest,
+  DiagnoseRequest,
 ]);
 export type Request = z.infer<typeof Request>;
 /** A request as the client builds it, before validation and defaults. */
@@ -483,6 +611,184 @@ export type TestResult = z.infer<typeof TestResult>;
 export const UninstallResult = z.object({});
 export type UninstallResult = z.infer<typeof UninstallResult>;
 
+/** What made a rule match a `diagnose` target. */
+export const DIAGNOSE_MATCH_VIA = ['ip', 'subnet', 'domain', 'wildcard', 'dns-server'] as const;
+export const DiagnoseMatchVia = z.enum(DIAGNOSE_MATCH_VIA);
+export type DiagnoseMatchVia = z.infer<typeof DiagnoseMatchVia>;
+
+/**
+ * Why the matching rule wins over the other enabled rules that cover the
+ * target, by the engine's order of precedence:
+ * - `only-match`      — no other enabled rule covers it;
+ * - `host-route`      — an `ip` / `/32` rule or a rule's DNS server route
+ *                       beats everything else;
+ * - `domain-address`  — a resolved address of a domain rule (a host route)
+ *                       beats a covering subnet;
+ * - `longest-prefix`  — the narrowest of several covering subnets;
+ * - `exact-domain`    — an exact domain rule beats a wildcard (0.3.0);
+ * - `deeper-wildcard` — the wildcard with the deepest base (0.3.0);
+ * - `config-order`    — equal rank: the earlier rule of the config.
+ */
+export const DIAGNOSE_PRECEDENCE_CODES = [
+  'only-match',
+  'host-route',
+  'domain-address',
+  'longest-prefix',
+  'exact-domain',
+  'deeper-wildcard',
+  'config-order',
+] as const;
+export const DiagnosePrecedence = z.enum(DIAGNOSE_PRECEDENCE_CODES);
+export type DiagnosePrecedence = z.infer<typeof DiagnosePrecedence>;
+
+/** Where an address of a `diagnose` result comes from: the rule's last DNS answer, or a query made for this request. */
+export const DIAGNOSE_ADDRESS_SOURCES = ['rule-cache', 'query'] as const;
+export const DiagnoseAddressSource = z.enum(DIAGNOSE_ADDRESS_SOURCES);
+export type DiagnoseAddressSource = z.infer<typeof DiagnoseAddressSource>;
+
+/** How the one A query to the rule's DNS server went; `not-queried` when no probe was made. */
+export const DIAGNOSE_DNS_OUTCOMES = ['ok', 'timeout', 'refused', 'error', 'not-queried'] as const;
+export const DiagnoseDnsOutcome = z.enum(DIAGNOSE_DNS_OUTCOMES);
+export type DiagnoseDnsOutcome = z.infer<typeof DiagnoseDnsOutcome>;
+
+/**
+ * Remarks on a `diagnose` result; the UI translates each code.
+ * - `name-not-covered`    — a domain no enabled domain rule covers: the helper
+ *                           did not resolve it (the app may, unprivileged);
+ * - `no-matching-rule`    — no enabled rule covers the target: it leaves
+ *                           through the default route;
+ * - `rule-disabled`       — a rule covers it but is switched off;
+ * - `globally-disabled`   — the global toggle is off;
+ * - `interface-down`      — the matching rule's interface is not up;
+ * - `no-gateway`          — that interface has no gateway;
+ * - `not-applied`         — the rule's route for an address is not in the
+ *                           routing table (see the rule's state);
+ * - `route-mismatch`      — the kernel sends an address through another
+ *                           interface than the rule's;
+ * - `connected-network`   — an address is on a directly connected subnet or
+ *                           is an interface's gateway or own address;
+ * - `dns-server-excluded` — an address is a DNS server and never routed;
+ * - `no-addresses`        — the name has no A records;
+ * - `resolve-failed`      — resolving the name failed;
+ * - `addresses-truncated` — more addresses than `maxDiagnoseAddresses`.
+ */
+export const DIAGNOSE_NOTES = [
+  'name-not-covered',
+  'no-matching-rule',
+  'rule-disabled',
+  'globally-disabled',
+  'interface-down',
+  'no-gateway',
+  'not-applied',
+  'route-mismatch',
+  'connected-network',
+  'dns-server-excluded',
+  'no-addresses',
+  'resolve-failed',
+  'addresses-truncated',
+] as const;
+export const DiagnoseNote = z.enum(DIAGNOSE_NOTES);
+export type DiagnoseNote = z.infer<typeof DiagnoseNote>;
+
+/** The rule a `diagnose` target falls under and why it wins. */
+export const DiagnoseMatch = z.object({
+  ruleId: z.uuid(),
+  via: DiagnoseMatchVia,
+  precedence: DiagnosePrecedence,
+});
+export type DiagnoseMatch = z.infer<typeof DiagnoseMatch>;
+
+/** The route the kernel holds for an address (`route -n get -host`), as `test` reports it. */
+export const DiagnoseRoute = z.object({
+  device: InterfaceName,
+  /** Null for a directly connected destination or a gateway that is not IPv4. */
+  gateway: Ipv4Address.nullable(),
+  /** The role of `device`, or null when it has neither. */
+  role: IfaceRole.nullable(),
+});
+export type DiagnoseRoute = z.infer<typeof DiagnoseRoute>;
+
+/** One address of a `diagnose` target. */
+export const DiagnoseAddress = z.object({
+  address: Ipv4Address,
+  source: DiagnoseAddressSource,
+  /** Null when the lookup found no route at all. */
+  route: DiagnoseRoute.nullable(),
+  /** The role the matching rule routes it through; null when no rule matches (default route). */
+  expectedRole: IfaceRole.nullable(),
+  /** Whether `route.role` equals `expectedRole`; null when either is unknown. */
+  matchesExpected: z.boolean().nullable(),
+});
+export type DiagnoseAddress = z.infer<typeof DiagnoseAddress>;
+
+const RESOLVER_FILE_PREFIX = `${PATHS.resolverDir}/`;
+
+/** A file under `PATHS.resolverDir` named after a valid domain: nothing else is ever reported. */
+const ResolverFile = z
+  .string()
+  .max(RESOLVER_FILE_PREFIX.length + MAX_DOMAIN_LENGTH)
+  .refine(
+    (path) => path.startsWith(RESOLVER_FILE_PREFIX) && normalizeDomain(path.slice(RESOLVER_FILE_PREFIX.length)).ok,
+    { message: 'Must be a resolver file named after a domain' },
+  );
+
+/** The DNS server that answers for the target, and whether it answered the probe. */
+export const DiagnoseDns = z.object({
+  server: Ipv4Address,
+  /** The role whose interface the server is reached through by the rule, or null when none. */
+  role: IfaceRole.nullable(),
+  /** The scoped resolver file that sends the name there, or null when there is none. */
+  resolverFile: ResolverFile.nullable(),
+  outcome: DiagnoseDnsOutcome,
+  /** Time to the probe's outcome; null when it was not queried. */
+  ms: z.int().min(0).max(PROTOCOL_LIMITS.maxDiagnoseDnsMs).nullable(),
+});
+export type DiagnoseDns = z.infer<typeof DiagnoseDns>;
+
+/** Result of `diagnose`. Codes only, no prose: the UI puts it into words. */
+export const DiagnoseResult = z
+  .object({
+    /** The target as it was asked, normalised. */
+    target: DiagnoseTarget,
+    targetKind: DiagnoseTargetKind,
+    /** The winning enabled rule, or null when none covers the target. */
+    match: DiagnoseMatch.nullable(),
+    /** Each address at most once. */
+    addresses: z.array(DiagnoseAddress).max(PROTOCOL_LIMITS.maxDiagnoseAddresses),
+    dns: DiagnoseDns.nullable(),
+    /** Each note at most once. */
+    notes: z.array(DiagnoseNote).max(DIAGNOSE_NOTES.length),
+  })
+  .check((ctx) => {
+    const { target, targetKind, addresses, notes } = ctx.value;
+    if (diagnoseTargetKind(target) !== targetKind) {
+      ctx.issues.push({
+        code: 'custom',
+        message: 'targetKind does not match the target',
+        input: targetKind,
+        path: ['targetKind'],
+      });
+    }
+    const seenAddresses = new Set<string>();
+    addresses.forEach(({ address }, index) => {
+      if (seenAddresses.has(address)) {
+        ctx.issues.push({
+          code: 'custom',
+          message: 'An address is listed more than once',
+          input: address,
+          path: ['addresses', index, 'address'],
+        });
+      }
+      seenAddresses.add(address);
+    });
+    notes.forEach((note, index) => {
+      if (notes.indexOf(note) !== index) {
+        ctx.issues.push({ code: 'custom', message: 'A note is listed more than once', input: note, path: ['notes', index] });
+      }
+    });
+  });
+export type DiagnoseResult = z.infer<typeof DiagnoseResult>;
+
 /** Method -> result type. */
 export interface ResultMap {
   status: StatusResult;
@@ -492,6 +798,7 @@ export interface ResultMap {
   setEnabled: StateResult;
   test: TestResult;
   uninstall: UninstallResult;
+  diagnose: DiagnoseResult;
 }
 export type ResultOf<M extends RequestMethod> = ResultMap[M];
 
@@ -504,6 +811,7 @@ export const RESULT_SCHEMAS: { readonly [M in RequestMethod]: z.ZodType<ResultMa
   setEnabled: StateResult,
   test: TestResult,
   uninstall: UninstallResult,
+  diagnose: DiagnoseResult,
 };
 
 // ---------------------------------------------------------------------------
@@ -520,6 +828,10 @@ export const RESULT_SCHEMAS: { readonly [M in RequestMethod]: z.ZodType<ResultMa
  * - `invalid-config`    — the `config` of `setConfig` failed validation.
  * - `operation-failed`  — the request was valid but the helper could not carry it out.
  * - `not-implemented`   — the method exists but this helper build cannot perform it.
+ * - `rate-limited`      — `diagnose` only: the connection used up its per-minute
+ *                         budget; try again in a minute (TASK-DELTA-21).
+ * - `busy`              — `diagnose` only: a diagnosis is already running on the
+ *                         connection, or too many run at once; try again shortly.
  * - `internal`          — an unexpected error inside the helper.
  * - `invalid-response`  — never sent: produced on the app side when a line
  *                         from the helper does not match this contract.
@@ -534,6 +846,8 @@ export const ERROR_CODES = [
   'not-implemented',
   'internal',
   'invalid-response',
+  'rate-limited',
+  'busy',
 ] as const;
 export const ErrorCode = z.enum(ERROR_CODES);
 export type ErrorCode = z.infer<typeof ErrorCode>;
@@ -774,6 +1088,24 @@ const KNOWN_FIELDS: ReadonlySet<string> = new Set([
   'lastReconcileReason',
   'destination',
   'role',
+  // dnsWarnings
+  'dnsWarnings',
+  'server',
+  'source',
+  'via',
+  // diagnose
+  'targetKind',
+  'match',
+  'precedence',
+  'addresses',
+  'address',
+  'route',
+  'expectedRole',
+  'matchesExpected',
+  'resolverFile',
+  'outcome',
+  'ms',
+  'notes',
   // log event
   'level',
   'msg',
@@ -801,6 +1133,7 @@ const VALIDATION_CODES: Readonly<Record<ValidationCode | 'duplicate-id' | 'iface
   'invalid-prefix': true,
   'prefix-too-wide': true,
   'invalid-domain': true,
+  'invalid-wildcard': true,
   'invalid-destination': true,
   'default-route': true,
   'this-network': true,
@@ -850,7 +1183,7 @@ const refuse = (code: ErrorCode, message: string, id: RequestId | null): Protoco
 
 /**
  * Helper side: validates one decoded line from a client as a `Request`.
- * Anything that is not exactly one of the seven requests is refused with a
+ * Anything that is not exactly one of the eight requests is refused with a
  * code and, when it could be read, the request id to answer with.
  *
  * The message of a refusal is safe to log and to send back: it consists of

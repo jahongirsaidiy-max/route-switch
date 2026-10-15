@@ -3,6 +3,7 @@ import { PATHS, type Config, type EngineState } from '@routeswitch/shared';
 import { createConfigWriter, emptyConfig, loadConfig, type ConfigFileReader, type ConfigFs } from './config-store';
 import {
   createDomainResolver,
+  probeDns,
   realClearTimer,
   realSetTimer,
   type ClearTimer,
@@ -72,7 +73,7 @@ import { UNINSTALL_REPLY_TIMEOUT_MS, requestUninstall, type UninstallReply } fro
  */
 
 /** Version of the helper, reported in `EngineState.helperVersion`. Kept equal to `package.json` by a test. */
-export const HELPER_VERSION = '0.1.0';
+export const HELPER_VERSION = '0.2.0';
 
 export const EXIT_CODES = {
   ok: 0,
@@ -553,7 +554,16 @@ const runDaemon = async (configPath: string, deps: RunDeps): Promise<number> => 
     engine: helper.engine,
     helperVersion: HELPER_VERSION,
     logger: root,
-    routeGet: (target) => helper.routes.routeGet(target),
+    routeGet: (target, options) => helper.routes.routeGet(target, options),
+    peekDomain: (ruleId) => helper.dns.peek(ruleId),
+    probeDns: (server, name) =>
+      probeDns(server, name, {
+        createResolver: deps.createDnsResolver,
+        setTimer: helper.setTimer,
+        clearTimer: helper.clearTimer,
+        monotonicNow: deps.monotonicNow,
+      }),
+    monotonicNow: deps.monotonicNow,
     saveConfig: (next) => writer.save(next),
     started,
     storedConfigProblem: loaded.ok ? null : loaded.code,

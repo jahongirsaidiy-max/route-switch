@@ -29,17 +29,28 @@ describe('App', () => {
   const screens: Record<View, ComponentType> = { popover: screen('popover'), rules: screen('rules') };
 
   it.each(VIEWS)('shows the %s screen for its view', (view) => {
-    const html = renderMarkup(createElement(App, { search: `?view=${view}`, screens }));
+    const html = renderMarkup(createElement(App, { search: `?view=${view}`, screens, language: 'uz' }));
     expect(html).toContain(`data-view="${view}"`);
     expect(html).toContain(`data-screen="${view}"`);
     expect(html.match(/data-screen=/g)).toHaveLength(1);
   });
 
   it('shows a notice instead of guessing a screen', () => {
-    const html = renderMarkup(createElement(App, { search: '?view=nope', screens }));
+    const html = renderMarkup(createElement(App, { search: '?view=nope', screens, language: 'uz' }));
     expect(html).toContain('data-view="unknown"');
     expect(html).toContain('role="alert"');
     expect(html).not.toContain('data-screen');
+  });
+
+  it('speaks the language it is given (TASK-DELTA-11)', () => {
+    expect(renderMarkup(createElement(App, { search: '?view=nope', screens, language: 'ru' }))).toContain('Неизвестное окно');
+    expect(renderMarkup(createElement(App, { search: '?view=nope', screens, language: 'en' }))).toContain('Unknown window');
+    expect(renderMarkup(createElement(App, { search: '?view=nope', screens, language: 'uz' }))).toContain('Noma&#x27;lum oyna');
+  });
+
+  it('shows nothing until the main process has named the language (no flash of another language)', () => {
+    const rs = { getLanguage: () => new Promise<never>(() => undefined), onLanguage: () => () => undefined };
+    expect(renderMarkup(createElement(App, { search: '?view=popover', screens, rs }))).toBe('');
   });
 
   it('the popover view is the menu bar screen', () => {

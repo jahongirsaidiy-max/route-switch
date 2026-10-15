@@ -19,6 +19,7 @@ import {
 } from './AddRuleScreen';
 import { initialAddRuleUi, type AddRuleUiState } from './controller';
 import { formOfRule, NEW_RULE_FORM, WILDCARD_TEXT, type RuleForm } from './model';
+import { VALIDATION_TEXT as UZ_VALIDATION } from '../../text';
 
 const NEW_ID = '77777777-7777-4777-8777-777777777777';
 const connected = (state: EngineState = STATE): EngineStateView => ({
@@ -149,6 +150,27 @@ describe('AddRulePanel — layout', () => {
     expect(text(render({ ui: ui({ kind: 'subnet', target: '172.16.12.40/32' }) }))).toContain('«172.16.12.40» qoidasida ham bor');
   });
 
+  it('an IP wildcard: the CIDR under the input, the -net preview, the subnet test (TASK-DELTA-15)', () => {
+    const html = text(render({ ui: ui({ kind: 'ip', target: '10.*.*.*', iface: 'wifi' }), config: null }));
+    expect(html).toContain('→ 10.0.0.0/8 (subnet)');
+    expect(html).toContain('$ route -n add -net 10.0.0.0/8 192.168.0.1');
+    expect(html).not.toContain('-host 10.0.0.0/8');
+    const { all, elements } = treeOf({ ui: ui({ kind: 'ip', target: '10.*.*.*' }), config: null });
+    buttonsNamed(elements, "Sinab ko'rish")[0]?.props.onClick?.();
+    expect(all.onTest).toHaveBeenCalledWith('10.0.0.1');
+    // The hints of both IP kinds give a wildcard example.
+    expect(text(render({ ui: ui({ kind: 'ip' }) }))).toContain('10.*.*.*');
+    expect(text(render({ ui: ui({ kind: 'subnet' }) }))).toContain('10.*.*.*');
+  });
+
+  it('an invalid or forbidden wildcard is refused next to the field (ADR-001 words for 224.*.*.*)', () => {
+    const touched = { submitted: true };
+    expect(text(render({ ui: ui({ kind: 'ip', target: '10.*.1.*' }, touched) }))).toContain("faqat oxirgi oktetlarda");
+    const forbidden = text(render({ ui: ui({ kind: 'ip', target: '224.*.*.*' }, touched) }));
+    expect(forbidden).not.toContain('→ 224.0.0.0');
+    expect(forbidden).toContain(UZ_VALIDATION.multicast);
+  });
+
   it('a helper that is not connected: a banner, and no command', () => {
     const html = text(render({ engine: { helper: 'not-installed', connection: { kind: 'not-installed' }, state: null, error: null } }));
     expect(html).toContain("Helper o'rnatilmagan — qoidani saqlab bo'lmaydi.");
@@ -202,8 +224,8 @@ describe('AddRulePanel — errors next to the field', () => {
     expect(visibleErrors(errors, { touched: new Set(), submitted: false })).toEqual({});
     expect(visibleErrors(errors, { touched: new Set(['dns', 'note']), submitted: false })).toEqual({ dns: 'b' });
     expect(visibleErrors(errors, { touched: new Set(), submitted: true })).toBe(errors);
-    expect(refreshText(600)).toBe('har 10 daqiqada');
-    expect(refreshText(90)).toBe('har 90 soniyada');
+    expect(refreshText(600)).toBe("IP'lar har 10 daqiqada yangilanadi.");
+    expect(refreshText(90)).toBe("IP'lar har 90 soniyada yangilanadi.");
   });
 });
 

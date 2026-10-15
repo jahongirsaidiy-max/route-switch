@@ -1,11 +1,11 @@
-import { LIMITS, type Config, type EngineState, type RuleInput } from '@routeswitch/shared';
+import { LIMITS, type Config, type EngineState, type Language, type RuleInput, type RulesBackupFile } from '@routeswitch/shared';
 import { mkdtemp, readdir, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-import type { RsApi, RsLogEntry, RsResult, RsSnapshot } from '../renderer/src/rs';
+import type { RsApi, RsDiagnosis, RsLogEntry, RsResult, RsSnapshot } from '../renderer/src/rs';
 import { createHelperClient, DEFAULT_TIMEOUTS, type HelperClient } from './helperClient';
 import {
   engineState,
@@ -20,21 +20,29 @@ import {
   statusResult,
 } from './helperClient.fixtures';
 import type { ConfigFileSystem } from './configFile';
+import type { NameLookup } from './diagnose';
 import {
   EMPTY_CONFIG,
   IMPORT_TTL_MS,
   INVOKE_CHANNELS,
+  LANGUAGE_CHANNEL,
   LOG_CHANNEL,
   registerIpcHandlers,
+  RULES_INTENT_CHANNEL,
+  RULES_INTENT_TTL_MS,
   STATE_CHANNEL,
+  viewOf,
   type ConfigDialogs,
   type InvokeEvent,
   type StateRecipient,
 } from './ipc';
 import type { HelperSetupResult, Installer } from './installer';
 import { createLogBuffer, type LogBuffer } from './logBuffer';
+import type { PreferencesStore } from './preferences';
+import type { RulesBackupStore } from './rulesBackup';
 import { APP_ENTRY_URL } from './runtime';
 import { createSettings, type Settings } from './settings';
+import { viewUrl } from './windows';
 
 // ---------------------------------------------------------------------------
 // The preload, loaded against a stand-in for Electron's renderer side. Its
@@ -111,6 +119,8 @@ interface FakeHelper {
   readonly silent: Set<string>;
   /** The stored config cannot be loaded (TASK-114): getConfig / setEnabled fail until a setConfig. */
   broken?: boolean;
+  /** The answer to every `diagnose` request (TASK-DELTA-20); `not-implemented` when unset. */
+  diagnose?: (request: { id: number; target: string }) => unknown;
 }
 
 function attachHelper(socket: FakeSocket, helper: FakeHelper): void {
@@ -167,6 +177,13 @@ function attachHelper(socket: FakeSocket, helper: FakeHelper): void {
             }),
           );
           return;
+        case 'diagnose':
+          if (helper.diagnose !== undefined) {
+            socket.receive(helper.diagnose({ id: request.id, target: request['target'] as string }));
+            return;
+          }
+          socket.receive(refused(request.id, 'not here', 'not-implemented'));
+          return;
         default:
           socket.receive(refused(request.id, 'not here', 'not-implemented'));
       }
@@ -184,6 +201,34 @@ const unusedSettings = (logger: Parameters<typeof createSettings>[0]['logger']):
     logger,
   });
 
+/** An in-memory language store, like `createPreferences` without the file. */
+function memoryPreferences(initial: Language = 'uz') {
+  let current = initial;
+  let dismissed: string | null = null;
+  const listeners = new Set<(language: Language) => void>();
+  const store = {
+    language: vi.fn(() => Promise.resolve(current)),
+    setLanguage: vi.fn((language: Language) => {
+      const changed = language !== current;
+      current = language;
+      if (changed) for (const listener of [...listeners]) listener(language);
+      return Promise.resolve(language);
+    }),
+    onLanguage: (listener: (language: Language) => void) => {
+      listeners.add(listener);
+      return () => {
+        listeners.delete(listener);
+      };
+    },
+    dismissedBackupAt: vi.fn(() => Promise.resolve(dismissed)),
+    setDismissedBackupAt: vi.fn((savedAt: string) => {
+      dismissed = savedAt;
+      return Promise.resolve();
+    }),
+  } satisfies PreferencesStore;
+  return { store, listeners };
+}
+
 interface SetupOptions {
   readonly connect?: boolean;
   readonly config?: Config;
@@ -198,6 +243,23 @@ interface SetupOptions {
   /** The helper's stored config cannot be loaded: the handshake ends `config-unreadable`. */
   readonly brokenConfig?: boolean;
   readonly installer?: Installer;
+  readonly preferences?: PreferencesStore;
+  readonly backup?: Pick<RulesBackupStore, 'read' | 'remove'>;
+  readonly lookupName?: NameLookup;
+  readonly diagnose?: FakeHelper['diagnose'];
+}
+
+/** A backup store in memory (TASK-DELTA-16). */
+function memoryBackup(initial: RulesBackupFile | null = null, removable = true) {
+  let current = initial;
+  const store = {
+    read: vi.fn(() => Promise.resolve(current)),
+    remove: vi.fn(() => {
+      if (removable) current = null;
+      return Promise.resolve(removable);
+    }),
+  } satisfies Pick<RulesBackupStore, 'read' | 'remove'>;
+  return store;
 }
 
 /** An installer that must not be reached. */
@@ -220,6 +282,7 @@ async function setup(options: SetupOptions = {}) {
     answerOnce: new Map(),
     silent: new Set(),
     broken: options.brokenConfig === true,
+    ...(options.diagnose === undefined ? {} : { diagnose: options.diagnose }),
   };
   const realClient = createHelperClient({
     socketPath: '/tmp/routeswitch-test/helper.sock',
@@ -243,11 +306,14 @@ async function setup(options: SetupOptions = {}) {
     listRecipients: () => recipients,
     ...(options.logBuffer === undefined ? {} : { logBuffer: options.logBuffer }),
     settings: options.settings ?? unusedSettings(logger),
+    preferences: options.preferences ?? memoryPreferences().store,
+    backup: options.backup ?? memoryBackup(),
     openRulesWindow: options.openRulesWindow ?? (() => undefined),
     configDialogs: options.configDialogs ?? CANCELLED_DIALOGS,
     installer: options.installer ?? UNUSED_INSTALLER,
     ...(options.configFs === undefined ? {} : { configFs: options.configFs }),
     ...(options.now === undefined ? {} : { now: options.now }),
+    ...(options.lookupName === undefined ? {} : { lookupName: options.lookupName }),
   });
 
   if (options.client === undefined) {
@@ -296,10 +362,10 @@ const newRule = (extra: Partial<RuleInput> = {}): RuleInput => ({
 // ---------------------------------------------------------------------------
 
 describe('registration', () => {
-  it('handles exactly the twenty-three invoke channels of the renderer API', async () => {
+  it('handles exactly the thirty invoke channels of the renderer API', async () => {
     const h = await setup({ connect: false });
     expect([...h.ipcMain.handlers.keys()].sort()).toEqual([...INVOKE_CHANNELS].sort());
-    expect(INVOKE_CHANNELS).toHaveLength(23);
+    expect(INVOKE_CHANNELS).toHaveLength(31);
   });
 
   it('dispose removes every handler and stops the state pushes; a second dispose does nothing', async () => {
@@ -310,7 +376,7 @@ describe('registration', () => {
     h.registration.dispose();
     h.registration.dispose();
     expect(h.ipcMain.handlers.size).toBe(0);
-    expect(h.ipcMain.removeHandler).toHaveBeenCalledTimes(23);
+    expect(h.ipcMain.removeHandler).toHaveBeenCalledTimes(31);
     h.sockets[0]?.emit('connect');
     for (let i = 0; i < 6; i += 1) await flush();
     expect(sent).toEqual([]);
@@ -753,6 +819,15 @@ describe('every argument is checked before anything reaches the helper', () => {
     ['a forbidden address to test', 'rs:test', ['0.0.0.0']],
     ['a domain to test', 'rs:test', ['corp.local']],
     ['a non-canonical address to test', 'rs:test', ['010.1.2.3']],
+    ['a URL to diagnose (the page strips it)', 'rs:diagnose', ['https://corp.local/x']],
+    ['a wildcard to diagnose', 'rs:diagnose', ['*.corp.local']],
+    ['an upper-case name to diagnose', 'rs:diagnose', ['Corp.Local']],
+    ['loopback to diagnose', 'rs:diagnose', ['127.0.0.1']],
+    ['a subnet to diagnose', 'rs:diagnose', ['10.0.0.0/8']],
+    ['IPv6 to diagnose', 'rs:diagnose', ['::1']],
+    ['a path to diagnose', 'rs:diagnose', ['../etc']],
+    ['a number to diagnose', 'rs:diagnose', [1]],
+    ['no target to diagnose', 'rs:diagnose', []],
     ['arguments to a method that takes none', 'rs:apply', [true]],
     ['arguments to getState', 'rs:getState', [{}]],
     ['arguments to getConfig', 'rs:getConfig', ['x']],
@@ -913,6 +988,8 @@ describe('rs:state', () => {
       entryUrl: APP_ENTRY_URL,
       logger,
       settings: unusedSettings(logger),
+      preferences: memoryPreferences().store,
+      backup: memoryBackup(),
       openRulesWindow: () => undefined,
       configDialogs: CANCELLED_DIALOGS,
       listRecipients: () => {
@@ -1123,6 +1200,8 @@ describe('helper away and a broken stored config (TASK-300)', () => {
     const h = await setup({ brokenConfig: true });
     await h.call('rs:resetConfig');
     h.sockets[0]?.emit('close');
+    // The app's lines go into the journal once the language is known (TASK-DELTA-12).
+    for (let i = 0; i < 6; i += 1) await flush();
     const log = valueOf(await h.call('rs:getLog')) as RsLogEntry[];
     expect(log.map((entry) => [entry.level, entry.msg, entry.source])).toEqual([
       ['error', "Helper saqlangan config'ni o'qiy olmadi — hech bir qoida qo'llanmaydi. Import yoki bo'sh config bilan tiklang", 'app'],
@@ -1348,6 +1427,140 @@ describe('settings: uninstall the helper', () => {
   });
 });
 
+describe('rs:diagnose (TASK-DELTA-20)', () => {
+  const ADDRESS_ROUTE = { device: 'en0', gateway: '192.168.1.1', role: 'wifi' } as const;
+  /** The helper's answer for one IPv4 target: no rule, the default route through Wi‑Fi. */
+  const ipAnswer = (id: number, target: string) =>
+    ok(id, {
+      target,
+      targetKind: 'ip',
+      match: null,
+      addresses: [{ address: target, source: 'query', route: ADDRESS_ROUTE, expectedRole: null, matchesExpected: null }],
+      dns: null,
+      notes: ['no-matching-rule'],
+    });
+  const notCovered = (id: number, target: string) =>
+    ok(id, { target, targetKind: 'domain', match: null, addresses: [], dns: null, notes: ['name-not-covered'] });
+  /** A helper that does not resolve names and answers every address. */
+  const answering = (request: { id: number; target: string }) =>
+    /^[\d.]+$/.test(request.target) ? ipAnswer(request.id, request.target) : notCovered(request.id, request.target);
+  const lookupOf = (...addresses: string[]): NameLookup => vi.fn(() => Promise.resolve(addresses.map((address) => ({ address, family: 4 }))));
+  const diagnoseTargets = (h: Awaited<ReturnType<typeof setup>>) =>
+    h.sent().filter((request) => request.method === 'diagnose').map((request) => request['target']);
+
+  it('an address: one helper diagnose, no lookup', async () => {
+    const lookupName = lookupOf('10.9.9.9');
+    const h = await setup({ diagnose: answering, lookupName });
+    const value = valueOf(await h.call('rs:diagnose', '172.16.12.40')) as RsDiagnosis;
+    expect(diagnoseTargets(h)).toEqual(['172.16.12.40']);
+    expect(lookupName).not.toHaveBeenCalled();
+    expect(value.lookup).toBeNull();
+    expect(value.result).toMatchObject({ target: '172.16.12.40', targetKind: 'ip', notes: ['no-matching-rule'] });
+  });
+
+  it('a name the helper resolves (a rule covers it): no lookup in the app', async () => {
+    const lookupName = lookupOf('10.9.9.9');
+    const h = await setup({
+      lookupName,
+      diagnose: (request) =>
+        ok(request.id, { target: request.target, targetKind: 'domain', match: { ruleId: RULE_ID, via: 'domain', precedence: 'only-match' }, addresses: [], dns: null, notes: [] }),
+    });
+    const value = valueOf(await h.call('rs:diagnose', 'corp.local')) as RsDiagnosis;
+    expect(value.lookup).toBeNull();
+    expect(lookupName).not.toHaveBeenCalled();
+    expect(diagnoseTargets(h)).toEqual(['corp.local']);
+  });
+
+  it('name-not-covered: the app resolves the name and diagnoses each address, one after the other', async () => {
+    const lookupName = lookupOf('203.0.113.7', '127.0.0.1', '203.0.113.7', '198.51.100.2');
+    const h = await setup({ diagnose: answering, lookupName });
+    const value = valueOf(await h.call('rs:diagnose', 'example.com')) as RsDiagnosis;
+    expect(lookupName).toHaveBeenCalledWith('example.com');
+    expect(diagnoseTargets(h)).toEqual(['example.com', '203.0.113.7', '198.51.100.2']);
+    expect(value.result.notes).toEqual(['name-not-covered']);
+    expect(value.lookup).toMatchObject({ outcome: 'ok', truncated: false, excluded: 1 });
+    expect(value.lookup?.addresses.map((entry) => [entry.address, entry.ok])).toEqual([
+      ['203.0.113.7', true],
+      ['198.51.100.2', true],
+    ]);
+  });
+
+  it('at most 8 addresses are diagnosed; more are reported as truncated', async () => {
+    const many = Array.from({ length: 12 }, (_, index) => `203.0.113.${String(index + 1)}`);
+    const h = await setup({ diagnose: answering, lookupName: lookupOf(...many) });
+    const value = valueOf(await h.call('rs:diagnose', 'example.com')) as RsDiagnosis;
+    expect(diagnoseTargets(h)).toEqual(['example.com', ...many.slice(0, 8)]);
+    expect(value.lookup).toMatchObject({ truncated: true });
+    expect(value.lookup?.addresses).toHaveLength(8);
+  });
+
+  it('a refused address is a row with its code; the others are still diagnosed', async () => {
+    let calls = 0;
+    const h = await setup({
+      lookupName: lookupOf('203.0.113.7', '198.51.100.2'),
+      diagnose: (request) => {
+        calls += 1;
+        if (calls === 2) return refused(request.id, 'Too many diagnoses on this connection; try again in a minute', 'operation-failed');
+        return answering(request);
+      },
+    });
+    const value = valueOf(await h.call('rs:diagnose', 'example.com')) as RsDiagnosis;
+    expect(value.lookup?.addresses).toEqual([
+      { address: '203.0.113.7', ok: false, code: 'operation-failed' },
+      expect.objectContaining({ address: '198.51.100.2', ok: true }),
+    ]);
+  });
+
+  it('a lookup that finds nothing: no address request', async () => {
+    const lookupName: NameLookup = () => Promise.reject(Object.assign(new Error('queryA ENOTFOUND nope.example'), { code: 'ENOTFOUND' }));
+    const h = await setup({ diagnose: answering, lookupName });
+    const value = valueOf(await h.call('rs:diagnose', 'nope.example')) as RsDiagnosis;
+    expect(value.lookup).toEqual({ outcome: 'not-found', addresses: [], truncated: false, excluded: 0 });
+    expect(diagnoseTargets(h)).toEqual(['nope.example']);
+  });
+
+  it('a helper refusal is passed on; nothing is resolved', async () => {
+    const lookupName = lookupOf('203.0.113.7');
+    const h = await setup({ lookupName, diagnose: (request) => refused(request.id, 'Too many diagnoses are running; try again shortly', 'operation-failed') });
+    expect(await h.call('rs:diagnose', 'example.com')).toMatchObject({ ok: false, code: 'operation-failed' });
+    expect(lookupName).not.toHaveBeenCalled();
+  });
+
+  it('without a helper: not-connected, nothing resolved', async () => {
+    const lookupName = lookupOf('203.0.113.7');
+    const h = await setup({ connect: false, lookupName });
+    expect(await h.call('rs:diagnose', 'example.com')).toMatchObject({ ok: false, code: 'not-connected' });
+    expect(lookupName).not.toHaveBeenCalled();
+  });
+
+  it('one diagnosis at a time: a second call while one runs is busy and sends nothing', async () => {
+    let finish: (addresses: { address: string; family: number }[]) => void = () => undefined;
+    const lookupName: NameLookup = () =>
+      new Promise((resolve) => {
+        finish = resolve;
+      });
+    const h = await setup({ diagnose: answering, lookupName });
+    const handler = h.ipcMain.handlers.get('rs:diagnose');
+    const first = handler?.(TRUSTED, 'example.com');
+    for (let i = 0; i < 8; i += 1) await flush();
+    expect(await h.call('rs:diagnose', '172.16.12.40')).toMatchObject({ ok: false, code: 'busy' });
+    expect(diagnoseTargets(h)).toEqual(['example.com']);
+    finish([{ address: '203.0.113.7', family: 4 }]);
+    expect(await first).toMatchObject({ ok: true });
+    expect((await h.call('rs:diagnose', '172.16.12.40')).ok).toBe(true);
+  });
+
+  it('the name and its addresses are logged at debug only', async () => {
+    const h = await setup({ diagnose: answering, lookupName: lookupOf('203.0.113.7') });
+    valueOf(await h.call('rs:diagnose', 'secret-host.example'));
+    const above = h.entries.filter((entry) => entry.level !== 'debug');
+    expect(JSON.stringify(above)).not.toContain('secret-host');
+    expect(JSON.stringify(above)).not.toContain('203.0.113.7');
+    expect(above.some((entry) => entry.msg === 'Diagnostics made')).toBe(true);
+    expect(JSON.stringify(h.entries.filter((entry) => entry.level === 'debug'))).toContain('secret-host.example');
+  });
+});
+
 describe('rs:openRulesWindow (main process only)', () => {
   it('opens the rules window and sends nothing to the helper', async () => {
     const openRulesWindow = vi.fn();
@@ -1374,6 +1587,114 @@ describe('rs:openRulesWindow (main process only)', () => {
     expect(openRulesWindow).not.toHaveBeenCalled();
   });
 
+  // TASK-DELTA-21: what the rules window is opened for.
+  const RULES_EVENT: InvokeEvent = { senderFrame: { url: viewUrl(APP_ENTRY_URL, 'rules'), parent: null } };
+  const POPOVER_EVENT: InvokeEvent = { senderFrame: { url: viewUrl(APP_ENTRY_URL, 'popover'), parent: null } };
+  const windowRecipient = (url: string) => {
+    const sent: [string, unknown][] = [];
+    const target: StateRecipient = { isDestroyed: () => false, getURL: () => url, send: (channel, payload) => sent.push([channel, payload]) };
+    return { target, intents: () => sent.filter(([channel]) => channel === RULES_INTENT_CHANNEL) };
+  };
+
+  it.each([
+    ['junk', 'rules'],
+    ['null', null],
+    ['an unknown kind', { kind: 'navigate', url: 'https://example.com/' }],
+    ['an unknown section', { kind: 'section', section: 'admin' }],
+    ['an extra key', { kind: 'section', section: 'log', extra: 1 }],
+    ['a rule instead of a warning', { kind: 'dns-offer', server: '10.0.0.53', role: 'ethernet', rule: { target: '0.0.0.0/0' } }],
+    ['a forbidden server', { kind: 'dns-offer', server: '127.0.0.1', role: 'ethernet' }],
+    ['a name as server', { kind: 'dns-offer', server: 'corp.local', role: 'wifi' }],
+    ['another role', { kind: 'dns-offer', server: '10.0.0.53', role: 'utun0' }],
+    ['two arguments', { kind: 'section', section: 'log' }, { kind: 'section', section: 'log' }],
+  ] as [string, ...unknown[]][])('refuses %s as an intent: nothing opens, nothing waits, nothing is pushed', async (_name, ...args) => {
+    const openRulesWindow = vi.fn();
+    const rules = windowRecipient(viewUrl(APP_ENTRY_URL, 'rules'));
+    const h = await setup({ openRulesWindow, recipients: [rules.target] });
+    expect(await h.call('rs:openRulesWindow', ...args)).toMatchObject({ ok: false, code: 'invalid-input' });
+    expect(openRulesWindow).not.toHaveBeenCalled();
+    expect(rules.intents()).toEqual([]);
+    expect(await h.callAs(RULES_EVENT, 'rs:takeRulesIntent')).toEqual({ ok: true, value: null });
+  });
+
+  it("the main process's own way in (the tray's Help, TASK-DELTA-22): the same slot and signal; nothing after dispose", async () => {
+    const openRulesWindow = vi.fn();
+    const rules = windowRecipient(viewUrl(APP_ENTRY_URL, 'rules'));
+    const h = await setup({ openRulesWindow, recipients: [rules.target] });
+    // `help` is a section the channel accepts too.
+    expect(await h.call('rs:openRulesWindow', { kind: 'section', section: 'help' })).toEqual({ ok: true, value: null });
+    expect(await h.callAs(RULES_EVENT, 'rs:takeRulesIntent')).toEqual({ ok: true, value: { kind: 'section', section: 'help' } });
+    h.registration.openRulesWindow({ kind: 'section', section: 'help' });
+    expect(openRulesWindow).toHaveBeenCalledTimes(2);
+    expect(rules.intents()).toHaveLength(2);
+    expect(await h.callAs(RULES_EVENT, 'rs:takeRulesIntent')).toEqual({ ok: true, value: { kind: 'section', section: 'help' } });
+    expect(h.entries.some((entry) => entry.msg === 'Rules window requested' && entry['channel'] === 'tray' && entry['section'] === 'help')).toBe(true);
+    h.registration.openRulesWindow();
+    expect(openRulesWindow).toHaveBeenCalledTimes(3);
+    h.registration.dispose();
+    h.registration.openRulesWindow({ kind: 'section', section: 'help' });
+    expect(openRulesWindow).toHaveBeenCalledTimes(3);
+  });
+
+  it('keeps a valid intent for the rules window, tells the rules window only, and hands it out once', async () => {
+    const openRulesWindow = vi.fn();
+    const rules = windowRecipient(viewUrl(APP_ENTRY_URL, 'rules'));
+    const popover = windowRecipient(viewUrl(APP_ENTRY_URL, 'popover'));
+    const foreign = windowRecipient(viewUrl('https://example.com/', 'rules'));
+    const h = await setup({ openRulesWindow, recipients: [rules.target, popover.target, foreign.target] });
+    const intent = { kind: 'dns-offer', server: '10.0.0.53', role: 'ethernet' };
+    expect(await h.callAs(POPOVER_EVENT, 'rs:openRulesWindow', intent)).toEqual({ ok: true, value: null });
+    expect(openRulesWindow).toHaveBeenCalledTimes(1);
+    expect(rules.intents()).toEqual([[RULES_INTENT_CHANNEL, null]]);
+    expect(popover.intents()).toEqual([]);
+    expect(foreign.intents()).toEqual([]);
+    // Only the rules window may take it; the popover is refused and the intent stays.
+    expect(await h.callAs(POPOVER_EVENT, 'rs:takeRulesIntent')).toMatchObject({ ok: false, code: 'forbidden' });
+    expect(await h.callAs(RULES_EVENT, 'rs:takeRulesIntent')).toEqual({ ok: true, value: intent });
+    expect(await h.callAs(RULES_EVENT, 'rs:takeRulesIntent')).toEqual({ ok: true, value: null });
+    // The server is not logged above debug.
+    expect(JSON.stringify(h.entries.filter((entry) => entry.level !== 'debug'))).not.toContain('10.0.0.53');
+    expect(h.sentAfterHandshake()).toEqual([]);
+  });
+
+  it('without an intent nothing waits and nothing is pushed; the last intent wins; a minute later it is gone', async () => {
+    let clock = 1_000_000;
+    const rules = windowRecipient(viewUrl(APP_ENTRY_URL, 'rules'));
+    const h = await setup({ recipients: [rules.target], now: () => clock });
+    await h.call('rs:openRulesWindow');
+    expect(rules.intents()).toEqual([]);
+    expect(await h.callAs(RULES_EVENT, 'rs:takeRulesIntent')).toEqual({ ok: true, value: null });
+    await h.call('rs:openRulesWindow', { kind: 'section', section: 'log' });
+    await h.call('rs:openRulesWindow', { kind: 'section', section: 'diagnostics' });
+    expect(await h.callAs(RULES_EVENT, 'rs:takeRulesIntent')).toEqual({ ok: true, value: { kind: 'section', section: 'diagnostics' } });
+    await h.call('rs:openRulesWindow', { kind: 'section', section: 'settings' });
+    clock += RULES_INTENT_TTL_MS;
+    expect(await h.callAs(RULES_EVENT, 'rs:takeRulesIntent')).toEqual({ ok: true, value: { kind: 'section', section: 'settings' } });
+    await h.call('rs:openRulesWindow', { kind: 'section', section: 'settings' });
+    clock += RULES_INTENT_TTL_MS + 1;
+    expect(await h.callAs(RULES_EVENT, 'rs:takeRulesIntent')).toEqual({ ok: true, value: null });
+  });
+
+  it('a window that cannot be told is logged; the intent still waits for it', async () => {
+    const broken: StateRecipient = {
+      isDestroyed: () => false,
+      getURL: () => viewUrl(APP_ENTRY_URL, 'rules'),
+      send: () => {
+        throw new Error('Object has been destroyed');
+      },
+    };
+    const h = await setup({ recipients: [broken] });
+    expect(await h.call('rs:openRulesWindow', { kind: 'section', section: 'log' })).toEqual({ ok: true, value: null });
+    expect(h.entries.some((entry) => entry.level === 'error' && entry.msg === 'Could not tell the rules window of a waiting intent')).toBe(true);
+    expect(await h.callAs(RULES_EVENT, 'rs:takeRulesIntent')).toEqual({ ok: true, value: { kind: 'section', section: 'log' } });
+  });
+
+  it('viewOf reads the view of a page URL', () => {
+    expect(viewOf(viewUrl(APP_ENTRY_URL, 'rules'))).toBe('rules');
+    expect(viewOf(APP_ENTRY_URL)).toBeNull();
+    expect(viewOf('not a url')).toBeNull();
+  });
+
   it.each([
     ['another document', { senderFrame: { url: 'https://example.com/', parent: null } }],
     ['a sub-frame of the app page', { senderFrame: { url: APP_ENTRY_URL, parent: {} } }],
@@ -1397,7 +1718,7 @@ describe('rs:openRulesWindow (main process only)', () => {
 });
 
 describe('the preload against the main process (window.rs)', () => {
-  it('exposes exactly the twenty-three methods of the renderer API, each wired to a handled channel', async () => {
+  it('exposes exactly the thirty-five methods of the renderer API (thirty-one calls, four subscriptions), each wired to a handled channel', async () => {
     const openRulesWindow = vi.fn();
     const h = await setup({ settings: fakeSettings().settings, openRulesWindow });
     bridge.setInvokeTarget((channel, ...args) => {
@@ -1412,25 +1733,35 @@ describe('the preload against the main process (window.rs)', () => {
         'apply',
         'applyImport',
         'copyServiceOrderCommand',
+        'deleteBackup',
         'deleteRule',
+        'diagnose',
+        'dismissBackup',
         'exportConfig',
+        'getBackup',
         'getConfig',
+        'getLanguage',
         'getLog',
         'getServiceOrder',
         'getSettings',
         'getState',
         'importConfig',
         'installHelper',
+        'onLanguage',
         'onLog',
+        'onRulesIntent',
         'onState',
         'openRulesWindow',
         'reconnectHelper',
         'removeHelper',
         'resetConfig',
+        'restoreBackup',
         'saveRule',
         'setEnabled',
         'setIfaceOverrides',
+        'setLanguage',
         'setOpenAtLogin',
+        'takeRulesIntent',
         'test',
         'toggleRule',
         'uninstallHelper',
@@ -1449,6 +1780,8 @@ describe('the preload against the main process (window.rs)', () => {
     expect((await settle(rs.setEnabled(true))).ok).toBe(true);
     expect((await settle(rs.apply())).ok).toBe(true);
     expect((await settle(rs.test('10.1.2.3'))).ok).toBe(true);
+    // The fake helper does not know `diagnose`: its refusal comes back as a value.
+    expect(await settle(rs.diagnose('10.1.2.3'))).toMatchObject({ ok: false, code: 'not-implemented' });
     // The test's file dialogs are cancelled: nothing is read or written.
     expect(await settle(rs.importConfig())).toEqual({ ok: true, value: null });
     expect(await settle(rs.applyImport(NEW_ID))).toMatchObject({ ok: false, code: 'import-expired' });
@@ -1463,9 +1796,17 @@ describe('the preload against the main process (window.rs)', () => {
     expect(await settle(rs.uninstallHelper())).toMatchObject({ ok: false, code: 'not-implemented' });
     expect(await settle(rs.openRulesWindow())).toEqual({ ok: true, value: null });
     expect(openRulesWindow).toHaveBeenCalledTimes(1);
+    expect(await settle(rs.openRulesWindow({ kind: 'section', section: 'log' }))).toEqual({ ok: true, value: null });
+    expect(openRulesWindow).toHaveBeenCalledTimes(2);
+    // This page is not the rules window (no `?view=rules`): the intent is not its to take.
+    expect(await settle(rs.takeRulesIntent())).toMatchObject({ ok: false, code: 'forbidden' });
     // Connected: nothing to reconnect, and a readable config is never reset.
     expect(await settle(rs.reconnectHelper())).toEqual({ ok: true, value: null });
     expect(await settle(rs.resetConfig())).toMatchObject({ ok: false, code: 'operation-failed' });
+    // The language is the app's own: no helper round trip.
+    expect(await settle(rs.getLanguage())).toEqual({ ok: true, value: 'uz' });
+    expect(await settle(rs.setLanguage('en'))).toEqual({ ok: true, value: 'en' });
+    expect(await settle(rs.getLanguage())).toEqual({ ok: true, value: 'en' });
     expect(h.sentAfterHandshake().filter((method) => method !== 'getConfig')).toEqual([
       'setConfig',
       'setConfig',
@@ -1473,6 +1814,7 @@ describe('the preload against the main process (window.rs)', () => {
       'setEnabled',
       'apply',
       'test',
+      'diagnose',
       'setConfig',
       'uninstall',
     ]);
@@ -1555,5 +1897,178 @@ describe('installHelper / removeHelper', () => {
     expect(await h.call('rs:removeHelper', '--force')).toMatchObject({ ok: false, code: 'invalid-input' });
     expect(installer.install).not.toHaveBeenCalled();
     expect(installer.uninstall).not.toHaveBeenCalled();
+  });
+});
+
+describe('language: rs:getLanguage, rs:setLanguage and the rs:language push', () => {
+  const languageRecipient = (url: string = APP_ENTRY_URL) => {
+    const received: unknown[] = [];
+    const target: StateRecipient = {
+      isDestroyed: () => false,
+      getURL: () => url,
+      send: (channel, payload) => {
+        if (channel === LANGUAGE_CHANNEL) received.push(payload);
+      },
+    };
+    return { target, received };
+  };
+
+  it('reads the stored language from the main process, with or without a helper', async () => {
+    const { store } = memoryPreferences('ru');
+    const h = await setup({ connect: false, preferences: store });
+    expect(await h.call('rs:getLanguage')).toEqual({ ok: true, value: 'ru' });
+    expect(h.sent()).toEqual([]);
+  });
+
+  it('stores a new language and pushes it to every window of the app page, not to another document', async () => {
+    const { store } = memoryPreferences('uz');
+    const popover = languageRecipient();
+    const rules = languageRecipient();
+    const foreign = languageRecipient('https://example.com/');
+    const h = await setup({ connect: false, preferences: store, recipients: [popover.target, rules.target, foreign.target] });
+    expect(await h.call('rs:setLanguage', 'ru')).toEqual({ ok: true, value: 'ru' });
+    expect(store.setLanguage).toHaveBeenCalledWith('ru');
+    expect(popover.received).toEqual(['ru']);
+    expect(rules.received).toEqual(['ru']);
+    expect(foreign.received).toEqual([]);
+    expect(await h.call('rs:getLanguage')).toEqual({ ok: true, value: 'ru' });
+    // The same language again: stored, nothing pushed.
+    expect(await h.call('rs:setLanguage', 'ru')).toEqual({ ok: true, value: 'ru' });
+    expect(popover.received).toEqual(['ru']);
+    expect(h.sent()).toEqual([]);
+  });
+
+  it.each<[string, unknown[]]>([
+    ['an unknown language', ['de']],
+    ['another spelling', ['RU']],
+    ['a locale tag', ['ru-RU']],
+    ['padding', ['ru ']],
+    ['an empty string', ['']],
+    ['a number', [1]],
+    ['null', [null]],
+    ['an object', [{ language: 'ru' }]],
+    ['an array', [['ru']]],
+    ['no argument', []],
+    ['a second argument', ['ru', 'en']],
+    ['a prototype key', ['toString']],
+  ])('refuses %s before the store is touched', async (_name, args) => {
+    const { store } = memoryPreferences('uz');
+    const recipient = languageRecipient();
+    const h = await setup({ connect: false, preferences: store, recipients: [recipient.target] });
+    expect(await h.call('rs:setLanguage', ...args)).toMatchObject({ ok: false, code: 'invalid-input' });
+    expect(store.setLanguage).not.toHaveBeenCalled();
+    expect(recipient.received).toEqual([]);
+  });
+
+  it('getLanguage takes no argument', async () => {
+    const h = await setup({ connect: false });
+    expect(await h.call('rs:getLanguage', 'ru')).toMatchObject({ ok: false, code: 'invalid-input' });
+  });
+
+  it('another document or a sub-frame can neither read nor change the language', async () => {
+    const { store } = memoryPreferences('uz');
+    const h = await setup({ connect: false, preferences: store });
+    for (const event of [
+      { senderFrame: { url: 'https://example.com/', parent: null } },
+      { senderFrame: { url: APP_ENTRY_URL, parent: {} } },
+      { senderFrame: null },
+    ]) {
+      expect(await h.callAs(event, 'rs:getLanguage')).toMatchObject({ ok: false, code: 'forbidden' });
+      expect(await h.callAs(event, 'rs:setLanguage', 'en')).toMatchObject({ ok: false, code: 'forbidden' });
+    }
+    expect(store.language).not.toHaveBeenCalled();
+    expect(store.setLanguage).not.toHaveBeenCalled();
+  });
+
+  it('a store that throws is answered internal, never thrown into the page', async () => {
+    const { store } = memoryPreferences('uz');
+    store.setLanguage.mockImplementationOnce(() => Promise.reject(new Error('disk gone')));
+    const h = await setup({ connect: false, preferences: store });
+    expect(await h.call('rs:setLanguage', 'en')).toMatchObject({ ok: false, code: 'internal' });
+  });
+
+  it('dispose stops the language pushes', async () => {
+    const { store, listeners } = memoryPreferences('uz');
+    const recipient = languageRecipient();
+    const h = await setup({ connect: false, preferences: store, recipients: [recipient.target] });
+    expect(listeners.size).toBe(1);
+    h.registration.dispose();
+    expect(listeners.size).toBe(0);
+  });
+});
+
+describe('rules backup: rs:getBackup, rs:restoreBackup, rs:deleteBackup, rs:dismissBackup (TASK-DELTA-16)', () => {
+  const EMPTY: Config = { version: 1, enabled: true, rules: [] };
+  const SAVED_AT = '2026-10-15T08:30:00.000Z';
+  const backupOf = (config: Config = oneRuleConfig()): RulesBackupFile => ({ version: 1, savedAt: SAVED_AT, configRevision: 3, config });
+
+  it('getBackup tells when and how many rules — not which — and works without the helper', async () => {
+    const h = await setup({ connect: false, backup: memoryBackup(backupOf()) });
+    expect(valueOf(await h.call('rs:getBackup'))).toEqual({ savedAt: SAVED_AT, ruleCount: 1, dismissed: false });
+    const none = await setup({ connect: false });
+    expect(valueOf(await none.call('rs:getBackup'))).toBeNull();
+  });
+
+  it('restore returns the backup as an import preview; nothing reaches the helper until applyImport (no setConfig without consent)', async () => {
+    const h = await setup({ config: EMPTY, backup: memoryBackup(backupOf()) });
+    const preview = valueOf(await h.call('rs:restoreBackup')) as { token: string; config: Config };
+    expect(preview.config).toEqual(oneRuleConfig());
+    // Asked, read and shown: still no setConfig.
+    await h.call('rs:getBackup');
+    expect(h.sentAfterHandshake()).toEqual([]);
+    expect(h.helper.config).toEqual(EMPTY);
+
+    expect(valueOf(await h.call('rs:applyImport', preview.token))).toMatchObject({ config: oneRuleConfig() });
+    expect(h.sentAfterHandshake()).toEqual(['setConfig']);
+    expect(h.helper.config).toEqual(oneRuleConfig());
+    // One use, like an import.
+    expect(await h.call('rs:applyImport', preview.token)).toMatchObject({ ok: false, code: 'import-expired' });
+    expect(h.sentAfterHandshake()).toEqual(['setConfig']);
+  });
+
+  it('a restore token expires after 10 minutes like an import', async () => {
+    let clock = 1_000_000;
+    const h = await setup({ config: EMPTY, backup: memoryBackup(backupOf()), now: () => clock });
+    const preview = valueOf(await h.call('rs:restoreBackup')) as { token: string };
+    clock += IMPORT_TTL_MS + 1;
+    expect(await h.call('rs:applyImport', preview.token)).toMatchObject({ ok: false, code: 'import-expired' });
+    expect(h.sentAfterHandshake()).toEqual([]);
+  });
+
+  it('without a backup the restore is refused no-backup; a backup that fails the schema is refused invalid-config', async () => {
+    const none = await setup({ config: EMPTY });
+    expect(await none.call('rs:restoreBackup')).toMatchObject({ ok: false, code: 'no-backup' });
+    const broken = { ...backupOf(), config: { version: 1, enabled: true, rules: [{ ...oneRuleConfig().rules[0], target: '0.0.0.0/0' }] } } as unknown as RulesBackupFile;
+    const h = await setup({ config: EMPTY, backup: memoryBackup(broken) });
+    expect(await h.call('rs:restoreBackup')).toMatchObject({ ok: false, code: 'invalid-config' });
+    expect(h.sentAfterHandshake()).toEqual([]);
+  });
+
+  it('dismissBackup turns down exactly the backup on disk; deleteBackup removes it', async () => {
+    const preferences = memoryPreferences();
+    const backup = memoryBackup(backupOf());
+    const h = await setup({ connect: false, preferences: preferences.store, backup });
+    expect(valueOf(await h.call('rs:dismissBackup'))).toBeNull();
+    expect(preferences.store.setDismissedBackupAt).toHaveBeenCalledWith(SAVED_AT);
+    expect(valueOf(await h.call('rs:getBackup'))).toEqual({ savedAt: SAVED_AT, ruleCount: 1, dismissed: true });
+    expect(valueOf(await h.call('rs:deleteBackup'))).toBeNull();
+    expect(valueOf(await h.call('rs:getBackup'))).toBeNull();
+    // Nothing on disk: nothing to turn down.
+    expect(valueOf(await h.call('rs:dismissBackup'))).toBeNull();
+    expect(preferences.store.setDismissedBackupAt).toHaveBeenCalledTimes(1);
+  });
+
+  it('a backup that cannot be removed is answered write-failed', async () => {
+    const h = await setup({ connect: false, backup: memoryBackup(backupOf(), false) });
+    expect(await h.call('rs:deleteBackup')).toMatchObject({ ok: false, code: 'write-failed' });
+  });
+
+  it.each(['rs:getBackup', 'rs:restoreBackup', 'rs:deleteBackup', 'rs:dismissBackup'])('%s takes no arguments and answers only the app page', async (channel) => {
+    const backup = memoryBackup(backupOf());
+    const h = await setup({ connect: false, backup });
+    expect(await h.call(channel, '../etc/passwd')).toMatchObject({ ok: false, code: 'invalid-input' });
+    expect(await h.callAs({ senderFrame: { url: 'https://example.com/', parent: null } }, channel)).toMatchObject({ ok: false, code: 'forbidden' });
+    expect(backup.read).not.toHaveBeenCalled();
+    expect(backup.remove).not.toHaveBeenCalled();
   });
 });

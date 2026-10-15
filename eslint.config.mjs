@@ -79,6 +79,33 @@ const RENDERER_RESTRICTIONS = [
 
 const PRELOAD_RESTRICTIONS = [importsOfAppContext(['main'], 'preload')];
 
+// `src/i18n` is imported by both the main process and the renderer, so it may
+// depend on neither: no Electron, no Node built-ins, no React, no code of the
+// three contexts — only `@routeswitch/shared` and the types of `rs.d.ts`.
+const I18N_RESTRICTIONS = [
+  {
+    regex: '^(?:electron|react|react-dom)(?:/|$)',
+    message: 'src/i18n is shared by main and renderer: no Electron, no React.',
+  },
+  {
+    regex: `^(?:node:|(?:${BARE_NODE_BUILTINS.join('|')})(?:/|$))`,
+    message: 'src/i18n is shared by main and renderer: no Node built-ins.',
+  },
+  {
+    regex: '^(?:\\.\\./)+(?:src/)?(?:main|preload)(?:/|$)',
+    message: 'src/i18n is shared by main and renderer: it must not import main or preload code.',
+  },
+  {
+    regex: '^(?:\\.\\./)+(?:src/)?renderer/(?!src/rs$)',
+    message: 'src/i18n may take only the types of renderer/src/rs.d.ts from the renderer.',
+  },
+];
+
+// Neither the DOM nor Node exists on both sides.
+const I18N_GLOBALS = ['window', 'document', 'navigator', 'localStorage', 'process', 'Buffer', 'require', '__dirname', 'global'].map(
+  (name) => ({ name, message: 'src/i18n runs in the main process and the renderer alike: no DOM or Node globals.' }),
+);
+
 const CHILD_PROCESS_SOURCE = '/^(node:)?child_process$/';
 
 // `no-restricted-syntax` does not merge across config objects either.
@@ -124,6 +151,15 @@ const RENDERER_SYNTAX = [
     selector: 'CallExpression[callee.name="require"]',
     message: 'The renderer has no require(). Use ES imports, and the API the preload exposes.',
   },
+  // Text is rendered as React text nodes only (the in-app Help is typed data, TASK-DELTA-22).
+  {
+    selector: 'JSXAttribute[name.name="dangerouslySetInnerHTML"], Property[key.name="dangerouslySetInnerHTML"]',
+    message: 'No HTML injection: render text as React nodes.',
+  },
+  {
+    selector: 'MemberExpression[property.name=/^(innerHTML|outerHTML)$/], CallExpression[callee.property.name="insertAdjacentHTML"]',
+    message: 'No HTML injection: render text as React nodes.',
+  },
 ];
 
 const appConfigs = [
@@ -144,6 +180,15 @@ const appConfigs = [
       'no-restricted-imports': restrictedImports(forbiddenPackagesFor('app'), RENDERER_RESTRICTIONS),
       'react-hooks/rules-of-hooks': 'error',
       'react-hooks/exhaustive-deps': 'error',
+    },
+  },
+  {
+    name: 'routeswitch/app/i18n',
+    files: [`packages/app/src/i18n/**/${SOURCE_FILES}`],
+    rules: {
+      'no-restricted-imports': restrictedImports(forbiddenPackagesFor('app'), I18N_RESTRICTIONS),
+      'no-restricted-globals': ['error', ...I18N_GLOBALS],
+      'no-restricted-syntax': ['error', ...NO_SHELL_SYNTAX, ...BROWSER_WINDOW_SYNTAX, ...RENDERER_SYNTAX],
     },
   },
   {

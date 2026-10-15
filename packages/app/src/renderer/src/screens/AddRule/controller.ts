@@ -5,7 +5,8 @@
 
 import type { Config, IfaceRole, RuleKind, TestResult } from '@routeswitch/shared';
 
-import type { Feedback } from '../../text';
+import type { I18n } from '../../../../i18n';
+import { UZ, type Feedback } from '../../text';
 import { saveRule, testRoute, type AddRuleApi } from './actions';
 import { checkForm, firstErrorField, formOfRule, NEW_RULE_FORM, type FormField, type RuleForm } from './model';
 
@@ -41,6 +42,15 @@ export const initialAddRuleUi = (form: RuleForm = NEW_RULE_FORM, loaded = false)
   focusField: null,
 });
 
+/**
+ * The first state of the dialog for what it opens on: an edit waits for the
+ * stored rule (`load`); a new rule starts empty, or filled in by an offer
+ * (TASK-DELTA-21) — counted as loaded, nothing touched or submitted, nothing
+ * sent: the save stays the user's.
+ */
+export const initialAddRuleUiFor = (editor: { readonly mode: 'add'; readonly prefill?: RuleForm } | { readonly mode: 'edit' }): AddRuleUiState =>
+  editor.mode === 'add' && editor.prefill !== undefined ? initialAddRuleUi(editor.prefill, true) : initialAddRuleUi();
+
 export type AddRuleUiUpdate = (change: (state: AddRuleUiState) => AddRuleUiState) => void;
 
 export interface AddRuleController {
@@ -72,6 +82,8 @@ export function createAddRuleController(
   update: AddRuleUiUpdate,
   current: () => AddRuleUiState,
   onSaved: () => void,
+  /** Read when a message is written, so it is in the language of that moment. */
+  i18n: () => I18n = () => UZ,
 ): AddRuleController {
   // Bumped by every test: an answer that arrives after a newer request is dropped.
   let testGeneration = 0;
@@ -99,13 +111,13 @@ export function createAddRuleController(
     save: async (config) => {
       const state = current();
       if (state.saving) return;
-      const check = checkForm(state.form, id, config);
+      const check = checkForm(state.form, id, config, i18n());
       if (check.rule === null) {
         update((next) => ({ ...next, submitted: true, focusField: firstErrorField(check.errors), feedback: check.formError === null ? null : { tone: 'danger', text: check.formError } }));
         return;
       }
       update((next) => ({ ...next, submitted: true, saving: true, feedback: null }));
-      const feedback = await saveRule(rs, check.rule);
+      const feedback = await saveRule(rs, check.rule, i18n);
       update((next) => ({ ...next, saving: false, feedback }));
       if (feedback === null) onSaved();
     },
@@ -113,7 +125,7 @@ export function createAddRuleController(
       testGeneration += 1;
       const generation = testGeneration;
       update((state) => ({ ...state, test: { phase: 'running', address } }));
-      const outcome = await testRoute(rs, address);
+      const outcome = await testRoute(rs, address, i18n);
       if (generation !== testGeneration) return;
       update((state) => ({
         ...state,

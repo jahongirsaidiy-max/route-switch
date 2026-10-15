@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from 'vitest';
 
+import { i18nFor } from '../../../../i18n';
 import type { RsErrorCode, RsResult } from '../../rs';
 import { INSTALL_TEXT } from '../../text';
 import { installHelper, removeHelper, setupFailureText } from './actions';
@@ -65,5 +66,31 @@ describe('removeHelper', () => {
       expect(await removeHelper(rs)).toMatchObject({ tone: 'danger' });
       expect(rs.uninstallHelper).not.toHaveBeenCalled();
     }
+  });
+});
+
+describe('the install flow in every language (TASK-DELTA-14)', () => {
+  it.each(['uz', 'ru', 'en'] as const)('%s: success, a refusal, a failed script and the socket fallback', async (locale) => {
+    const i18n = i18nFor(locale);
+    expect(await installHelper({ installHelper: () => Promise.resolve({ ok: true as const, value: null }) }, i18n)).toEqual({
+      tone: 'success',
+      text: i18n.t.install.installed,
+    });
+    expect((await installHelper({ installHelper: () => refused('install-denied') }, i18n)).text).toBe(i18n.t.errors['install-denied']);
+    const failed = await installHelper({ installHelper: () => refused('install-failed', 'install-helper: error: x') }, i18n);
+    // The script's own line is English and is shown as it came.
+    expect(failed.text).toBe(`${i18n.t.errors['install-failed']} (install-helper: error: x)`);
+    expect(await removeHelper({ removeHelper: () => Promise.resolve({ ok: true as const, value: null }), uninstallHelper: vi.fn() }, i18n)).toEqual({
+      tone: 'success',
+      text: i18n.t.install.removed,
+    });
+    const fallback = { removeHelper: () => refused('install-unavailable'), uninstallHelper: () => Promise.resolve({ ok: true as const, value: {} }) };
+    expect((await removeHelper(fallback, i18n)).text).toBe(i18n.t.components.recovery.removedOverSocket);
+  });
+
+  it('Russian and English do not fall back to Uzbek', async () => {
+    const fallback = { removeHelper: () => refused('install-unavailable'), uninstallHelper: () => Promise.resolve({ ok: true as const, value: {} }) };
+    expect((await removeHelper(fallback, i18nFor('ru'))).text).toBe('Helper удалён: его маршруты и файлы resolver удалены. Маршрутизация остановлена.');
+    expect(setupFailureText({ ok: false, code: 'install-cancelled', error: 'x' }, i18nFor('en'))).toContain('password dialog');
   });
 });

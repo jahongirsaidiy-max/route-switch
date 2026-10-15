@@ -9,12 +9,15 @@ import type { HelperClient, HelperStatus, HelperSnapshot } from './helperClient'
 import { engineState, memoryLogger, RULE_ID } from './helperClient.fixtures';
 import { INVOKE_CHANNELS, STATE_CHANNEL } from './ipc';
 import { APP_ENTRY_URL } from './runtime';
+import { i18nFor, type Locale } from '../i18n';
 import { createSettings } from './settings';
 import {
   INITIAL_APPEARANCE,
+  initialAppearance,
   loadTrayImage,
   startShell,
   trayAppearance,
+  trayMenuTemplate,
   type TrayAppearance,
   type TrayIconKind,
   type TrayLike,
@@ -97,8 +100,105 @@ describe('trayAppearance', () => {
     expect(trayAppearance(connected, both('192.168.1.1', false), current).tooltip).toBe('RouteSwitch — faol');
   });
 
+  // TASK-DELTA-21
+  it('notes DNS servers reached through the other interface, once per server; the icon keeps its look', () => {
+    const base = engineState(1);
+    const warning = (server: string, role: 'ethernet' | 'wifi', source: 'interface' | 'rule' = 'interface') => ({
+      server,
+      source,
+      role,
+      via: role === 'ethernet' ? ('wifi' as const) : ('ethernet' as const),
+      code: 'other-interface-subnet' as const,
+      ...(source === 'rule' ? { ruleId: RULE_ID } : {}),
+    });
+    const two = { ...base, dnsWarnings: [warning('10.0.0.53', 'ethernet'), warning('10.0.0.53', 'ethernet', 'rule'), warning('10.0.0.54', 'ethernet')] };
+    expect(trayAppearance(connected, two, current)).toEqual({ kind: 'active', tooltip: 'RouteSwitch — faol · 2 ta DNS server boshqa interfeysdan ketmoqda' });
+    expect(trayAppearance(connected, { ...base, dnsWarnings: [] }, current).tooltip).toBe('RouteSwitch — faol');
+    const failing = engineState(1, 1, { rules: [ruleState('error')], dnsWarnings: [warning('10.0.0.53', 'ethernet')] });
+    expect(trayAppearance(connected, failing, current).kind).toBe('error');
+    const ru = i18nFor('ru');
+    const ruTip = (count: number) =>
+      trayAppearance(connected, { ...base, dnsWarnings: Array.from({ length: count }, (_, i) => warning(`10.0.0.${String(i + 1)}`, 'wifi')) }, current, ru).tooltip;
+    expect(ruTip(1)).toBe('RouteSwitch — активно · 1 DNS-сервер идёт через другой интерфейс');
+    expect(ruTip(2)).toBe('RouteSwitch — активно · 2 DNS-сервера идут через другой интерфейс');
+    expect(ruTip(5)).toBe('RouteSwitch — активно · 5 DNS-серверов идут через другой интерфейс');
+    expect(trayAppearance(connected, two, current, i18nFor('en')).tooltip).toBe('RouteSwitch — active · 2 DNS servers go through the other interface');
+    // Off: routing is off, no note.
+    expect(trayAppearance(connected, { ...two, enabled: false }, current).tooltip).toBe('RouteSwitch — o\'chirilgan');
+  });
+
   it('starts in the neutral look', () => {
     expect(INITIAL_APPEARANCE.kind).toBe('off');
+  });
+
+  // TASK-DELTA-12
+  it.each<[Locale, string, string, string, string]>([
+    ['uz', 'RouteSwitch — ulanmoqda…', 'RouteSwitch — 2 ta qoidada xato · 1 ta qoida interfeysni kutmoqda', "RouteSwitch — helper o'rnatilmagan", 'RouteSwitch — faol · 5 ta qoida interfeysni kutmoqda'],
+    ['ru', 'RouteSwitch — подключение…', 'RouteSwitch — ошибка в 2 правилах · 1 правило ждёт интерфейс', 'RouteSwitch — helper не установлен', 'RouteSwitch — активно · 5 правил ждут интерфейс'],
+    ['en', 'RouteSwitch — connecting…', 'RouteSwitch — 2 rules failing · 1 rule is waiting for an interface', 'RouteSwitch — helper not installed', 'RouteSwitch — active · 5 rules are waiting for an interface'],
+  ])('%s: the tooltips, with plurals', (locale, initial, failing, notInstalled, waitingFive) => {
+    const i18n = i18nFor(locale);
+    expect(initialAppearance(i18n)).toEqual({ kind: 'off', tooltip: initial });
+    const state = engineState(1, 1, { rules: [ruleState('error'), ruleState('error'), waiting('no-gateway')] });
+    expect(trayAppearance(connected, state, current, i18n).tooltip).toBe(failing);
+    expect(trayAppearance({ kind: 'not-installed' }, null, current, i18n).tooltip).toBe(notInstalled);
+    const five = engineState(1, 1, { rules: Array.from({ length: 5 }, () => waiting('interface-down')) });
+    expect(trayAppearance(connected, five, current, i18n).tooltip).toBe(waitingFive);
+  });
+
+  it('Russian plurals of the waiting rules: 1, 2, 5, 21', () => {
+    const ru = i18nFor('ru');
+    const tooltip = (count: number) =>
+      trayAppearance(connected, engineState(1, 1, { rules: Array.from({ length: count }, () => waiting('interface-down')) }), current, ru).tooltip;
+    expect(tooltip(1)).toBe('RouteSwitch — активно · 1 правило ждёт интерфейс');
+    expect(tooltip(2)).toBe('RouteSwitch — активно · 2 правила ждут интерфейс');
+    expect(tooltip(5)).toBe('RouteSwitch — активно · 5 правил ждут интерфейс');
+    expect(tooltip(21)).toBe('RouteSwitch — активно · 21 правило ждёт интерфейс');
+  });
+
+  it('every look has its own words in every language', () => {
+    const statuses: HelperStatus[] = [
+      { kind: 'not-installed' },
+      { kind: 'disconnected', reason: 'timeout' },
+      { kind: 'incompatible', helperVersion: '9.0.0', protocolVersion: 9, expectedProtocolVersion: 1 },
+      { kind: 'config-unreadable', helperVersion: '1.2.3' },
+    ];
+    for (const locale of ['ru', 'en'] as const) {
+      const i18n = i18nFor(locale);
+      for (const status of statuses) {
+        const own = trayAppearance(status, null, current, i18n);
+        expect(own.kind).toBe(trayAppearance(status, null, current).kind);
+        expect(own.tooltip).not.toBe(trayAppearance(status, null, current).tooltip);
+      }
+      expect(trayAppearance(connected, engineState(1, 1, { enabled: false }), current, i18n).tooltip).toBe(i18n.t.tray.off);
+    }
+  });
+});
+
+describe('trayMenuTemplate', () => {
+  it('names the rules item as the menu bar window names its button, in every language', () => {
+    for (const locale of ['uz', 'ru', 'en'] as const) {
+      const { t } = i18nFor(locale);
+      expect(t.tray.manageRules.toLowerCase()).toBe(t.menuBar.manageRules.toLowerCase());
+    }
+  });
+
+  it.each<[Locale, string, string, string]>([
+    ['uz', 'Qoidalarni boshqarish', 'Yordam', 'RouteSwitch ilovasidan chiqish'],
+    ['ru', 'Открыть правила', 'Справка', 'Выйти из RouteSwitch'],
+    ['en', 'Manage Rules', 'RouteSwitch Help', 'Quit RouteSwitch'],
+  ])('%s: the three items and a separator', (locale, rules, help, quitLabel) => {
+    const openRules = vi.fn();
+    const openHelp = vi.fn();
+    const quit = vi.fn();
+    const template = trayMenuTemplate(i18nFor(locale), { openRules, openHelp, quit });
+    expect(template.map((item) => item.label ?? item.type)).toEqual([rules, help, 'separator', quitLabel]);
+    (template[0]?.click as () => void)();
+    (template[1]?.click as () => void)();
+    (template[3]?.click as () => void)();
+    expect(openRules).toHaveBeenCalledTimes(1);
+    expect(openHelp).toHaveBeenCalledTimes(1);
+    expect(quit).toHaveBeenCalledTimes(1);
   });
 });
 
@@ -263,7 +363,7 @@ class FakeWindow {
   }
 }
 
-function shellHarness() {
+function shellHarness(options: { language?: Promise<Locale> } = {}) {
   const images = {
     active: { name: 'active' },
     off: { name: 'off' },
@@ -304,6 +404,10 @@ function shellHarness() {
     else if (state !== null) for (const listener of [...stateListeners]) listener(state);
   };
   const templates: MenuItemConstructorOptions[][] = [];
+  const languageListeners = new Set<(language: Locale) => void>();
+  const setLanguage = (language: Locale): void => {
+    for (const listener of [...languageListeners]) listener(language);
+  };
   const quit = vi.fn();
   const activateApp = vi.fn();
   const { logger, entries } = memoryLogger();
@@ -331,6 +435,17 @@ function shellHarness() {
         writeClipboard: () => Promise.resolve(),
         logger,
       }),
+      preferences: {
+        language: () => options.language ?? Promise.resolve('uz'),
+        setLanguage: (language) => Promise.resolve(language),
+        dismissedBackupAt: () => Promise.resolve(null),
+        setDismissedBackupAt: () => Promise.resolve(),
+        onLanguage: (listener) => {
+          languageListeners.add(listener);
+          return () => languageListeners.delete(listener);
+        },
+      },
+      rulesBackup: { read: () => Promise.resolve(null), remove: () => Promise.resolve(true) },
       configDialogs: { chooseImportFile: () => Promise.resolve(null), chooseExportFile: () => Promise.resolve(null) },
       installer: {
         install: () => Promise.reject(new Error('not used')),
@@ -357,12 +472,89 @@ function shellHarness() {
     if (item === undefined) throw new Error(`no menu item ${label}`);
     return item;
   };
-  return { menuBar, images, trays, tray, windows, handlers, ipcMain, setHelper, templates, menuItem, quit, activateApp, entries, statusListeners, stateListeners };
+  return {
+    menuBar,
+    images,
+    trays,
+    tray,
+    windows,
+    handlers,
+    ipcMain,
+    setHelper,
+    setLanguage,
+    languageListeners,
+    templates,
+    menuItem,
+    quit,
+    activateApp,
+    entries,
+    statusListeners,
+    stateListeners,
+  };
 }
 
 const clickItem = (item: MenuItemConstructorOptions): void => {
   (item.click as () => void)();
 };
+
+describe('startShell — the language (TASK-DELTA-12)', () => {
+  const settle = () =>
+    new Promise<void>((resolve) => {
+      setTimeout(resolve, 0);
+    });
+  const labels = (template: MenuItemConstructorOptions[] | undefined) => template?.map((item) => item.label ?? item.type);
+
+  it('takes the stored language once it is read: the menu is built again and the tooltip worded again', async () => {
+    const h = shellHarness({ language: Promise.resolve('ru') });
+    // Before the read: Uzbek.
+    expect(h.tray().tooltip).toBe('RouteSwitch — ulanmoqda…');
+    await settle();
+    expect(h.tray().tooltip).toBe('RouteSwitch — подключение…');
+    expect(h.templates).toHaveLength(2);
+    expect(labels(h.templates.at(-1))).toEqual(['Открыть правила', 'Справка', 'separator', 'Выйти из RouteSwitch']);
+    // The menu shown on a right-click is the new one.
+    h.tray().listeners.get('right-click')?.({}, h.tray().getBounds());
+    expect(h.tray().menus.at(-1)).toEqual({ template: h.templates.at(-1) });
+  });
+
+  it('a change of language rebuilds the menu and rewords the current tooltip, also while connecting', async () => {
+    const h = shellHarness();
+    await settle();
+    // Uzbek was already on: nothing was rebuilt.
+    expect(h.templates).toHaveLength(1);
+    h.setHelper({ kind: 'not-installed' }, null);
+    h.setHelper({ kind: 'connecting' }, null);
+    expect(h.tray().tooltip).toBe("RouteSwitch — helper o'rnatilmagan");
+    h.setLanguage('en');
+    expect(h.tray().tooltip).toBe('RouteSwitch — helper not installed');
+    expect(h.tray().image).toBe(h.images.error);
+    expect(labels(h.templates.at(-1))).toEqual(['Manage Rules', 'RouteSwitch Help', 'separator', 'Quit RouteSwitch']);
+    h.setHelper({ kind: 'connected', helperVersion: '1.2.3' }, engineState(1));
+    expect(h.tray().tooltip).toBe('RouteSwitch — active');
+    // The same language again: nothing is rebuilt.
+    const built = h.templates.length;
+    h.setLanguage('en');
+    expect(h.templates).toHaveLength(built);
+    // The new menu still works.
+    const item = h.templates.at(-1)?.[3];
+    if (item !== undefined) clickItem(item);
+    expect(h.quit).toHaveBeenCalledTimes(1);
+    expect(h.entries.some((entry) => entry.msg === 'Tray language changed' && entry['language'] === 'en')).toBe(true);
+  });
+
+  it('dispose stops listening to the language; a late read changes nothing', async () => {
+    let answer: (locale: Locale) => void = () => undefined;
+    const h = shellHarness({ language: new Promise<Locale>((resolve) => (answer = resolve)) });
+    // The tray's own and the `rs:language` push of the IPC.
+    expect(h.languageListeners.size).toBe(2);
+    h.menuBar.dispose();
+    expect(h.languageListeners.size).toBe(0);
+    answer('ru');
+    await settle();
+    expect(h.templates).toHaveLength(1);
+    expect(h.tray().tooltip).toBe('RouteSwitch — ulanmoqda…');
+  });
+});
 
 describe('startShell', () => {
   it('puts one tray icon in the menu bar, neutral until the helper answers, and opens no window', () => {
@@ -435,6 +627,18 @@ describe('startShell', () => {
     expect(h.quit).toHaveBeenCalledTimes(1);
   });
 
+  it('"Yordam" opens the single rules window with a Help intent, which only the rules window can take', async () => {
+    const h = shellHarness();
+    clickItem(h.menuItem('Yordam'));
+    clickItem(h.menuItem('Yordam'));
+    expect(h.windows.map((window) => window.view)).toEqual(['rules']);
+    const take = h.handlers.get('rs:takeRulesIntent') as (event: unknown) => Promise<unknown>;
+    const fromRules = { senderFrame: { url: `${APP_ENTRY_URL}?view=rules`, parent: null } };
+    expect(await take(fromRules)).toEqual({ ok: true, value: { kind: 'section', section: 'help' } });
+    expect(await take(fromRules)).toEqual({ ok: true, value: null });
+    expect(h.entries.some((entry) => entry.msg === 'Rules window requested' && entry['channel'] === 'tray' && entry['section'] === 'help')).toBe(true);
+  });
+
   it('"Qoidalarni boshqarish" of the menu bar window (rs:openRulesWindow) opens the same single rules window', async () => {
     const h = shellHarness();
     h.tray().click();
@@ -456,10 +660,12 @@ describe('startShell', () => {
     expect(h.windows[1]?.visible).toBe(true);
   });
 
-  it('sends the state to the open windows', () => {
+  it('sends the state to the open windows', async () => {
     const h = shellHarness();
     h.tray().click();
     h.setHelper({ kind: 'not-installed' }, null);
+    // The journal line waits for the language (TASK-DELTA-12).
+    for (let i = 0; i < 6; i += 1) await Promise.resolve();
     expect(h.windows[0]?.sent).toEqual([
       [STATE_CHANNEL, { connection: { kind: 'not-installed' }, state: null }],
       // The app's own journal line about it (TASK-300).

@@ -3,7 +3,8 @@
 // transition is tested without a DOM. `RulesScreen` keeps the state in
 // `useState` and passes its setter.
 
-import type { Feedback } from '../../text';
+import type { I18n } from '../../../../i18n';
+import { UZ, type Feedback } from '../../text';
 import { removeRule, setRuleEnabled, type RulesApi } from './actions';
 
 export interface RulesUiState {
@@ -45,7 +46,13 @@ export interface RulesController {
   readonly dismissDelete: () => void;
 }
 
-export function createRulesController(rs: RulesApi, update: RulesUiUpdate, current: () => RulesUiState): RulesController {
+/** `i18n` is read when an outcome is written, so a message is in the language of that moment. */
+export function createRulesController(
+  rs: RulesApi,
+  update: RulesUiUpdate,
+  current: () => RulesUiState,
+  i18n: () => I18n = () => UZ,
+): RulesController {
   const begin = (id: string) => {
     update((state) => ({ ...state, busy: withBusy(state.busy, id, true), feedback: null }));
   };
@@ -54,7 +61,7 @@ export function createRulesController(rs: RulesApi, update: RulesUiUpdate, curre
     toggle: async (id, enabled) => {
       if (current().busy.has(id)) return;
       begin(id);
-      const feedback = await setRuleEnabled(rs, id, enabled);
+      const feedback = await setRuleEnabled(rs, id, enabled, i18n);
       update((state) => ({ ...state, busy: withBusy(state.busy, id, false), feedback }));
     },
     askDelete: (id) => {
@@ -70,7 +77,7 @@ export function createRulesController(rs: RulesApi, update: RulesUiUpdate, curre
       // Only the rule being asked about, and only once.
       if (state.confirmingDelete !== id || state.busy.has(id)) return;
       begin(id);
-      const feedback = await removeRule(rs, id);
+      const feedback = await removeRule(rs, id, i18n);
       update((next) => ({
         ...next,
         busy: withBusy(next.busy, id, false),

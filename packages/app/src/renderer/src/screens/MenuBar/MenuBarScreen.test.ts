@@ -2,13 +2,15 @@ import type { EngineState } from '@routeswitch/shared';
 import { createElement, isValidElement, type ReactElement, type ReactNode } from 'react';
 import { describe, expect, it, vi } from 'vitest';
 
-import { Button, Toggle } from '../../components';
+import { i18nFor, type Locale } from '../../../../i18n';
+import { Button, StatusDot, Toggle } from '../../components';
+import { I18nProvider } from '../../hooks/useI18n';
 import { renderMarkup } from '../../components/test-utils';
 import { IDLE_CONFIG, type ConfigView } from '../../hooks/useConfig';
 import { LOADING_VIEW, type EngineStateView } from '../../hooks/useEngineState';
 import type { RsApi, RsServiceOrder, RsSnapshot } from '../../rs';
 import { CONFIG, ID, NOW, ORDER_WIFI_FIRST, STATE, ruleState } from './fixtures';
-import { helperNotice, INSTALL_TEXT } from '../../text';
+import { helperNotice, INSTALL_TEXT, UZ } from '../../text';
 import { followServiceOrder, MenuBarPanel, MenuBarScreen, type MenuBarPanelProps } from './MenuBarScreen';
 
 const connected = (state: EngineState = STATE): EngineStateView => ({
@@ -138,6 +140,18 @@ describe('MenuBarPanel — connected', () => {
     button(elements, 'Qoidalarni boshqarish').props.onClick?.();
     expect(all.onApply).toHaveBeenCalledTimes(1);
     expect(all.onOpenRules).toHaveBeenCalledTimes(1);
+  });
+
+  it('the header\'s "?" opens the Help (TASK-DELTA-22), named in the window\'s language; no button without the action', () => {
+    const onOpenHelp = vi.fn();
+    const { elements } = treeOf({ onOpenHelp });
+    const help = elements.find((element) => element.type === 'button' && element.props.children === '?');
+    expect(help?.props).toMatchObject({ 'aria-label': 'Yordam', title: 'Yordam' });
+    help?.props.onClick?.();
+    expect(onOpenHelp).toHaveBeenCalledTimes(1);
+    expect(render({ onOpenHelp, i18n: i18nFor('ru') })).toContain('aria-label="Справка"');
+    expect(render({ onOpenHelp, i18n: i18nFor('en') })).toContain('aria-label="Help"');
+    expect(render()).not.toContain('aria-label="Yordam"');
   });
 
   it('a running action is busy (announced, focus kept), not disabled', () => {
@@ -318,12 +332,12 @@ describe('MenuBarPanel — no live state', () => {
   });
 
   it('says why the helper is unreachable and that routes stay applied', () => {
-    expect(helperNotice(views[3]?.[1] ?? LOADING_VIEW)?.text).toBe(
+    expect(helperNotice(views[3]?.[1] ?? LOADING_VIEW, UZ)?.text).toBe(
       "Helper ishlamayapti. U launchd orqali qayta ishga tushadi; bo'lmasa qayta o'rnating. Qo'llangan route'lar helper'da qoladi.",
     );
-    expect(helperNotice(views[4]?.[1] ?? LOADING_VIEW)?.text).toContain('v0.0.9');
-    expect(helperNotice(views[7]?.[1] ?? LOADING_VIEW)?.text).toBe("Bu oynadan ruxsat yo'q.");
-    expect(helperNotice(connected())).toBeNull();
+    expect(helperNotice(views[4]?.[1] ?? LOADING_VIEW, UZ)?.text).toContain('v0.0.9');
+    expect(helperNotice(views[7]?.[1] ?? LOADING_VIEW, UZ)?.text).toBe("Bu oynadan ruxsat yo'q.");
+    expect(helperNotice(connected(), UZ)).toBeNull();
   });
 
   it('helper away: "Qayta ulanish" asks for a reconnect, and is busy (not disabled) while asked', () => {
@@ -389,12 +403,107 @@ describe('MenuBarScreen', () => {
       openRulesWindow: vi.fn(),
       reconnectHelper: vi.fn(),
       installHelper: vi.fn(),
+      getBackup: vi.fn(),
     } satisfies Partial<RsApi>;
     const html = renderMarkup(createElement(MenuBarScreen, { rs }));
     expect(text(html)).toContain("Holat o'qilmoqda…");
     // Static rendering runs no effects: nothing was asked of the helper or the main process.
     expect(rs.getConfig).not.toHaveBeenCalled();
     expect(rs.getServiceOrder).not.toHaveBeenCalled();
+  });
+});
+
+describe('MenuBarPanel — in every language (TASK-DELTA-12)', () => {
+  // The Uzbek texts of the window itself (the user's notes, targets and interface names are not translated).
+  const UZBEK = ['Faol qoidalar', 'Interfeyslar', ' ta · ', 'Yana ', 'daq oldin', "Oxirgi qo'llash", "Qayta qo'llash", 'Qoidalarni boshqarish', 'Ulangan'];
+
+  it.each<[Locale, readonly string[]]>([
+    ['uz', ['Faol', 'Interfeyslar', 'Faol qoidalar', '5 ta · 8 route', 'Yana 1 ta qoida', '3 IP · 2 daq oldin', "Oxirgi qo'llash: 10:58 · tarmoq o'zgarganda", "Qayta qo'llash", 'Qoidalarni boshqarish']],
+    ['ru', ['Вкл.', 'Интерфейсы', 'Активные правила', '5 правил · 8 маршрутов', 'Ещё 1 правило', '3 IP · 2 минуты назад', 'Последнее применение: 10:58 · при изменении сети', 'Применить снова', 'Открыть правила']],
+    ['en', ['On', 'Interfaces', 'Active rules', '5 rules · 8 routes', '1 more rule', '3 IPs · 2 min ago', 'Last applied: 10:58 · when the network changed', 'Apply again', 'Manage rules']],
+  ])('%s: every text of the connected window', (locale, expected) => {
+    const words = text(render({ i18n: i18nFor(locale) }));
+    for (const word of expected) expect(words).toContain(word);
+    if (locale !== 'uz') for (const word of UZBEK) expect(words).not.toContain(word);
+  });
+
+  it.each<[Locale, string, string, string]>([
+    ['uz', 'Routing (barcha qoidalar)', "O'chiq", "Routing o'chirilgan — qoidalar qo'llanmaydi"],
+    ['ru', 'Маршрутизация (все правила)', 'Выкл.', 'Маршрутизация выключена — правила не применяются'],
+    ['en', 'Routing (all rules)', 'Off', 'Routing is off — no rules are applied'],
+  ])('%s: the switch (its accessible name) and routing off', (locale, label, off, status) => {
+    const i18n = i18nFor(locale);
+    expect(toggle(treeOf({ i18n }).elements).props.label).toBe(label);
+    const words = text(render({ i18n, engine: connected({ ...STATE, enabled: false }) }));
+    expect(words).toContain(off);
+    expect(words).toContain(status);
+  });
+
+  it('Russian plurals of the rule and route counts, and of the hidden rules', () => {
+    const ru = i18nFor('ru');
+    expect(ru.t.menuBar.ruleCount(1, 1)).toBe('1 правило · 1 маршрут');
+    expect(ru.t.menuBar.ruleCount(2, 3)).toBe('2 правила · 3 маршрута');
+    expect(ru.t.menuBar.ruleCount(5, 21)).toBe('5 правил · 21 маршрут');
+    expect(ru.t.menuBar.ruleCount(0, 11)).toBe('0 правил · 11 маршрутов');
+    expect(ru.t.menuBar.moreRules(2)).toBe('Ещё 2 правила');
+    expect(ru.t.menuBar.rulesFailing(1)).toBe('Ошибка в 1 правиле');
+    expect(ru.t.menuBar.rulesFailing(3)).toBe('Ошибка в 3 правилах');
+    expect(i18nFor('en').t.menuBar.ruleCount(1, 1)).toBe('1 rule · 1 route');
+  });
+
+  it.each<[Locale, string, string, string]>([
+    ['ru', 'Не удалось прочитать правила.', 'Прочитать снова', 'Ответ не пришёл'],
+    ['en', 'The rules could not be read.', 'Read again', 'No answer came'],
+  ])('%s: the rules that could not be read, with the error and the button in the language', (locale, title, again, error) => {
+    const failed: ConfigView = { phase: 'failed', config: null, revision: 3, error: { code: 'timeout', message: 'x' } };
+    const i18n = i18nFor(locale);
+    const { all, elements } = treeOf({ config: failed, i18n });
+    const words = text(renderMarkup(MenuBarPanel(all)));
+    expect(words).toContain(title);
+    expect(words).toContain(error);
+    button(elements, again).props.onClick?.();
+    expect(all.onReloadConfig).toHaveBeenCalledTimes(1);
+    expect(text(render({ i18n, config: { ...IDLE_CONFIG, phase: 'loading', revision: 3 } }))).toContain(i18n.t.menuBar.rulesLoading);
+    expect(text(render({ i18n, config: { ...READY, config: { ...CONFIG, rules: [] } } }))).toContain(i18n.t.menuBar.noRules);
+  });
+
+  it('a warning mark is named in the language, and the network warnings and the notice follow it', () => {
+    const en = i18nFor('en');
+    const state: EngineState = {
+      ...STATE,
+      rules: STATE.rules.map((rule) => (rule.ruleId === ID.domain ? { ...rule, reasonCode: 'overridden-by-rule' } : rule)),
+    };
+    const { elements } = treeOf({ engine: connected(state), i18n: en });
+    // The rule rows' marks (the interface cards have their own dots).
+    const marks = elements.filter((element) => element.type === StatusDot && element.props.label?.includes(':') === true);
+    expect(marks.map((element) => element.props.label)).toEqual([`Warning: ${en.t.ruleReason['overridden-by-rule']}`]);
+    const down: EngineState = {
+      ...STATE,
+      interfaces: { ...STATE.interfaces, ethernet: { ...STATE.interfaces.ethernet, up: false } },
+      rules: STATE.rules.map((rule) => ({ ...rule, status: 'pending', reasonCode: 'interface-down' })),
+    };
+    expect(text(render({ engine: connected(down), i18n: en }))).toContain('waiting');
+    const notice = text(render({ engine: LOADING_VIEW, config: IDLE_CONFIG, i18n: en }));
+    expect(notice).toContain(en.t.notice.loadingTitle);
+  });
+
+  it('the screen speaks the language of its provider', () => {
+    const rs: Parameters<typeof MenuBarScreen>[0]['rs'] = {
+      getState: vi.fn(() => new Promise<never>(() => undefined)),
+      onState: vi.fn<(listener: (snapshot: RsSnapshot) => void) => () => void>(() => () => undefined),
+      getConfig: vi.fn(),
+      getServiceOrder: vi.fn(),
+      setEnabled: vi.fn(),
+      apply: vi.fn(),
+      openRulesWindow: vi.fn(),
+      reconnectHelper: vi.fn(),
+      installHelper: vi.fn(),
+      getBackup: vi.fn(),
+    } satisfies Partial<RsApi>;
+    const html = renderMarkup(createElement(I18nProvider, { language: 'ru' }, createElement(MenuBarScreen, { rs })));
+    expect(text(html)).toContain(i18nFor('ru').t.notice.loadingTitle);
+    expect(text(html)).toContain('Открыть правила');
+    expect(text(html)).not.toContain("Holat o'qilmoqda");
   });
 });
 
@@ -489,5 +598,31 @@ describe('followServiceOrder (TASK-DELTA-08)', () => {
     expect(view.shows.size).toBe(1);
     view.reader.stop();
     expect(view.shows.size).toBe(0);
+  });
+});
+
+describe('MenuBarPanel: the rules backup offer (TASK-DELTA-16)', () => {
+  const SAVED_AT = '2026-10-15T08:30:00.000Z';
+  const EMPTY: ConfigView = { phase: 'ready', config: { ...CONFIG, rules: [] }, revision: 3, error: null };
+
+  it('shows the offer; its button opens the rules window, where the preview is', () => {
+    const offer = { count: 3, savedAt: SAVED_AT };
+    expect(text(render({ config: EMPTY, backupOffer: offer }))).toContain('Oldingi qoidalarni tiklash (3)');
+    const { all, elements } = treeOf({ config: EMPTY, backupOffer: offer });
+    button(elements, i18nFor('uz').t.backup.openRules).props.onClick?.();
+    expect(all.onOpenRules).toHaveBeenCalledTimes(1);
+  });
+
+  it('no offer without one', () => {
+    expect(text(render({ config: EMPTY }))).not.toContain('Oldingi qoidalarni tiklash');
+  });
+
+  it.each<[Locale, string]>([
+    ['ru', 'Восстановить прежние правила (3)'],
+    ['en', 'Restore previous rules (3)'],
+  ])('in %s', (locale, title) => {
+    const html = text(render({ config: EMPTY, backupOffer: { count: 3, savedAt: SAVED_AT }, i18n: i18nFor(locale) }));
+    expect(html).toContain(title);
+    expect(html).not.toContain('tiklash');
   });
 });

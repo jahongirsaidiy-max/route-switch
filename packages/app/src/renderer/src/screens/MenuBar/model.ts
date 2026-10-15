@@ -4,8 +4,9 @@
 
 import type { Config, EngineState, IfaceRole, RuleState, RuleStatus } from '@routeswitch/shared';
 
+import type { I18n } from '../../../../i18n';
 import type { RsServiceOrder } from '../../rs';
-import { formatAgo, formatClock, isActiveWarning, lastKnownShort, lastKnownText, RECONCILE_REASON_TEXT, ruleReasonText } from '../../text';
+import { isActiveWarning, lastKnownShort, lastKnownText, ruleReasonText, UZ } from '../../text';
 
 /** How many rules the window lists; the rest are counted (RouteSwitch.md §Renderer ekranlari). */
 export const MENU_RULE_LIMIT = 4;
@@ -45,15 +46,15 @@ type ConfigRule = Config['rules'][number];
  * the note when there is one; for a domain, its DNS server or how many
  * addresses it resolved to.
  */
-export function ruleDetail(rule: ConfigRule, state: RuleState | null, now: number): string {
+export function ruleDetail(rule: ConfigRule, state: RuleState | null, now: number, i18n: I18n = UZ): string {
   const lastKnown = state === null ? null : lastKnownShort(rule, state);
   if (lastKnown !== null) return lastKnown;
   const note = rule.note?.trim() ?? '';
   if (note !== '') return note;
   if (rule.kind !== 'domain') return '';
-  if (rule.dns !== undefined) return `DNS: ${rule.dns}`;
+  if (rule.dns !== undefined) return i18n.t.menuBar.dnsServer(rule.dns);
   if (state === null || state.lastResolvedAt === null) return '';
-  return `${String(state.appliedDestinations.length)} IP · ${formatAgo(state.lastResolvedAt, now)}`;
+  return i18n.t.menuBar.resolved(state.appliedDestinations.length, i18n.formatAgo(state.lastResolvedAt, now));
 }
 
 /**
@@ -61,11 +62,11 @@ export function ruleDetail(rule: ConfigRule, state: RuleState | null, now: numbe
  * what it still routes (`lastKnownText`): the row itself only has room for
  * the first address.
  */
-export function ruleNotice(state: RuleState | null, rule?: ConfigRule, now = 0): RuleNotice | null {
+export function ruleNotice(state: RuleState | null, rule?: ConfigRule, now = 0, i18n: I18n = UZ): RuleNotice | null {
   if (state === null) return null;
-  const reason = ruleReasonText(state);
+  const reason = ruleReasonText(state, i18n);
   if (reason === null) return null;
-  const lastKnown = rule === undefined ? null : lastKnownText(rule, state, now);
+  const lastKnown = rule === undefined ? null : lastKnownText(rule, state, now, undefined, i18n);
   const text = lastKnown === null ? reason : `${reason}. ${lastKnown}`;
   if (state.status === 'pending' || state.status === 'error') return { kind: 'status', status: state.status, text };
   if (isActiveWarning(state)) return { kind: 'warning', text };
@@ -74,7 +75,7 @@ export function ruleNotice(state: RuleState | null, rule?: ConfigRule, now = 0):
 }
 
 /** The enabled rules of the config joined with their state by id; the first `limit` are listed. */
-export function menuRules(config: Config, state: EngineState, now: number, limit = MENU_RULE_LIMIT): MenuRules {
+export function menuRules(config: Config, state: EngineState, now: number, limit = MENU_RULE_LIMIT, i18n: I18n = UZ): MenuRules {
   const states = new Map(state.rules.map((rule) => [rule.ruleId, rule]));
   const enabled = config.rules.filter((rule) => rule.enabled);
   const shown = enabled.slice(0, limit).map((rule): MenuRule => {
@@ -84,8 +85,8 @@ export function menuRules(config: Config, state: EngineState, now: number, limit
       id: rule.id,
       iface: rule.iface,
       target: rule.target,
-      detail: ruleDetail(rule, ruleState, now),
-      notice: ruleNotice(ruleState, rule, now),
+      detail: ruleDetail(rule, ruleState, now, i18n),
+      notice: ruleNotice(ruleState, rule, now, i18n),
     };
   });
   const routes = state.rules.reduce((sum, rule) => sum + rule.appliedDestinations.length, 0);
@@ -109,16 +110,17 @@ export interface StatusLine {
 }
 
 /** The status row: last apply and its trigger, and how many rules are in error. */
-export function statusLine(state: EngineState, now: number): StatusLine {
+export function statusLine(state: EngineState, now: number, i18n: I18n = UZ): StatusLine {
+  const words = i18n.t.menuBar;
   if (!state.enabled) {
-    return { tone: 'neutral', text: "Routing o'chirilgan — qoidalar qo'llanmaydi", errors: null };
+    return { tone: 'neutral', text: words.routingOff, errors: null };
   }
   const failing = errorCount(state);
-  const errors = failing === 0 ? null : `${String(failing)} ta qoidada xato`;
+  const errors = failing === 0 ? null : words.rulesFailing(failing);
   const tone = failing === 0 ? 'success' : 'danger';
-  if (state.lastApplyAt === null) return { tone, text: "Hali qo'llanmagan", errors };
-  const trigger = state.lastReconcileReason === null ? '' : ` · ${RECONCILE_REASON_TEXT[state.lastReconcileReason]}`;
-  return { tone, text: `Oxirgi qo'llash: ${formatClock(state.lastApplyAt, now)}${trigger}`, errors };
+  if (state.lastApplyAt === null) return { tone, text: words.notAppliedYet, errors };
+  const trigger = state.lastReconcileReason === null ? '' : ` · ${i18n.t.reconcileReason[state.lastReconcileReason]}`;
+  return { tone, text: `${words.lastApply(i18n.formatTime(state.lastApplyAt, now))}${trigger}`, errors };
 }
 
 /** The role whose interface can carry traffic: up, with an address and a gateway. */

@@ -5,6 +5,7 @@
 // read again whenever its revision changes); the window keeps no truth of
 // its own — a switch shows the state the helper reported, not the click.
 
+import type { IfaceRole } from '@routeswitch/shared';
 import { useCallback, useEffect, useState, type ReactElement } from 'react';
 
 import {
@@ -20,16 +21,27 @@ import {
   Toggle,
   requestReconnect,
 } from '../../components';
+import type { I18n } from '../../../../i18n';
 import { configStoreFor, useConfig, type ConfigView } from '../../hooks/useConfig';
 import { useEngineState, type EngineStateView } from '../../hooks/useEngineState';
+import { useI18n } from '../../hooks/useI18n';
 import { useNow } from '../../hooks/useNow';
 import { browserShowSignal, readOnShow, type ShowSignal, type ShownReader } from '../../hooks/windowShown';
 import type { RsApi, RsServiceOrder } from '../../rs';
-import { errorText, helperNotice, LOADING_NOTICE, networkWarnings, type Feedback } from '../../text';
+import { errorText, helperNotice, loadingNotice, networkWarnings, UZ, type Feedback } from '../../text';
 import { installHelper } from '../Install';
-import { openRules, reapply, setRouting, type MenuBarApi } from './actions';
+import { dnsWarningViews } from '../AddRule/model';
+import { backupKey, backupOffer, useBackup, type BackupApi } from '../Rules/recovery';
+import { DnsWarningBanner } from '../Rules/RulesScreen';
+import { openHelp, openRules, reapply, setRouting, suggestRule, type MenuBarApi } from './actions';
 import styles from './MenuBarScreen.module.css';
 import { defaultRole, interfacesKey, menuRules, statusLine, type MenuRule, type StatusLine } from './model';
+
+/** Which DNS warning's offer to open in the rules window. */
+export interface DnsOfferRequest {
+  readonly server: string;
+  readonly role: IfaceRole;
+}
 
 export type MenuBarAction = 'enabled' | 'apply' | 'rules' | 'reconnect' | 'install';
 
@@ -45,11 +57,26 @@ export interface MenuBarPanelProps {
   readonly onToggle: (next: boolean) => void;
   readonly onApply: () => void;
   readonly onOpenRules: () => void;
+  /** The header's "?": the rules window at its Help section (TASK-DELTA-22). Absent: no button. */
+  readonly onOpenHelp?: () => void;
   readonly onReloadConfig: () => void;
   /** "Qayta ulanish" of the helper notice. */
   readonly onReconnect: () => void;
   /** "Helper'ni (qayta) o'rnatish" of the helper notice (TASK-214). */
   readonly onInstall: () => void;
+  /**
+   * The rules backup's restore offer (TASK-DELTA-16): the helper holds no
+   * rules, the app's backup does. Its button opens the rules window, where
+   * the preview and the confirmation are.
+   */
+  readonly backupOffer?: { readonly count: number; readonly savedAt: string } | null;
+  /**
+   * A DNS warning's "qoidasini qo'shish" (TASK-DELTA-21): the rules window
+   * opens with the add-rule form filled in. Absent: the warnings show without it.
+   */
+  readonly onSuggestRule?: (request: DnsOfferRequest) => void;
+  /** The language of the window (`useI18n()`); Uzbek without it. */
+  readonly i18n?: I18n;
 }
 
 function AlertIcon({ size = 14 }: { readonly size?: number }): ReactElement {
@@ -72,7 +99,7 @@ function AlertIcon({ size = 14 }: { readonly size?: number }): ReactElement {
   );
 }
 
-function RuleRow({ rule }: { readonly rule: MenuRule }): ReactElement {
+function RuleRow({ rule, i18n }: { readonly rule: MenuRule; readonly i18n: I18n }): ReactElement {
   const notice = rule.notice;
   return (
     <li className={styles['row']} data-notice={notice?.kind ?? undefined}>
@@ -85,65 +112,104 @@ function RuleRow({ rule }: { readonly rule: MenuRule }): ReactElement {
           {rule.detail}
         </span>
       )}
-      {notice?.kind === 'status' ? <StatusBadge status={notice.status} detail={notice.text} /> : null}
-      {notice?.kind === 'warning' ? <StatusDot tone="warning" label={`Ogohlantirish: ${notice.text}`} /> : null}
+      {notice?.kind === 'status' ? <StatusBadge status={notice.status} detail={notice.text} i18n={i18n} /> : null}
+      {notice?.kind === 'warning' ? <StatusDot tone="warning" label={i18n.t.menuBar.warning(notice.text)} /> : null}
     </li>
   );
 }
 
-function RulesSection({ config, engine, now, onReloadConfig }: Pick<MenuBarPanelProps, 'config' | 'now' | 'onReloadConfig'> & { readonly engine: EngineStateView }): ReactElement {
+function RulesSection({
+  config,
+  engine,
+  now,
+  onReloadConfig,
+  i18n,
+}: Pick<MenuBarPanelProps, 'config' | 'now' | 'onReloadConfig'> & { readonly engine: EngineStateView; readonly i18n: I18n }): ReactElement {
+  const words = i18n.t.menuBar;
   const state = engine.state;
-  const rules = config.config === null || state === null ? null : menuRules(config.config, state, now);
+  const rules = config.config === null || state === null ? null : menuRules(config.config, state, now, undefined, i18n);
   return (
     // With routing off no rule is applied: the list is dimmed (the status row says why).
     <section className={styles['rules']} aria-labelledby="menubar-rules" data-off={state?.enabled === false || undefined}>
       <div className={styles['rulesHead']}>
         <h2 id="menubar-rules" className={styles['label']}>
-          Faol qoidalar
+          {words.activeRules}
         </h2>
-        {rules === null ? null : (
-          <span className={styles['count']}>
-            {rules.total} ta · {rules.routes} route
-          </span>
-        )}
+        {rules === null ? null : <span className={styles['count']}>{words.ruleCount(rules.total, rules.routes)}</span>}
       </div>
       {rules === null && config.phase === 'failed' ? (
         <div className={styles['empty']} role="alert">
-          <p>Qoidalarni o'qib bo'lmadi. {config.error === null ? '' : errorText(config.error.code)}</p>
+          <p>
+            {words.rulesUnreadable} {config.error === null ? '' : errorText(config.error.code, i18n)}
+          </p>
           <Button variant="ghost" onClick={onReloadConfig}>
-            Qayta o'qish
+            {words.reload}
           </Button>
         </div>
       ) : null}
       {rules === null && config.phase !== 'failed' ? (
         <p className={styles['empty']} role="status">
-          Qoidalar o'qilmoqda…
+          {words.rulesLoading}
         </p>
       ) : null}
       {rules !== null && rules.total === 0 ? (
-        <p className={styles['empty']}>Yoqilgan qoida yo'q. «Qoidalarni boshqarish» orqali qo'shing.</p>
+        <p className={styles['empty']}>{words.noRules}</p>
       ) : null}
       {rules !== null && rules.total > 0 ? (
         <ul className={styles['list']}>
           {rules.shown.map((rule) => (
-            <RuleRow key={rule.id} rule={rule} />
+            <RuleRow key={rule.id} rule={rule} i18n={i18n} />
           ))}
         </ul>
       ) : null}
-      {rules !== null && rules.hidden > 0 ? <p className={styles['more']}>Yana {rules.hidden} ta qoida</p> : null}
+      {rules !== null && rules.hidden > 0 ? <p className={styles['more']}>{words.moreRules(rules.hidden)}</p> : null}
     </section>
   );
 }
 
-/** Rules waiting for an interface, both interfaces on one subnet (`networkWarnings`). */
-function Warnings({ engine, config }: { readonly engine: EngineStateView; readonly config: ConfigView }): ReactElement | null {
+/**
+ * Rules waiting for an interface, both interfaces on one subnet
+ * (`networkWarnings`), and DNS servers reached through the wrong interface,
+ * each with its add-rule offer (`dnsWarningViews`, TASK-DELTA-21).
+ */
+function Warnings({
+  engine,
+  config,
+  onSuggestRule,
+  suggesting,
+  i18n,
+}: {
+  readonly engine: EngineStateView;
+  readonly config: ConfigView;
+  readonly onSuggestRule: ((request: DnsOfferRequest) => void) | undefined;
+  readonly suggesting: boolean;
+  readonly i18n: I18n;
+}): ReactElement | null {
   const state = engine.state;
-  const warnings = state === null ? [] : networkWarnings(state, config.config);
-  if (warnings.length === 0) return null;
+  const warnings = state === null ? [] : networkWarnings(state, config.config, i18n);
+  const dnsWarnings = state === null ? [] : dnsWarningViews(state, config.config, i18n);
+  if (warnings.length === 0 && dnsWarnings.length === 0) return null;
   return (
     <div className={styles['warnings']}>
       {warnings.map((warning) => (
         <Banner key={warning.id} tone="warning" size="compact" title={warning.title} text={warning.text} />
+      ))}
+      {dnsWarnings.map((warning) => (
+        <DnsWarningBanner
+          key={warning.id}
+          warning={warning}
+          size="compact"
+          addRuleOff={null}
+          busy={suggesting}
+          onOffer={
+            onSuggestRule === undefined
+              ? undefined
+              : (_form, { server, role }) => {
+                  onSuggestRule({ server, role });
+                }
+          }
+          i18n={i18n}
+        />
       ))}
     </div>
   );
@@ -167,9 +233,11 @@ function StatusRow({ line }: { readonly line: StatusLine }): ReactElement {
 /** The window for given data; `MenuBarScreen` supplies the live data and the actions. */
 export function MenuBarPanel(props: MenuBarPanelProps): ReactElement {
   const { engine, busy } = props;
+  const i18n = props.i18n ?? UZ;
+  const words = i18n.t.menuBar;
   const state = engine.helper === 'connected' ? engine.state : null;
   // A connected snapshot always carries a state; should one ever not, it reads as still loading.
-  const notice = state === null ? (helperNotice(engine) ?? LOADING_NOTICE) : null;
+  const notice = state === null ? (helperNotice(engine, i18n) ?? loadingNotice(i18n)) : null;
   const enabled = state?.enabled ?? false;
   const preferred = state === null ? null : defaultRole(props.serviceOrder, state.interfaces);
 
@@ -184,11 +252,22 @@ export function MenuBarPanel(props: MenuBarPanelProps): ReactElement {
             </h1>
           </div>
           <div className={styles['switch']}>
-            <span aria-hidden="true">{state === null ? '' : enabled ? 'Faol' : "O'chiq"}</span>
+            {props.onOpenHelp === undefined ? null : (
+              <button
+                type="button"
+                className={styles['helpButton']}
+                aria-label={i18n.t.rules.sections.help}
+                title={i18n.t.rules.sections.help}
+                onClick={props.onOpenHelp}
+              >
+                ?
+              </button>
+            )}
+            <span aria-hidden="true">{state === null ? '' : enabled ? words.on : words.off}</span>
             <Toggle
               checked={enabled}
               onChange={props.onToggle}
-              label="Routing (barcha qoidalar)"
+              label={words.toggleLabel}
               disabled={state === null}
               busy={busy.has('enabled')}
             />
@@ -200,6 +279,7 @@ export function MenuBarPanel(props: MenuBarPanelProps): ReactElement {
             <p className={styles['noticeTitle']}>{notice?.title}</p>
             {notice === null || notice.text === '' ? null : <p className={styles['noticeText']}>{notice.text}</p>}
             <HelperRecovery
+              i18n={i18n}
               recovery={notice?.recovery ?? null}
               onReconnect={props.onReconnect}
               reconnecting={busy.has('reconnect')}
@@ -211,14 +291,34 @@ export function MenuBarPanel(props: MenuBarPanelProps): ReactElement {
           <>
             <section className={styles['interfaces']} aria-labelledby="menubar-interfaces">
               <h2 id="menubar-interfaces" className={styles['label']}>
-                Interfeyslar
+                {words.interfaces}
               </h2>
-              <InterfaceCard role="wifi" iface={state.interfaces.wifi} isDefault={preferred === 'wifi'} />
-              <InterfaceCard role="ethernet" iface={state.interfaces.ethernet} isDefault={preferred === 'ethernet'} />
+              <InterfaceCard role="wifi" iface={state.interfaces.wifi} isDefault={preferred === 'wifi'} i18n={i18n} />
+              <InterfaceCard role="ethernet" iface={state.interfaces.ethernet} isDefault={preferred === 'ethernet'} i18n={i18n} />
             </section>
-            <Warnings engine={engine} config={props.config} />
-            <RulesSection config={props.config} engine={engine} now={props.now} onReloadConfig={props.onReloadConfig} />
-            <StatusRow line={statusLine(state, props.now)} />
+            {props.backupOffer === null || props.backupOffer === undefined ? null : (
+              <div className={styles['warnings']}>
+                <Banner
+                  tone="warning"
+                  size="compact"
+                  title={i18n.t.backup.offerTitle(props.backupOffer.count)}
+                  text={i18n.t.backup.offerText(i18n.formatTime(props.backupOffer.savedAt, props.now))}
+                >
+                  <Button variant="primary" onClick={props.onOpenRules} busy={busy.has('rules')}>
+                    {i18n.t.backup.openRules}
+                  </Button>
+                </Banner>
+              </div>
+            )}
+            <Warnings
+              engine={engine}
+              config={props.config}
+              onSuggestRule={props.onSuggestRule}
+              suggesting={busy.has('rules')}
+              i18n={i18n}
+            />
+            <RulesSection config={props.config} engine={engine} now={props.now} onReloadConfig={props.onReloadConfig} i18n={i18n} />
+            <StatusRow line={statusLine(state, props.now, i18n)} />
           </>
         )}
 
@@ -230,10 +330,10 @@ export function MenuBarPanel(props: MenuBarPanelProps): ReactElement {
 
         <div className={styles['actions']}>
           <Button grow onClick={props.onApply} disabled={state === null || !enabled} busy={busy.has('apply')}>
-            Qayta qo'llash
+            {words.reapply}
           </Button>
           <Button variant="primary" grow onClick={props.onOpenRules} busy={busy.has('rules')}>
-            Qoidalarni boshqarish
+            {words.manageRules}
           </Button>
         </div>
       </div>
@@ -259,14 +359,17 @@ export function followServiceOrder(
 
 export interface MenuBarScreenProps {
   /** The preload API; `window.rs` in the app. */
-  readonly rs?: MenuBarApi & Pick<RsApi, 'getState' | 'onState' | 'getConfig' | 'getServiceOrder' | 'reconnectHelper' | 'installHelper'>;
+  readonly rs?: MenuBarApi & BackupApi & Pick<RsApi, 'getState' | 'onState' | 'getConfig' | 'getServiceOrder' | 'reconnectHelper' | 'installHelper'>;
 }
 
 /** The screen of the menu bar window (`?view=popover`). */
 export function MenuBarScreen({ rs: given }: MenuBarScreenProps): ReactElement {
   const rs = given ?? window.rs;
+  const i18n = useI18n();
   const engine = useEngineState(rs);
   const config = useConfig(rs);
+  // The rules backup (TASK-DELTA-16): read on every connection and config revision, and when the popover is shown.
+  const backup = useBackup(rs, backupKey(engine));
   // Ticks, and refreshes when the popover is shown again (it is hidden, not closed).
   const now = useNow();
   const [serviceOrder, setServiceOrder] = useState<RsServiceOrder | null>(null);
@@ -317,24 +420,32 @@ export function MenuBarScreen({ rs: given }: MenuBarScreenProps): ReactElement {
       now={now}
       busy={busy}
       feedback={feedback}
+      i18n={i18n}
+      backupOffer={backupOffer(engine, config.config, backup.view)}
       onToggle={(next) => {
-        run('enabled', () => setRouting(rs, next));
+        run('enabled', () => setRouting(rs, next, i18n));
       }}
       onApply={() => {
-        run('apply', () => reapply(rs));
+        run('apply', () => reapply(rs, i18n));
       }}
       onOpenRules={() => {
-        run('rules', () => openRules(rs));
+        run('rules', () => openRules(rs, i18n));
+      }}
+      onOpenHelp={() => {
+        run('rules', () => openHelp(rs, i18n));
+      }}
+      onSuggestRule={(request) => {
+        run('rules', () => suggestRule(rs, request, i18n));
       }}
       onReloadConfig={() => {
         configStoreFor(rs).reload();
       }}
       onReconnect={() => {
-        run('reconnect', () => requestReconnect(rs));
+        run('reconnect', () => requestReconnect(rs, i18n));
       }}
       onInstall={() => {
         // One install at a time; the main process would answer a second one `busy`.
-        if (!busy.has('install')) run('install', () => installHelper(rs));
+        if (!busy.has('install')) run('install', () => installHelper(rs, i18n));
       }}
     />
   );

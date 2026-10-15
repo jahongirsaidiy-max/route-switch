@@ -47,6 +47,34 @@
   font-weight: var(--rs-weight-semibold);
 }
 
+/* The "?" before the switch (TASK-DELTA-22, not in the design): a round 20px button in the header's muted text. */
+.helpButton {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 20px;
+  height: 20px;
+  margin-right: var(--rs-space-2);
+  padding: 0;
+  border: 1px solid var(--rs-color-border-strong);
+  border-radius: var(--rs-radius-pill);
+  background: transparent;
+  color: var(--rs-color-text-secondary);
+  font-size: var(--rs-text-caption);
+  font-weight: var(--rs-weight-semibold);
+  cursor: pointer;
+  transition: background-color var(--rs-transition);
+}
+
+.helpButton:hover {
+  background: var(--rs-color-hover);
+}
+
+.helpButton:focus-visible {
+  outline: none;
+  box-shadow: var(--rs-shadow-focus);
+}
+
 /* "Faol" + switch: gap 8, 12px, #4A4E57. */
 .switch {
   display: flex;

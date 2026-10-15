@@ -17,6 +17,7 @@ export type ValidationCode =
   | 'invalid-prefix'
   | 'prefix-too-wide'
   | 'invalid-domain'
+  | 'invalid-wildcard'
   | 'invalid-destination'
   | 'default-route'
   | 'this-network'
@@ -93,6 +94,8 @@ const MESSAGES: Record<ValidationCode, string> = {
   'prefix-too-wide': `Subnet is too wide: the prefix must be between ${String(MIN_SUBNET_PREFIX)} and ${String(IPV4_BITS)}`,
   'invalid-domain':
     'Must be a lower-case domain name (a-z, 0-9, "-" and "." only), e.g. corp.local; wildcards are not supported',
+  'invalid-wildcard':
+    'A wildcard must be four dot-separated parts with "*" only in the trailing parts, e.g. 10.*.*.* or 192.168.5.*',
   'invalid-destination': 'Must be an IPv4 address or an IPv4 subnet in CIDR form',
   'default-route': 'The default route (0.0.0.0/0) must never be changed',
   'this-network': '"This network" addresses (0.0.0.0/8) must never be routed',
@@ -236,6 +239,44 @@ export const normalizeSubnet = (input: string): Normalised => {
   if (typeof parsed === 'string') return fail(parsed);
   const reason = forbiddenReasonOf(parsed);
   return reason === null ? ok(toDestination(parsed).cidr) : fail(reason);
+};
+
+/** The character that marks a wildcard octet in an `ip` / `subnet` input (`10.*.*.*`). */
+export const IP_WILDCARD = '*';
+const IPV4_OCTETS = 4;
+const OCTET_BITS = 8;
+
+/** True when an `ip` / `subnet` input is meant as a wildcard (contains `*` anywhere). */
+export const isIpWildcard = (input: string): boolean => input.includes(IP_WILDCARD);
+
+/**
+ * Syntax only: turns an IPv4 wildcard into the canonical CIDR it stands for.
+ * Exactly four dot-separated parts; the trailing 1..3 parts are a bare `*`
+ * and the leading ones are strict decimal octets: `192.168.5.*` →
+ * `192.168.5.0/24`, `192.168.*.*` → `/16`, `10.*.*.*` → `/8`.
+ *
+ * Everything else is `invalid-wildcard`: a `*` followed by an octet
+ * (`192.*.1.*`), all four parts `*` (`*.*.*.*`), fewer or more parts (`10.*`),
+ * a part that is not exactly `*` (`10.**.*.*`, `1*.0.0.*`), a prefix
+ * after the last `*` (`10.*.*.*` + `/8`), white space, or no `*` at all. The forbidden ranges are not
+ * checked here: pass the result through `normalizeSubnet` for a rule target.
+ */
+export const parseIpWildcard = (input: string): Normalised => {
+  const parts = input.split('.');
+  if (parts.length !== IPV4_OCTETS) return fail('invalid-wildcard');
+
+  const firstStar = parts.indexOf(IP_WILDCARD);
+  // At least one fixed octet and at least one `*`.
+  if (firstStar < 1) return fail('invalid-wildcard');
+  // Once a `*` appears, every later part is a `*` too.
+  if (!parts.slice(firstStar).every((part) => part === IP_WILDCARD)) return fail('invalid-wildcard');
+
+  const fixed = parts.slice(0, firstStar);
+  const network = [...fixed, ...Array<string>(IPV4_OCTETS - firstStar).fill('0')].join('.');
+  // The fixed octets get the same strict check as any address (no `010`, no space, no hex).
+  if (parseAddress(network) === null) return fail('invalid-wildcard');
+
+  return ok(`${network}/${String(firstStar * OCTET_BITS)}`);
 };
 
 const DOMAIN_CHARSET = /^[a-z0-9.-]+$/;

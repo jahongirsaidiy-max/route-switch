@@ -6,7 +6,9 @@ import { Button } from '../../components';
 import { renderMarkup } from '../../components/test-utils';
 import type { EngineStateView } from '../../hooks/useEngineState';
 import type { RsApi, RsServiceOrder } from '../../rs';
+import { i18nFor } from '../../../../i18n';
 import {
+  chooseLanguage,
   focusUninstallButton,
   followServiceOrderView,
   SettingsPanel,
@@ -52,6 +54,9 @@ const ORDER: RsServiceOrder = {
 
 const props = (extra: Partial<SettingsPanelProps> = {}): SettingsPanelProps => ({
   engine: CONNECTED,
+  language: 'uz',
+  languageHint: i18nFor('uz').t.settingsLanguage.hint,
+  onSelectLanguage: vi.fn(),
   openAtLogin: false,
   overrides: null,
   serviceOrder: { phase: 'ready', order: ORDER, feedback: null },
@@ -92,7 +97,10 @@ const treeOf = (extra: Partial<SettingsPanelProps> = {}) => {
 const buttonsNamed = (elements: ReactElement<AnyProps>[], text: string) =>
   elements.filter((element) => element.type === Button && element.props.children === text);
 
-const selectOf = (html: string) => /<select[^>]*>.*?<\/select>/.exec(html)?.[0] ?? '';
+/** The Ethernet adapter select (the language picker comes first, `name="language"`). */
+const selectOf = (html: string) =>
+  [...html.matchAll(/<select[^>]*>.*?<\/select>/g)].map((match) => match[0]).find((select) => !select.includes('name="language"')) ?? '';
+const languageSelectOf = (html: string) => /<select name="language"[^>]*>.*?<\/select>/.exec(html)?.[0] ?? '';
 
 describe('SettingsPanel: login item', () => {
   it('is a switch showing the setting', () => {
@@ -137,7 +145,7 @@ describe('SettingsPanel: Ethernet adapter', () => {
   it('reports a choice, but ignores changes while saving or disabled', () => {
     const pick = (extra: Partial<SettingsPanelProps>, value: string) => {
       const { all, elements } = treeOf(extra);
-      const select = elements.find((element) => element.type === 'select');
+      const select = elements.find((element) => element.type === 'select' && (element.props as { name?: string }).name !== 'language');
       select?.props.onChange?.({ target: { value } });
       return all.onSelectEthernet;
     };
@@ -263,6 +271,11 @@ describe('SettingsScreen', () => {
       copyServiceOrderCommand: vi.fn(),
       uninstallHelper: vi.fn(),
       removeHelper: vi.fn(),
+      setLanguage: vi.fn(),
+      getBackup: vi.fn(),
+      restoreBackup: vi.fn(),
+      applyImport: vi.fn(),
+      deleteBackup: vi.fn(),
     };
     const html = renderMarkup(createElement(SettingsScreen, { rs }));
     expect(html).toContain('Sozlamalar');
@@ -273,6 +286,70 @@ describe('SettingsScreen', () => {
     expect(rs.copyServiceOrderCommand).not.toHaveBeenCalled();
     expect(rs.uninstallHelper).not.toHaveBeenCalled();
     expect(rs.removeHelper).not.toHaveBeenCalled();
+    expect(rs.setLanguage).not.toHaveBeenCalled();
+    expect(rs.restoreBackup).not.toHaveBeenCalled();
+    expect(rs.applyImport).not.toHaveBeenCalled();
+    expect(rs.deleteBackup).not.toHaveBeenCalled();
+  });
+});
+
+describe('SettingsPanel: language (TASK-DELTA-11)', () => {
+  it('is titled the same in every language and names each language in its own words', () => {
+    const html = render();
+    expect(html).toContain('Til / Язык / Language');
+    const select = languageSelectOf(html);
+    expect(select).toContain('aria-labelledby="settings-language"');
+    expect(select).toContain('<option value="uz" lang="uz" selected="">O&#x27;zbekcha</option>');
+    expect(select).toContain('<option value="ru" lang="ru">Русский</option>');
+    expect(select).toContain('<option value="en" lang="en">English</option>');
+  });
+
+  it('shows the language in force and its hint', () => {
+    const html = render({ language: 'ru', languageHint: i18nFor('ru').t.settingsLanguage.hint });
+    expect(languageSelectOf(html)).toContain('<option value="ru" lang="ru" selected="">');
+    expect(html).toContain('Тексты приложения показываются на этом языке');
+  });
+
+  it('comes before the other settings', () => {
+    const html = render();
+    expect(html.indexOf('settings-language')).toBeLessThan(html.indexOf('settings-login'));
+  });
+
+  it('reports a choice; ignores it while saving and ignores a value that is not a language', () => {
+    const pick = (extra: Partial<SettingsPanelProps>, value: string) => {
+      const { all, elements } = treeOf(extra);
+      const select = elements.find((element) => element.type === 'select' && (element.props as { name?: string }).name === 'language');
+      select?.props.onChange?.({ target: { value } });
+      return all.onSelectLanguage;
+    };
+    expect(pick({}, 'en')).toHaveBeenCalledWith('en');
+    expect(pick({ busy: new Set(['language']) }, 'en')).not.toHaveBeenCalled();
+    expect(pick({}, 'de')).not.toHaveBeenCalled();
+    expect(pick({}, 'toString')).not.toHaveBeenCalled();
+  });
+
+  it('stays focusable while saving: busy and aria-disabled, not disabled', () => {
+    const select = languageSelectOf(render({ busy: new Set(['language']) }));
+    expect(select).not.toContain('disabled=""');
+    expect(select).toContain('aria-disabled="true"');
+    expect(select).toContain('aria-busy="true"');
+  });
+
+  it('shows a refusal under the picker', () => {
+    expect(render({ feedback: { language: { tone: 'danger', text: 'Amal bajarilmadi.' } } })).toContain('Amal bajarilmadi.');
+  });
+});
+
+describe('chooseLanguage', () => {
+  it('sets the language; success needs no words (every window switches)', async () => {
+    const rs = { setLanguage: vi.fn(() => Promise.resolve({ ok: true as const, value: 'ru' as const })) };
+    expect(await chooseLanguage(rs, 'ru', i18nFor('uz'))).toBeNull();
+    expect(rs.setLanguage).toHaveBeenCalledWith('ru');
+  });
+
+  it('words a refusal in the language still in force', async () => {
+    const rs = { setLanguage: vi.fn(() => Promise.resolve({ ok: false as const, code: 'internal' as const, error: 'x' })) };
+    expect(await chooseLanguage(rs, 'ru', i18nFor('en'))).toEqual({ tone: 'danger', text: 'Unexpected error (internal).' });
   });
 });
 
@@ -390,5 +467,122 @@ describe('followServiceOrderView (TASK-DELTA-08)', () => {
     expect(view.view()).toMatchObject({ phase: 'failed', order: null, feedback: { tone: 'danger' } });
     view.reader.stop();
     expect(view.shows.size).toBe(0);
+  });
+});
+
+describe('SettingsPanel: every language (TASK-DELTA-14)', () => {
+  it('speaks Uzbek without a language, as before', () => {
+    const html = render();
+    expect(html).toContain('Sozlamalar');
+    expect(html).toContain('Ethernet adapteri');
+    expect(html).toContain('(hozir: en5)');
+    expect(html).toContain('aria-label="Login&#x27;da ishga tushirish"');
+  });
+
+  it.each([
+    ['ru', ['Настройки', 'Запуск при входе', 'Адаптер Ethernet', '(сейчас: en5)', 'Автоматически', 'en7 · Thunderbolt Ethernet · Нет IP', 'Wi‑Fi по умолчанию', 'Сейчас первая: USB 10/100/1000 LAN.', 'Копировать', 'Обновить', 'Удалить helper', 'Helper работает']],
+    ['en', ['Settings', 'Open at login', 'Ethernet adapter', '(now: en5)', 'Automatic', 'en7 · Thunderbolt Ethernet · No IP', 'Make Wi‑Fi the default', 'First now: USB 10/100/1000 LAN.', 'Copy', 'Refresh', 'Remove the helper', 'Helper is running']],
+  ] as const)('%s: every card, the hints and the buttons', (locale, words) => {
+    const html = render({ i18n: i18nFor(locale) });
+    for (const word of words) expect(html).toContain(word);
+    for (const uzbek of ['Sozlamalar', 'Nusxalash', 'Avtomatik', 'adapteri', 'Yangilash']) expect(html).not.toContain(uzbek);
+  });
+
+  it('the networksetup command is shown as it is, in every language', () => {
+    for (const locale of ['uz', 'ru', 'en'] as const) {
+      expect(render({ i18n: i18nFor(locale) })).toContain('sudo networksetup -ordernetworkservices &#x27;Wi-Fi&#x27; &#x27;USB 10/100/1000 LAN&#x27;');
+    }
+  });
+
+  it('the Wi‑Fi default note, a missing adapter and a helper that is not connected', () => {
+    const ru = i18nFor('ru');
+    const first = render({ i18n: ru, serviceOrder: { phase: 'ready', order: { ...ORDER, wifiFirst: true }, feedback: null } });
+    expect(first).toContain('Wi-Fi уже первая — канал по умолчанию Wi‑Fi.');
+    expect(render({ i18n: ru, overrides: { ethernet: 'en9' } })).toContain('en9 · не подключён');
+    expect(render({ i18n: i18nFor('en'), engine: NOT_INSTALLED })).toContain('You can choose once the helper is connected.');
+    expect(render({ i18n: i18nFor('en'), serviceOrder: { phase: 'loading', order: null, feedback: null } })).toContain('Reading the service order…');
+  });
+
+  it('the uninstall question in Russian', () => {
+    const { elements } = treeOf({ i18n: i18nFor('ru'), confirmingUninstall: true });
+    expect(buttonsNamed(elements, 'Да, удалить')).toHaveLength(1);
+    expect(buttonsNamed(elements, 'Отмена')).toHaveLength(1);
+    expect(render({ i18n: i18nFor('ru'), confirmingUninstall: true })).toContain('Действительно удалить helper?');
+  });
+
+  it('a failed service order read is worded in the language at the time of the answer', async () => {
+    let view: ServiceOrderView = { phase: 'loading', order: null, feedback: null };
+    const reader = followServiceOrderView(
+      { getServiceOrder: () => Promise.resolve({ ok: false, code: 'not-connected', error: 'x' } as const) },
+      (next) => {
+        view = next(view);
+      },
+      () => () => undefined,
+      () => i18nFor('en'),
+    );
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(view.feedback?.text).toBe(i18nFor('en').t.errors['not-connected']);
+    reader.stop();
+  });
+});
+
+describe('SettingsPanel: the rules backup (TASK-DELTA-16)', () => {
+  const SAVED_AT = '2026-10-15T08:30:00.000Z';
+  const NOW = Date.parse('2026-10-15T09:00:00.000Z');
+  const info = { savedAt: SAVED_AT, ruleCount: 4, dismissed: false };
+  const clean = (html: string) => html.replace(/<[^>]+>/g, ' ').replace(/&#x27;/g, "'").replace(/\s+/g, ' ');
+
+  it('says what the backup holds and offers restore and removal', () => {
+    const html = clean(render({ backup: { phase: 'ready', info }, now: NOW }));
+    expect(html).toContain('Qoidalar zaxirasi');
+    expect(html).toMatch(/Zaxira: 4 ta qoida, \d\d:\d\d/);
+    expect(html).toContain('Zaxiradan tiklash');
+    expect(html).toContain("Zaxirani o'chirish");
+  });
+
+  it('without a backup there is nothing to restore or remove', () => {
+    const html = render({ backup: { phase: 'ready', info: null } });
+    expect(clean(html)).toContain("Zaxira hali yo'q");
+    expect(html).toContain('disabled=""');
+  });
+
+  it('without the helper a restore cannot be applied: the reason is shown', () => {
+    expect(clean(render({ engine: NOT_INSTALLED, backup: { phase: 'ready', info } }))).toContain("Tiklash uchun helper ulangan bo'lishi kerak.");
+  });
+
+  it('the restore preview asks before anything is replaced', () => {
+    const preview = { token: '99999999-9999-4999-8999-999999999999', config: { version: 1 as const, enabled: true, rules: [] }, source: { kind: 'backup' as const, savedAt: SAVED_AT } };
+    const html = clean(render({ backup: { phase: 'ready', info }, now: NOW, restore: { phase: 'idle', preview, feedback: null, focusImport: false } }));
+    expect(html).toContain('Zaxira (');
+    expect(html).toContain('Almashtirish');
+    expect(html).toContain('Bekor qilish');
+  });
+
+  it('removal asks first', () => {
+    const html = clean(render({ backup: { phase: 'ready', info }, confirmingBackupRemoval: true }));
+    expect(html).toContain("Zaxira rostdan ham o'chirilsinmi?");
+    expect(html).toContain("Ha, o'chirish");
+  });
+
+  it('the uninstall question says the rules stay in the backup, in every language', () => {
+    for (const locale of ['uz', 'ru', 'en'] as const) {
+      const words = i18nFor(locale);
+      const html = clean(render({ confirmingUninstall: true, i18n: words }));
+      expect(html).toContain(words.t.settings.helper.question.replace(/'/g, "'"));
+    }
+    expect(i18nFor('uz').t.settings.helper.question).toContain('zaxira');
+    expect(i18nFor('ru').t.settings.helper.question).toContain('резервной копии');
+    expect(i18nFor('en').t.settings.helper.question).toContain('backup');
+  });
+
+  it.each([
+    ['ru', 'Резервная копия правил', 'Копия: 4 правила'],
+    ['en', 'Rules backup', 'Backup: 4 rules'],
+  ] as const)('in %s', (locale, title, summary) => {
+    const html = clean(render({ backup: { phase: 'ready', info }, now: NOW, i18n: i18nFor(locale), language: locale }));
+    expect(html).toContain(title);
+    expect(html).toContain(summary);
+    expect(html).not.toContain('Zaxira');
   });
 });

@@ -1,7 +1,9 @@
 import { createElement } from 'react';
 import { describe, expect, it, vi } from 'vitest';
 
+import { i18nFor, type I18n } from '../../../../i18n';
 import { renderMarkup } from '../../components/test-utils';
+import { I18nProvider } from '../../hooks/useI18n';
 import type { RsApi, RsLogEntry, RsResult } from '../../rs';
 import { LogPanel, LogScreen, filterOptions, formatLogTime, visibleEntries, type LogFilter } from './LogScreen';
 import { logStoreFor, type LogView } from './useLog';
@@ -142,5 +144,72 @@ describe('LogScreen', () => {
     const html = renderMarkup(createElement(LogScreen, { rs }));
     expect(rowsOf(html)).toHaveLength(4);
     expect(html).toContain('aria-checked="true"');
+  });
+});
+
+describe('the journal in every language (TASK-DELTA-14)', () => {
+  const ru = i18nFor('ru');
+  const en = i18nFor('en');
+  const renderIn = (i18n: I18n, view: LogView, filter: LogFilter = 'all') =>
+    renderMarkup(createElement(LogPanel, { view, filter, onFilterChange: vi.fn(), now: NOW, i18n }));
+
+  it('the time through Intl: the day as 13.10 in Uzbek and Russian, 10/13 in English; 24-hour with seconds', () => {
+    expect(formatLogTime(at(23, 59, 59, 13), NOW, i18nFor('uz'))).toBe('13.10 23:59:59');
+    expect(formatLogTime(at(23, 59, 59, 13), NOW, ru)).toBe('13.10 23:59:59');
+    expect(formatLogTime(at(23, 59, 59, 13), NOW, en)).toBe('10/13 23:59:59');
+    expect(formatLogTime(at(9, 5, 7), NOW, en)).toBe('09:05:07');
+    expect(formatLogTime(at(0, 0, 1), NOW, ru)).toBe('00:00:01');
+    expect(formatLogTime('not a date', NOW, en)).toBe('not a date');
+  });
+
+  it('the filter counts each level in the language', () => {
+    expect(filterOptions(ENTRIES, ru).map((option) => option.label)).toEqual([
+      'Все (4)',
+      'Информация (2)',
+      'Предупреждение (1)',
+      'Ошибка (1)',
+    ]);
+    expect(filterOptions(ENTRIES, en).map((option) => option.label)).toEqual(['All (4)', 'Info (2)', 'Warning (1)', 'Error (1)']);
+  });
+
+  it('headings, level names and the footer; the helper messages stay as they came', () => {
+    const html = renderIn(ru, ready(ENTRIES));
+    for (const word of ['Журнал', 'Последние 500 сообщений helper', 'Время', 'Уровень', 'Сообщение', '>Ошибка<', 'aria-label="Записи журнала"', '4 записи · новые сверху', 'Хранятся последние 500 записей'])
+      expect(html).toContain(word);
+    expect(html).toContain('route add 10.0.0.0/8 failed');
+    expect(html).not.toMatch(/Jurnal|Hammasi|Daraja|ta yozuv/);
+    const english = renderIn(en, ready(ENTRIES));
+    for (const word of ['>Log<', "The helper&#x27;s last 500 messages", '>Warning<', '4 entries · newest first', 'The last 500 are kept']) expect(english).toContain(word);
+  });
+
+  it('Russian plurals of the entry count', () => {
+    const many = (count: number) => Array.from({ length: count }, (_, index) => ({ seq: index + 1, level: 'info' as const, msg: 'x', at: at(10, 0, 0) }));
+    expect(renderIn(ru, ready(many(1)))).toContain('1 запись ·');
+    expect(renderIn(ru, ready(many(3)))).toContain('3 записи ·');
+    expect(renderIn(ru, ready(many(5)))).toContain('5 записей ·');
+    expect(renderIn(ru, ready(many(21)))).toContain('21 запись ·');
+    expect(renderIn(en, ready(many(1)))).toContain('1 entry ·');
+    expect(renderIn(ru, ready([]))).toContain('0 записей ·');
+  });
+
+  it('empty, loading, nothing at a level and a failed history', () => {
+    expect(renderIn(ru, ready([]))).toContain('Журнал пока пуст');
+    expect(renderIn(en, { phase: 'loading', entries: [], error: null })).toContain('Loading the log…');
+    expect(renderIn(en, ready(ENTRIES.filter((entry) => entry.level !== 'error')), 'error')).toContain('No entries at this level.');
+    expect(renderIn(ru, { phase: 'failed', entries: [], error: { code: 'forbidden', message: 'x' } })).toContain('Не удалось прочитать историю журнала');
+  });
+
+  it("the app's own tag and its tooltip", () => {
+    const app: RsLogEntry = { seq: 5, level: 'warn', msg: 'Helper connection lost', at: at(11, 5, 0), source: 'app' };
+    const html = renderIn(en, ready([app]));
+    expect(html).toContain('>App</span>');
+    expect(html).toContain('title="The app&#x27;s own entry (not the helper&#x27;s)"');
+    expect(renderIn(ru, ready([app]))).toContain('>Приложение</span>');
+  });
+
+  it('LogScreen takes the language of the provider', () => {
+    const rs: Pick<RsApi, 'getLog' | 'onLog'> = { getLog: () => new Promise(() => undefined), onLog: () => () => undefined };
+    const html = renderMarkup(createElement(I18nProvider, { language: 'ru' }, createElement(LogScreen, { rs })));
+    expect(html).toContain('Журнал загружается…');
   });
 });

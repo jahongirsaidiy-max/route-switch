@@ -1,9 +1,11 @@
+import { readFileSync } from 'node:fs';
 import { chmod, mkdir, mkdtemp, realpath, rm, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
+import { LOCALES, type Locale } from '../i18n';
 import { memoryLogger } from './helperClient.fixtures';
 
 type ExecCallback = (error: (Error & { code?: number | string; killed?: boolean }) | null, stdout: string, stderr: string) => void;
@@ -17,12 +19,14 @@ import {
   classifyRun,
   createInstaller,
   ELEVATION_SCRIPT,
+  ELEVATION_SCRIPTS,
   elevationArgs,
   HELPER_PACKAGE_FILES,
   INSTALL_SCRIPT,
   MAX_DETAIL_LENGTH,
   OSASCRIPT,
   PASSWORD_PROMPT,
+  PASSWORD_PROMPTS,
   plainDetail,
   runWithExecFile,
   UNINSTALL_SCRIPT,
@@ -70,7 +74,9 @@ const fullPackage = (extra: Record<string, FakeEntry> = {}): Record<string, Fake
 
 const run = (partial: Partial<ElevationRun>): ElevationRun => ({ code: 0, stdout: '', stderr: '', timedOut: false, ...partial });
 
-const setup = (options: { fs?: PackageFileSystem; result?: ElevationRun; resourcesDir?: string | null } = {}) => {
+const setup = (
+  options: { fs?: PackageFileSystem; result?: ElevationRun; resourcesDir?: string | null; language?: () => Promise<Locale> } = {},
+) => {
   const { logger, entries } = memoryLogger(() => 0);
   const runner = vi.fn<ElevationRunner>(() => Promise.resolve(options.result ?? run({})));
   const installer = createInstaller({
@@ -78,6 +84,7 @@ const setup = (options: { fs?: PackageFileSystem; result?: ElevationRun; resourc
     uid: UID,
     run: runner,
     fs: options.fs ?? fakeFs(fullPackage()),
+    ...(options.language === undefined ? {} : { language: options.language }),
     logger,
   });
   return { installer, runner, entries };
@@ -102,6 +109,88 @@ describe('the elevation command', () => {
     expect(source).toContain('with administrator privileges');
     // The prompt is the only literal string besides "" and " ": no quote can end it early.
     expect(PASSWORD_PROMPT).not.toMatch(/["\\]/);
+  });
+
+  // TASK-DELTA-12: one fixed script per UI language; only the prompt sentence differs.
+  it.each(LOCALES)('%s: the same constant script around its own prompt, written out in full', (locale) => {
+    const script = ELEVATION_SCRIPTS[locale];
+    const prompt = PASSWORD_PROMPTS[locale];
+    // Same lines as Uzbek except the `do shell script` line.
+    expect(script).toHaveLength(ELEVATION_SCRIPT.length);
+    script.forEach((line, i) => {
+      if (!line.startsWith('do shell script')) expect(line).toBe(ELEVATION_SCRIPT[i]);
+    });
+    expect(script.filter((line) => line.startsWith('do shell script'))).toEqual([
+      `do shell script cmd with prompt "${prompt}" with administrator privileges`,
+    ]);
+    const source = script.join('\n');
+    expect(source).not.toContain('/');
+    expect(source).not.toContain('${');
+    expect(source).toContain('quoted form of (arg_ as text)');
+    // No quote or backslash can end the prompt early; no line break can start another statement.
+    expect(prompt).not.toMatch(/["\\\n\r]/);
+    expect(prompt).toContain('RouteSwitch');
+  });
+
+  it('the source of the scripts holds no template literal: each prompt line is written out as a plain string', () => {
+    const source = readFileSync(path.join(import.meta.dirname, 'installer.ts'), 'utf8');
+    const start = source.indexOf('const SCRIPT_HEAD');
+    const end = source.indexOf('export const ELEVATION_SCRIPT =');
+    expect(start).toBeGreaterThan(0);
+    expect(end).toBeGreaterThan(start);
+    // The code only: the doc comments may quote names in backticks.
+    const block = source.slice(start, end).replace(/\/\*[\s\S]*?\*\//g, '');
+    expect(block).not.toContain('`');
+    expect(block).not.toContain('${');
+    expect(block).not.toContain('PASSWORD_PROMPT');
+    for (const locale of LOCALES) expect(block).toContain(`with prompt "${PASSWORD_PROMPTS[locale].replace(/'/g, "\\'")}"`);
+  });
+
+  it('the three prompts are three languages', () => {
+    expect(new Set(LOCALES.map((locale) => PASSWORD_PROMPTS[locale])).size).toBe(3);
+    expect(PASSWORD_PROMPTS.ru).toMatch(/пароль администратора/);
+    expect(PASSWORD_PROMPTS.en).toMatch(/administrator password/);
+    expect(PASSWORD_PROMPT).toBe(PASSWORD_PROMPTS.uz);
+  });
+
+  it.each(LOCALES)('%s: elevationArgs puts that script first and the words after it, untouched', (locale) => {
+    const words = [BASH, "/x y/it's \"quoted\" $(id)/install-helper.sh", '/x y'];
+    const args = elevationArgs(words, locale);
+    expect(args.slice(0, ELEVATION_SCRIPTS[locale].length * 2)).toEqual(ELEVATION_SCRIPTS[locale].flatMap((line) => ['-e', line]));
+    expect(args.slice(ELEVATION_SCRIPTS[locale].length * 2)).toEqual(words);
+  });
+
+  it('without a language the script is Uzbek', () => {
+    expect(elevationArgs([BASH])).toEqual(elevationArgs([BASH], 'uz'));
+  });
+});
+
+describe('the language of the password dialog (TASK-DELTA-12)', () => {
+  it.each(LOCALES)('%s: install and uninstall run the script of the UI language, with the same words', async (locale) => {
+    const h = setup({ language: () => Promise.resolve(locale) });
+    expect(await h.installer.install()).toEqual({ ok: true, value: null });
+    expect(await h.installer.uninstall()).toEqual({ ok: true, value: null });
+    const [install, uninstall] = h.runner.mock.calls.map(([, args]) => args);
+    expect(install).toEqual(elevationArgs([BASH, `${RES}/${INSTALL_SCRIPT}`, RES], locale));
+    expect(uninstall).toEqual(elevationArgs([BASH, `${RES}/${UNINSTALL_SCRIPT}`], locale));
+    expect(h.entries.some((entry) => entry.msg === 'Asking for the administrator password' && entry['language'] === locale)).toBe(true);
+  });
+
+  it('a language that fails or is not one of the three falls back to Uzbek; the install still runs', async () => {
+    const failing = setup({ language: () => Promise.reject(new Error('boom')) });
+    expect(await failing.installer.install()).toEqual({ ok: true, value: null });
+    expect(failing.runner.mock.calls[0]?.[1]).toEqual(elevationArgs([BASH, `${RES}/${INSTALL_SCRIPT}`, RES], 'uz'));
+    const odd = setup({ language: () => Promise.resolve('de' as Locale) });
+    expect(await odd.installer.install()).toEqual({ ok: true, value: null });
+    expect(odd.runner.mock.calls[0]?.[1]).toEqual(elevationArgs([BASH, `${RES}/${INSTALL_SCRIPT}`, RES], 'uz'));
+  });
+
+  it('a refused package asks no language and runs nothing', async () => {
+    const language = vi.fn(() => Promise.resolve<Locale>('ru'));
+    const h = setup({ language, resourcesDir: null });
+    expect(await h.installer.install()).toMatchObject({ ok: false, code: 'install-unavailable' });
+    expect(h.runner).not.toHaveBeenCalled();
+    expect(language).not.toHaveBeenCalled();
   });
 });
 

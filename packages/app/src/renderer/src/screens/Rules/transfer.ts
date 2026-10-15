@@ -17,8 +17,9 @@
 import type { Config } from '@routeswitch/shared';
 import type { Ref } from 'react';
 
+import type { I18n } from '../../../../i18n';
 import type { RsApi, RsResult } from '../../rs';
-import { configIssueText, errorText, type Feedback } from '../../text';
+import { configIssueText, errorText, UZ, type Feedback } from '../../text';
 import type { RulesController } from './controller';
 
 export type TransferApi = Pick<RsApi, 'importConfig' | 'applyImport' | 'exportConfig'>;
@@ -26,6 +27,8 @@ export type TransferApi = Pick<RsApi, 'importConfig' | 'applyImport' | 'exportCo
 export interface ImportPreview {
   readonly token: string;
   readonly config: Config;
+  /** Where the config comes from: a file the user chose, or the app's rules backup (TASK-DELTA-16, with its time). */
+  readonly source?: { readonly kind: 'backup'; readonly savedAt: string };
 }
 
 export interface TransferUiState {
@@ -43,9 +46,9 @@ export const INITIAL_TRANSFER_UI: TransferUiState = { phase: 'idle', preview: nu
 export type TransferUiUpdate = (change: (state: TransferUiState) => TransferUiState) => void;
 
 /** The words for a refused import. */
-export function importFailureText(result: Extract<RsResult<unknown>, { ok: false }>): string {
-  const why = result.code === 'invalid-config' ? configIssueText(result.issue) : errorText(result.code);
-  return `Import qilinmadi: ${why}`;
+export function importFailureText(result: Extract<RsResult<unknown>, { ok: false }>, i18n: I18n = UZ): string {
+  const why = result.code === 'invalid-config' ? configIssueText(result.issue, i18n) : errorText(result.code, i18n);
+  return i18n.t.rules.importFailed(why);
 }
 
 export interface TransferController {
@@ -62,61 +65,128 @@ export interface TransferController {
   readonly focusDone: () => void;
 }
 
-export function createTransferController(rs: TransferApi, update: TransferUiUpdate, current: () => TransferUiState): TransferController {
+/** `i18n` is read when an outcome is written, so a message is in the language of that moment. */
+export function createTransferController(
+  rs: TransferApi,
+  update: TransferUiUpdate,
+  current: () => TransferUiState,
+  i18n: () => I18n = () => UZ,
+): TransferController {
   return {
     startImport: async () => {
       if (current().phase !== 'idle') return;
       update((state) => ({ ...state, phase: 'importing', preview: null, feedback: null }));
       const result = await rs.importConfig();
+      const words = i18n();
       update((state) => {
-        if (!result.ok) return { ...state, phase: 'idle', feedback: { tone: 'danger', text: importFailureText(result) } };
+        if (!result.ok) return { ...state, phase: 'idle', feedback: { tone: 'danger', text: importFailureText(result, words) } };
         // Cancelled dialog: nothing changes.
         if (result.value === null) return { ...state, phase: 'idle' };
         return { ...state, phase: 'idle', preview: { token: result.value.token, config: result.value.config } };
       });
     },
     cancelImport: () => {
-      update((state) => (state.preview === null || state.phase === 'applying' ? state : { ...state, preview: null, focusImport: true }));
+      cancelPreview(update);
     },
     dismiss: () => {
       update((state) => (state.preview === null || state.phase === 'applying' ? state : { ...state, preview: null }));
     },
-    confirmImport: async (token) => {
-      const state = current();
-      // Only the file being asked about, and only once.
-      if (state.phase !== 'idle' || state.preview?.token !== token) return;
-      const rules = state.preview.config.rules.length;
-      update((next) => ({ ...next, phase: 'applying', feedback: null }));
-      const result = await rs.applyImport(token);
-      // The token is used up either way: the confirmation closes.
-      update((next) => ({
-        ...next,
-        phase: 'idle',
-        preview: null,
-        focusImport: true,
-        feedback: result.ok
-          ? { tone: 'success', text: `Config import qilindi: ${String(rules)} ta qoida.` }
-          : { tone: 'danger', text: result.code === 'import-expired' ? `Import qilinmadi: ${errorText(result.code)}` : `Config almashtirilmadi: ${errorText(result.code)}` },
-      }));
-    },
+    confirmImport: (token) => confirmPreview(rs, token, update, current, i18n),
     startExport: async () => {
       if (current().phase !== 'idle') return;
       update((state) => ({ ...state, phase: 'exporting', feedback: null }));
       const result = await rs.exportConfig();
+      const words = i18n();
       update((state) => ({
         ...state,
         phase: 'idle',
         feedback: !result.ok
-          ? { tone: 'danger', text: `Export qilinmadi: ${errorText(result.code)}` }
+          ? { tone: 'danger', text: words.t.rules.exportFailed(errorText(result.code, words)) }
           : result.value === null
             ? null
-            : { tone: 'success', text: `Config faylga saqlandi: ${String(result.value.rules)} ta qoida.` },
+            : { tone: 'success', text: words.t.rules.exported(result.value.rules) },
       }));
     },
     focusDone: () => {
       update((state) => (state.focusImport ? { ...state, focusImport: false } : state));
     },
   };
+}
+
+/**
+ * "Almashtirish" of a preview (an import or a restore): replaces the stored
+ * config with the previewed one, once — only the preview being asked about.
+ * The token is used up either way: the confirmation closes.
+ */
+export async function confirmPreview(
+  rs: Pick<RsApi, 'applyImport'>,
+  token: string,
+  update: TransferUiUpdate,
+  current: () => TransferUiState,
+  i18n: () => I18n = () => UZ,
+): Promise<void> {
+  const state = current();
+  if (state.phase !== 'idle' || state.preview?.token !== token) return;
+  const rules = state.preview.config.rules.length;
+  const fromBackup = state.preview.source?.kind === 'backup';
+  update((next) => ({ ...next, phase: 'applying', feedback: null }));
+  const result = await rs.applyImport(token);
+  const words = i18n();
+  const t = words.t.rules;
+  update((next) => ({
+    ...next,
+    phase: 'idle',
+    preview: null,
+    focusImport: true,
+    feedback: result.ok
+      ? { tone: 'success', text: fromBackup ? words.t.backup.restored(rules) : t.imported(rules) }
+      : {
+          tone: 'danger',
+          text: (result.code === 'import-expired' ? t.importFailed : t.replaceFailed)(errorText(result.code, words)),
+        },
+  }));
+}
+
+/** "Bekor qilish" / Escape of a preview: forgets it; nothing is sent. */
+export function cancelPreview(update: TransferUiUpdate): void {
+  update((state) => (state.preview === null || state.phase === 'applying' ? state : { ...state, preview: null, focusImport: true }));
+}
+
+/**
+ * "Ko'rib chiqish" of the backup offer / "Zaxiradan tiklash": the main process
+ * reads the app's rules backup and hands it over like an imported file — the
+ * same preview, the same one-use token, the same "Almashtirish"
+ * (`confirmImport`). Nothing reaches the helper here. Ignored while busy.
+ */
+export async function startRestore(
+  rs: Pick<RsApi, 'restoreBackup'>,
+  savedAt: string,
+  update: TransferUiUpdate,
+  current: () => TransferUiState,
+  i18n: () => I18n = () => UZ,
+): Promise<void> {
+  if (current().phase !== 'idle') return;
+  update((state) => ({ ...state, phase: 'importing', preview: null, feedback: null }));
+  const result = await rs.restoreBackup();
+  const words = i18n();
+  update((state) =>
+    result.ok
+      ? { ...state, phase: 'idle', preview: { token: result.value.token, config: result.value.config, source: { kind: 'backup', savedAt } } }
+      : {
+          ...state,
+          phase: 'idle',
+          feedback: {
+            tone: 'danger',
+            text: words.t.backup.restoreFailed(result.code === 'invalid-config' ? configIssueText(result.issue, words) : errorText(result.code, words)),
+          },
+        },
+  );
+}
+
+/** The question of the confirmation for `preview`: a restore says which backup first. */
+export function previewQuestion(preview: ImportPreview, current: Config | null, now: number, i18n: I18n = UZ): string {
+  const question = importQuestion(importSummary(current, preview.config), i18n);
+  return preview.source?.kind === 'backup' ? `${i18n.t.backup.previewFrom(i18n.formatTime(preview.source.savedAt, now))} ${question}` : question;
 }
 
 // ---------------------------------------------------------------------------
@@ -223,15 +293,13 @@ export function importSummary(current: Config | null, next: Config): ImportSumma
 }
 
 /** The question of the confirmation. */
-export function importQuestion(summary: ImportSummary): string {
-  const now = summary.current === null ? '' : ` (hozir ${String(summary.current)} ta)`;
+export function importQuestion(summary: ImportSummary, i18n: I18n = UZ): string {
+  const t = i18n.t.rules;
   const parts = [
-    `Import joriy configni to'liq almashtiradi: ${String(summary.rules)} ta qoida${now}.`,
-    summary.current === null
-      ? ''
-      : `Qo'shiladi: ${String(summary.added)}, o'chiriladi: ${String(summary.removed)}, o'zgaradi: ${String(summary.changed)}, o'zgarmaydi: ${String(summary.unchanged)}.`,
-    summary.enabledChange === 'off' ? "Routing o'chiriladi." : summary.enabledChange === 'on' ? 'Routing yoqiladi.' : '',
-    summary.overridesChanged ? 'Interfeys almashtirishlari ham almashadi.' : '',
+    t.importReplaces(summary.rules, summary.current),
+    summary.current === null ? '' : t.importCounts(summary.added, summary.removed, summary.changed, summary.unchanged),
+    summary.enabledChange === 'off' ? t.importRoutingOff : summary.enabledChange === 'on' ? t.importRoutingOn : '',
+    summary.overridesChanged ? t.importOverrides : '',
   ];
   return parts.filter((part) => part !== '').join(' ');
 }
