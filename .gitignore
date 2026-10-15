@@ -5,6 +5,10 @@ node_modules/
 dist/
 out/
 build/
+# …except the app icon and its SVG source (electron-builder buildResources)
+!/build/
+/build/*
+!/build/app-resources/
 release/
 *.tsbuildinfo
 .vite/

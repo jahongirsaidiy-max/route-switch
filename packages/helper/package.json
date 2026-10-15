@@ -1,6 +1,7 @@
 {
   "name": "@routeswitch/helper",
-  "version": "0.0.0",
+  "version": "0.1.0",
+  "license": "MIT",
   "private": true,
   "description": "RouteSwitch root helper daemon",
   "type": "module",
@@ -12,6 +13,6 @@
     "start": "node --import \"data:text/javascript,import{registerHooks}from'node:module';registerHooks({resolve(s,c,n){try{return n(s,c)}catch(e){if(s.startsWith('.'))return n(s+'.ts',c);throw e}}})\" src/main.ts"
   },
   "dependencies": {
-    "@routeswitch/shared": "0.0.0"
+    "@routeswitch/shared": "0.1.0"
   }
 }

@@ -1,6 +1,7 @@
 {
   "name": "routeswitch",
-  "version": "0.0.0",
+  "version": "0.1.0",
+  "license": "MIT",
   "private": true,
   "description": "macOS menu bar app that routes chosen IPs, subnets and domains through a specific network interface",
   "type": "module",
