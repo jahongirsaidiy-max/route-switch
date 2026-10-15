@@ -59,6 +59,22 @@ import { Config, DEVICE_NAME, IfaceRole, LIMITS, findDuplicateIds } from './sche
  */
 export const PROTOCOL_VERSION = 4;
 
+/**
+ * Bounds of the routes the helper learns for wildcard domain rules from the
+ * DNS answers its proxy forwards (ADR-002 §4):
+ * - `perRule` / `total` — learned addresses kept per wildcard rule and for all
+ *   of them together; when full, the one seen longest ago is dropped and the
+ *   rule reports `addresses-truncated`;
+ * - `minTtlSec` / `maxTtlSec` — a learned address lives for the answer's TTL
+ *   clamped to this range, renewed by every answer that carries it again.
+ */
+export const LEARNED_ROUTE_LIMITS = {
+  perRule: 256,
+  total: 4096,
+  minTtlSec: 900,
+  maxTtlSec: 86_400,
+} as const;
+
 /** Size bounds that keep every message serialisable within `MAX_LINE_BYTES`. */
 export const PROTOCOL_LIMITS = {
   /** `error` of a failed response, in UTF-16 code units. */
@@ -67,8 +83,17 @@ export const PROTOCOL_LIMITS = {
   logMessageMaxLength: 2000,
   /** Human-readable `reason` of a rule state. */
   reasonMaxLength: 300,
-  /** `route(8)` destinations reported for one rule: the resolved IPs plus the DNS server route. */
-  maxAppliedDestinationsPerRule: LIMITS.maxIpsPerDomain + 1,
+  /**
+   * `route(8)` destinations reported for one rule: the resolved (or, for a
+   * wildcard rule, learned) IPs plus the DNS server route.
+   */
+  maxAppliedDestinationsPerRule: Math.max(LIMITS.maxIpsPerDomain, LEARNED_ROUTE_LIMITS.perRule) + 1,
+  /**
+   * `appliedDestinations` of all rules of one state together: every rule with
+   * its DNS server and the addresses of a domain, plus every learned address.
+   * Keeps the largest state far below `STRUCTURE_LIMITS.maxNodes`.
+   */
+  maxAppliedDestinations: LIMITS.maxRules * (LIMITS.maxIpsPerDomain + 1) + LEARNED_ROUTE_LIMITS.total,
   /** Network adapters listed in `EngineState.adapters`. */
   maxAdapters: 32,
   /** Hardware port name of an adapter, e.g. `USB 10/100/1000 LAN`. */
@@ -408,6 +433,15 @@ export const EngineState = z
       }
       seenDevices.add(adapter.device);
     });
+    const listed = rules.reduce((sum, rule) => sum + rule.appliedDestinations.length, 0);
+    if (listed > PROTOCOL_LIMITS.maxAppliedDestinations) {
+      ctx.issues.push({
+        code: 'custom',
+        message: `The rules list ${String(listed)} applied destinations, more than ${String(PROTOCOL_LIMITS.maxAppliedDestinations)}`,
+        input: listed,
+        path: ['rules'],
+      });
+    }
     for (const { first, second } of findDuplicateIds(rules.map((rule) => ({ id: rule.ruleId })))) {
       const ruleId = rules[second]?.ruleId ?? '';
       ctx.issues.push({

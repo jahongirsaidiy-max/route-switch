@@ -11,6 +11,7 @@ import {
   type ReconcileOptions,
   type ReconcileOutcome,
   type RetryNeeds,
+  type SubscribeOptions,
   type StateListener,
 } from './engine';
 import { CommandRejectedError, type ProcessExit, type ProcessHandlers, type ProcessSpawner } from './exec';
@@ -178,6 +179,8 @@ interface FakeEngine extends Pick<
   readonly forgotten: DriftedRoute[][];
   applied: AppliedRoute[];
   needs: RetryNeeds;
+  /** The options of every `subscribe` call. */
+  readonly subscriptions: (SubscribeOptions | undefined)[];
   reconciling: boolean;
   seq: number;
   /** Tells the subscribers that a pass ended. */
@@ -201,7 +204,8 @@ const createFakeEngine = (order: string[]): FakeEngine => {
     calls: [],
     forgotten: [],
     applied: [],
-    needs: { deferred: 0, refused: 0, failing: 0 },
+    needs: { deferred: 0, refused: 0, failing: 0, learnedExpired: 0 },
+    subscriptions: [],
     reconciling: false,
     seq: 0,
     onReconcile: null,
@@ -224,7 +228,8 @@ const createFakeEngine = (order: string[]): FakeEngine => {
     },
     isReconciling: () => fake.reconciling,
     getRetryNeeds: () => fake.needs,
-    subscribe: (listener) => {
+    subscribe: (listener, options) => {
+      fake.subscriptions.push(options);
       listeners.add(listener);
       return () => {
         listeners.delete(listener);
@@ -1033,17 +1038,17 @@ describe('network monitor: drift check', () => {
   it('retries refused or failing routes every 10th check only', async () => {
     const h = setup();
     h.monitor.start();
-    h.engine.needs = { deferred: 0, refused: 1, failing: 0 };
+    h.engine.needs = { deferred: 0, refused: 1, failing: 0, learnedExpired: 0 };
     await h.pass((RETRY_EVERY_DRIFT_CHECKS - 1) * DRIFT_INTERVAL_MS, 1000);
     expect(h.engine.calls).toEqual([]);
     await h.pass(DRIFT_INTERVAL_MS, 1000);
     expect(h.engine.calls).toEqual([{ reason: 'drift-check', options: { retryRefused: true } }]);
 
-    h.engine.needs = { deferred: 0, refused: 0, failing: 2 };
+    h.engine.needs = { deferred: 0, refused: 0, failing: 2, learnedExpired: 0 };
     await h.pass(RETRY_EVERY_DRIFT_CHECKS * DRIFT_INTERVAL_MS, 1000);
     expect(h.engine.calls).toHaveLength(2);
 
-    h.engine.needs = { deferred: 0, refused: 0, failing: 0 };
+    h.engine.needs = { deferred: 0, refused: 0, failing: 0, learnedExpired: 0 };
     await h.pass(2 * RETRY_EVERY_DRIFT_CHECKS * DRIFT_INTERVAL_MS, 5000);
     expect(h.engine.calls).toHaveLength(2);
   });
@@ -1051,7 +1056,7 @@ describe('network monitor: drift check', () => {
   it('reconciles with a fresh detection while routes are deferred, less and less often', async () => {
     const h = setup();
     h.monitor.start();
-    h.engine.needs = { deferred: 3, refused: 0, failing: 0 };
+    h.engine.needs = { deferred: 3, refused: 0, failing: 0, learnedExpired: 0 };
     const at: number[] = [];
     for (let check = 1; check <= 40; check += 1) {
       const before = h.engine.calls.length;
@@ -1063,10 +1068,10 @@ describe('network monitor: drift check', () => {
     expect(h.engine.calls.every((call) => call.reason === 'drift-check' && call.options?.force === true)).toBe(true);
 
     // Nothing deferred any more: back to nothing, and the next deferral starts from every check.
-    h.engine.needs = { deferred: 0, refused: 0, failing: 0 };
+    h.engine.needs = { deferred: 0, refused: 0, failing: 0, learnedExpired: 0 };
     await h.pass(DRIFT_INTERVAL_MS, 5000);
     const count = h.engine.calls.length;
-    h.engine.needs = { deferred: 1, refused: 0, failing: 0 };
+    h.engine.needs = { deferred: 1, refused: 0, failing: 0, learnedExpired: 0 };
     await h.pass(DRIFT_INTERVAL_MS, 5000);
     expect(h.engine.calls).toHaveLength(count + 1);
   });
@@ -1078,8 +1083,86 @@ describe('network monitor: drift check', () => {
     stubNetstat(h, { stdout: table(ROW_HOST, ROW_NET) });
     await h.pass((RETRY_EVERY_DRIFT_CHECKS - 1) * DRIFT_INTERVAL_MS, 5000);
     stubNetstat(h, { stdout: table(ROW_HOST) });
-    h.engine.needs = { deferred: 1, refused: 1, failing: 0 };
+    h.engine.needs = { deferred: 1, refused: 1, failing: 0, learnedExpired: 0 };
     await h.pass(DRIFT_INTERVAL_MS, 5000);
     expect(h.engine.calls).toEqual([{ reason: 'drift-check', options: { retryRefused: true, force: true } }]);
+  });
+
+  it('reconciles on every check while learned addresses have expired (wildcard rules)', async () => {
+    const h = setup();
+    h.monitor.start();
+    h.engine.needs = { deferred: 0, refused: 0, failing: 0, learnedExpired: 2 };
+    await h.pass(DRIFT_INTERVAL_MS, 5000);
+    expect(h.engine.calls).toEqual([{ reason: 'drift-check', options: {} }]);
+    expect(h.logs('debug', 'reconcile requested by the monitor finished')[0]?.context).toMatchObject({ why: ['learned-expired'] });
+
+    h.engine.needs = { deferred: 0, refused: 0, failing: 0, learnedExpired: 0 };
+    await h.pass(3 * DRIFT_INTERVAL_MS, 5000);
+    expect(h.engine.calls).toHaveLength(1);
+  });
+
+  it('hears of every pass end, also of the dns-learned passes the engine announces coalesced', () => {
+    const h = setup();
+    h.monitor.start();
+    expect(h.engine.subscriptions).toEqual([{ everyPass: true }]);
+  });
+
+  it('removes an expired learned route through the real engine on the drift timer', async () => {
+    const scheduler = createFakeScheduler(NOW);
+    const runner = createFakeCommandRunner();
+    const logger = createLogger({ sinks: [], now: scheduler.now });
+    const netinfo: NetInfo = { detectInterfaces: () => Promise.resolve(NETWORK), invalidate: () => undefined };
+    const calls: string[] = [];
+    const wildcard: Rule = { id: ruleId(40), enabled: true, kind: 'domain', target: '*.corp.local', iface: 'ethernet', refreshSec: 600 };
+    const engine = createEngine({
+      netinfo,
+      routes: {
+        routeAdd: (request) => {
+          calls.push(`add ${request.dst}`);
+          return Promise.resolve({ ok: true, outcome: 'added', dst: request.dst, kind: 'host', gateway: request.gateway });
+        },
+        routeDelete: (request) => {
+          calls.push(`delete ${request.dst}`);
+          return Promise.resolve({ ok: true, outcome: 'deleted', dst: request.dst, kind: 'host' });
+        },
+      },
+      logger,
+      helperVersion: '0.0.0',
+      initialConfig: config([wildcard]),
+      now: scheduler.now,
+      setTimer: scheduler.setTimer,
+      clearTimer: scheduler.clearTimer,
+    });
+    await engine.reconcile('startup');
+    const monitor = createNetworkMonitor({
+      engine,
+      netinfo,
+      runner,
+      spawner: createFakeSpawner(),
+      logger,
+      setTimer: scheduler.setTimer,
+      clearTimer: scheduler.clearTimer,
+      now: () => scheduler.now().getTime(),
+      monotonicNow: () => scheduler.now().getTime() - NOW.getTime() + MONOTONIC_START,
+    });
+    monitor.start();
+    const learned = engine.learn(ruleId(40), ['172.16.20.1'], 60);
+    await flush();
+    expect((await learned).outcome).toBe('applied');
+    expect(calls).toEqual(['add 172.16.20.1']);
+    runner.when('/usr/sbin/netstat', ['-rn', '-f', 'inet'], { stdout: table('172.16.20.1        10.20.4.1          UGHS           en5') });
+
+    for (let done = 0; done < 14 * DRIFT_INTERVAL_MS; done += 5000) {
+      scheduler.advance(5000);
+      await flush();
+    }
+    expect(calls).toEqual(['add 172.16.20.1']);
+    for (let done = 0; done < 2 * DRIFT_INTERVAL_MS; done += 5000) {
+      scheduler.advance(5000);
+      await flush();
+    }
+    expect(calls).toEqual(['add 172.16.20.1', 'delete 172.16.20.1']);
+    expect(engine.getApplied()).toEqual([]);
+    monitor.stop();
   });
 });

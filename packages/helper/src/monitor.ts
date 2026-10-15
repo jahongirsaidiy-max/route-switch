@@ -46,7 +46,9 @@ import { expandNetstatDestination, type NetInfo } from './netinfo';
  * - while the last pass deferred routes (`summary.deferred > 0`: the detection
  *   could not be trusted and the engine's own retries are used up), a pass
  *   with a fresh detection, every check at first and then less often (up to
- *   every `DEFERRED_RETRY_MAX_CHECKS`-th).
+ *   every `DEFERRED_RETRY_MAX_CHECKS`-th);
+ * - when learned addresses of wildcard rules have expired
+ *   (`RetryNeeds.learnedExpired`), a pass that removes their routes.
  */
 
 /** Quiet time after the last network message before the reconcile. */
@@ -69,7 +71,7 @@ export const RESTART_MIN_DELAY_MS = 1000;
 export const RESTART_MAX_DELAY_MS = 60_000;
 /** A monitor process that ran this long before it died starts the restart delays from the beginning. */
 export const RESTART_RESET_AFTER_MS = 60_000;
-/** Bound of the routing table read by the drift check (≈ 16 500 routes of ours plus the system's). */
+/** Bound of the routing table read by the drift check (≈ 20 600 routes of ours, `MAX_APPLIED_ROUTES`, plus the system's). */
 export const DRIFT_MAX_TABLE_LINES = 40_000;
 const DRIFT_MAX_LINE_LENGTH = 512;
 const DRIFT_NETSTAT_TIMEOUT_MS = 10_000;
@@ -511,6 +513,10 @@ export const createNetworkMonitor = (deps: NetworkMonitorDeps): NetworkMonitor =
         options.retryRefused = true;
         why.push('retry-refused');
       }
+      if (needs.learnedExpired > 0) {
+        // Wildcard rules: learned addresses whose lifetime is over lose their routes in the pass.
+        why.push('learned-expired');
+      }
       if (needs.deferred > 0) {
         deferredWait += 1;
         if (deferredWait >= deferredGap) {
@@ -538,9 +544,13 @@ export const createNetworkMonitor = (deps: NetworkMonitorDeps): NetworkMonitor =
     if (started || stopped) return;
     started = true;
     lastTickAt = now();
-    unsubscribe = engine.subscribe(() => {
-      lastPassEndAt = clock();
-    });
+    // Every pass end counts, also those of `dns-learned` passes whose announcement the engine coalesces.
+    unsubscribe = engine.subscribe(
+      () => {
+        lastPassEndAt = clock();
+      },
+      { everyPass: true },
+    );
     logger.info('network monitor started', { driftIntervalMs: DRIFT_INTERVAL_MS, debounceMs: DEBOUNCE_MS });
     spawnChild(false);
     armDrift();

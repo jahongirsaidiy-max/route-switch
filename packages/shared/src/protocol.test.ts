@@ -20,6 +20,7 @@ import {
   Event,
   HelperVersionInfo,
   InterfaceState,
+  LEARNED_ROUTE_LIMITS,
   PROTOCOL_LIMITS,
   PROTOCOL_VERSION,
   RECONCILE_REASONS,
@@ -282,7 +283,9 @@ describe('constants', () => {
     expect(PROTOCOL_LIMITS.maxDnsWarnings).toBe(16);
     expect(PROTOCOL_LIMITS.maxDiagnoseAddresses).toBe(LIMITS.maxIpsPerDomain);
     expect(STRUCTURE_LIMITS).toEqual({ maxNodes: 65_536, maxArrayLength: 500, maxDepth: 12, maxStringLength: 4096 });
-    expect(PROTOCOL_LIMITS.maxAppliedDestinationsPerRule).toBe(LIMITS.maxIpsPerDomain + 1);
+    expect(PROTOCOL_LIMITS.maxAppliedDestinationsPerRule).toBe(LEARNED_ROUTE_LIMITS.perRule + 1);
+    expect(LEARNED_ROUTE_LIMITS).toEqual({ perRule: 256, total: 4096, minTtlSec: 900, maxTtlSec: 86_400 });
+    expect(LEARNED_ROUTE_LIMITS.perRule).toBeGreaterThan(LIMITS.maxIpsPerDomain);
   });
 
   it('keeps the codec error codes inside the protocol error codes', () => {
@@ -821,7 +824,7 @@ describe('RuleState', () => {
       {
         appliedDestinations: Array.from(
           { length: PROTOCOL_LIMITS.maxAppliedDestinationsPerRule + 1 },
-          (_unused, index) => `10.0.0.${String(index + 1)}`,
+          (_unused, index) => `10.0.${String(Math.floor(index / 200))}.${String((index % 200) + 1)}`,
         ),
       },
     ],
@@ -833,7 +836,7 @@ describe('RuleState', () => {
   it('accepts the maximum number of applied destinations', () => {
     const appliedDestinations = Array.from(
       { length: PROTOCOL_LIMITS.maxAppliedDestinationsPerRule },
-      (_unused, index) => `10.0.0.${String(index + 1)}`,
+      (_unused, index) => `10.0.${String(Math.floor(index / 200))}.${String((index % 200) + 1)}`,
     );
     expect(RuleState.safeParse(ruleStateInput({ appliedDestinations })).success).toBe(true);
   });
@@ -1150,6 +1153,18 @@ describe('message sizes', () => {
     })),
   });
 
+  /**
+   * Destinations listed for rule `index` of the largest state: every rule
+   * lists a domain's worth, the first ones the most a rule can, until all
+   * rules together list `PROTOCOL_LIMITS.maxAppliedDestinations`.
+   */
+  const destinationsOf = (index: number): number => {
+    const base = LIMITS.maxIpsPerDomain + 1;
+    const extra = PROTOCOL_LIMITS.maxAppliedDestinationsPerRule - base;
+    const spare = PROTOCOL_LIMITS.maxAppliedDestinations - LIMITS.maxRules * base;
+    return base + Math.max(0, Math.min(extra, spare - index * extra));
+  };
+
   const largestState = (): Record<string, unknown> => ({
     helperVersion: `1.2.3-${'a'.repeat(PROTOCOL_LIMITS.helperVersionMaxLength - 6)}`,
     seq: Number.MAX_SAFE_INTEGER,
@@ -1170,8 +1185,8 @@ describe('message sizes', () => {
       reasonCode: 'forbidden-destination',
       reason: escaped(PROTOCOL_LIMITS.reasonMaxLength),
       appliedDestinations: Array.from(
-        { length: PROTOCOL_LIMITS.maxAppliedDestinationsPerRule },
-        (_inner, octet) => `255.255.255.${String(100 + octet)}/32`,
+        { length: destinationsOf(index) },
+        (_inner, octet) => `255.255.${String(200 + Math.floor(octet / 100))}.${String(100 + (octet % 100))}/32`,
       ),
       lastResolvedAt: AT,
     })),
@@ -1237,12 +1252,25 @@ describe('message sizes', () => {
   });
 
   it('fits the largest possible state event in one line', () => {
-    const state = EngineState.safeParse(largestState());
+    const largest = largestState();
+    const rules = largest['rules'] as { appliedDestinations: string[] }[];
+    expect(rules.reduce((sum, rule) => sum + rule.appliedDestinations.length, 0)).toBe(PROTOCOL_LIMITS.maxAppliedDestinations);
+    expect(rules[0]?.appliedDestinations).toHaveLength(PROTOCOL_LIMITS.maxAppliedDestinationsPerRule);
+    const state = EngineState.safeParse(largest);
     if (!state.success) throw new Error(state.error.message);
 
     const bytes = new TextEncoder().encode(encodeJsonLine({ event: 'state', state: state.data })).length;
     expect(bytes).toBeGreaterThan(1_000_000);
     expect(bytes).toBeLessThan(MAX_LINE_BYTES / 2);
+  });
+
+  it('refuses a state whose rules list more applied destinations than all routes the helper can hold', () => {
+    const largest = largestState();
+    const rules = largest['rules'] as { appliedDestinations: string[] }[];
+    rules.at(-1)?.appliedDestinations.push('10.9.9.9');
+    const result = EngineState.safeParse(largest);
+    expect(result.success).toBe(false);
+    expect(result.error?.issues.map((issue) => issue.path)).toEqual([['rules']]);
   });
 });
 

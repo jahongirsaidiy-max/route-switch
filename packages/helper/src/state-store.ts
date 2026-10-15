@@ -1,9 +1,9 @@
 import { constants } from 'node:fs';
 import * as nodeFs from 'node:fs/promises';
 
-import { PATHS, PROTOCOL_LIMITS, LIMITS } from '@routeswitch/shared';
+import { PATHS } from '@routeswitch/shared';
 
-import type { AppliedRoute } from './engine';
+import { MAX_APPLIED_ROUTES, type AppliedRoute } from './engine';
 import type { Logger } from './logger';
 
 /**
@@ -31,8 +31,8 @@ import type { Logger } from './logger';
  */
 
 export const STATE_VERSION = 1;
-/** Every route the engine can hold: 500 rules with up to 33 destinations each. */
-export const MAX_STATE_ROUTES = LIMITS.maxRules * PROTOCOL_LIMITS.maxAppliedDestinationsPerRule;
+/** Every route the engine can hold (`MAX_APPLIED_ROUTES`: the rules' routes plus every learned address). */
+export const MAX_STATE_ROUTES = MAX_APPLIED_ROUTES;
 /** Far above the largest real file (≈ 2 MB with every route and rule id); anything larger is not read. */
 export const MAX_STATE_BYTES = 8 * 1024 * 1024;
 const FILE_MODE = 0o644;
