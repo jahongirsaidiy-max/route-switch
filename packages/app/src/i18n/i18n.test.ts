@@ -95,8 +95,22 @@ describe('the dictionary', () => {
     const uzTexts = new Map(leaves(uz).filter(([, value]) => typeof value === 'string'));
     for (const locale of ['ru', 'en'] as const) {
       const same = leaves(MESSAGES[locale]).filter(([path, value]) => typeof value === 'string' && uzTexts.get(path) === value);
-      // Only words that are the same in a language: the field name `id` (and English "DNS server").
-      expect(same.map(([path]) => path)).toEqual(locale === 'en' ? ['configFile.fields.id', 'configFile.fields.dns'] : ['configFile.fields.id']);
+      // Only words that are the same in a language: the field name `id` (and English "DNS server"), the "Helper"
+      // heading, the English "DEFAULT" tag. Each screen's task adds its own (one entry per line, merge-friendly).
+      const allowed = new Set<string>([
+        'configFile.fields.id',
+        ...(locale === 'en' ? ['configFile.fields.dns'] : []),
+        'settings.helper.title',
+        ...(locale === 'en' ? ['components.iface.defaultTag'] : []),
+        'rules.kinds.ip',
+        'addRule.kinds.ip',
+        ...(locale === 'en' ? ['rules.import'] : []),
+        ...(locale === 'en' ? ['rules.export'] : []),
+        ...(locale === 'en' ? ['rules.kinds.subnet'] : []),
+        ...(locale === 'en' ? ['addRule.kinds.subnet'] : []),
+        ...(locale === 'en' ? ['addRule.targetField.subnet.label'] : []),
+      ]);
+      expect(same.map(([path]) => path).filter((path) => !allowed.has(path))).toEqual([]);
     }
   });
 

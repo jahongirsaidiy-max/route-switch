@@ -462,3 +462,60 @@ describe('followServiceOrderView (TASK-DELTA-08)', () => {
     expect(view.shows.size).toBe(0);
   });
 });
+
+describe('SettingsPanel: every language (TASK-DELTA-14)', () => {
+  it('speaks Uzbek without a language, as before', () => {
+    const html = render();
+    expect(html).toContain('Sozlamalar');
+    expect(html).toContain('Ethernet adapteri');
+    expect(html).toContain('(hozir: en5)');
+    expect(html).toContain('aria-label="Login&#x27;da ishga tushirish"');
+  });
+
+  it.each([
+    ['ru', ['Настройки', 'Запуск при входе', 'Адаптер Ethernet', '(сейчас: en5)', 'Автоматически', 'en7 · Thunderbolt Ethernet · Нет IP', 'Wi‑Fi по умолчанию', 'Сейчас первая: USB 10/100/1000 LAN.', 'Копировать', 'Обновить', 'Удалить helper', 'Helper работает']],
+    ['en', ['Settings', 'Open at login', 'Ethernet adapter', '(now: en5)', 'Automatic', 'en7 · Thunderbolt Ethernet · No IP', 'Make Wi‑Fi the default', 'First now: USB 10/100/1000 LAN.', 'Copy', 'Refresh', 'Remove the helper', 'Helper is running']],
+  ] as const)('%s: every card, the hints and the buttons', (locale, words) => {
+    const html = render({ i18n: i18nFor(locale) });
+    for (const word of words) expect(html).toContain(word);
+    for (const uzbek of ['Sozlamalar', 'Nusxalash', 'Avtomatik', 'adapteri', 'Yangilash']) expect(html).not.toContain(uzbek);
+  });
+
+  it('the networksetup command is shown as it is, in every language', () => {
+    for (const locale of ['uz', 'ru', 'en'] as const) {
+      expect(render({ i18n: i18nFor(locale) })).toContain('sudo networksetup -ordernetworkservices &#x27;Wi-Fi&#x27; &#x27;USB 10/100/1000 LAN&#x27;');
+    }
+  });
+
+  it('the Wi‑Fi default note, a missing adapter and a helper that is not connected', () => {
+    const ru = i18nFor('ru');
+    const first = render({ i18n: ru, serviceOrder: { phase: 'ready', order: { ...ORDER, wifiFirst: true }, feedback: null } });
+    expect(first).toContain('Wi-Fi уже первая — канал по умолчанию Wi‑Fi.');
+    expect(render({ i18n: ru, overrides: { ethernet: 'en9' } })).toContain('en9 · не подключён');
+    expect(render({ i18n: i18nFor('en'), engine: NOT_INSTALLED })).toContain('You can choose once the helper is connected.');
+    expect(render({ i18n: i18nFor('en'), serviceOrder: { phase: 'loading', order: null, feedback: null } })).toContain('Reading the service order…');
+  });
+
+  it('the uninstall question in Russian', () => {
+    const { elements } = treeOf({ i18n: i18nFor('ru'), confirmingUninstall: true });
+    expect(buttonsNamed(elements, 'Да, удалить')).toHaveLength(1);
+    expect(buttonsNamed(elements, 'Отмена')).toHaveLength(1);
+    expect(render({ i18n: i18nFor('ru'), confirmingUninstall: true })).toContain('Действительно удалить helper?');
+  });
+
+  it('a failed service order read is worded in the language at the time of the answer', async () => {
+    let view: ServiceOrderView = { phase: 'loading', order: null, feedback: null };
+    const reader = followServiceOrderView(
+      { getServiceOrder: () => Promise.resolve({ ok: false, code: 'not-connected', error: 'x' } as const) },
+      (next) => {
+        view = next(view);
+      },
+      () => () => undefined,
+      () => i18nFor('en'),
+    );
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(view.feedback?.text).toBe(i18nFor('en').t.errors['not-connected']);
+    reader.stop();
+  });
+});

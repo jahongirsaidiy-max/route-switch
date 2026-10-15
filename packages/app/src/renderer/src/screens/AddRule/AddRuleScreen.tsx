@@ -10,10 +10,12 @@ import type { Config, IfaceRole, InterfaceState, RuleKind } from '@routeswitch/s
 import { useEffect, useMemo, useRef, useState, type ReactElement, type Ref } from 'react';
 
 import { Button, InterfaceOption, Segment, StatusDot } from '../../components';
+import type { I18n } from '../../../../i18n';
 import { useConfig, type ConfigView } from '../../hooks/useConfig';
 import { useEngineState, type EngineStateView } from '../../hooks/useEngineState';
+import { useI18n } from '../../hooks/useI18n';
 import type { RsApi } from '../../rs';
-import { errorText, HELPER_STATUS_TEXT } from '../../text';
+import { errorText, helperStatusText, UZ } from '../../text';
 import type { AddRuleApi } from './actions';
 import styles from './AddRuleScreen.module.css';
 import { createAddRuleController, initialAddRuleUi, type AddRuleController, type AddRuleUiState } from './controller';
@@ -22,8 +24,8 @@ import {
   checkForm,
   commandPreview,
   describeTest,
-  KIND_OPTIONS,
-  TARGET_FIELD,
+  kindOptions,
+  targetField,
   testAddressOf,
   type FieldErrors,
   type FormField,
@@ -59,6 +61,8 @@ export interface AddRulePanelProps {
   readonly onTest: (address: string) => void;
   /** The input of a field, so the focus can move to the first refused one. */
   readonly fieldRef?: ((field: FormField) => Ref<HTMLInputElement>) | undefined;
+  /** The UI language (`useI18n()`); Uzbek when not given. */
+  readonly i18n?: I18n | undefined;
 }
 
 const MESSAGE_ID: Readonly<Record<FormField, string>> = {
@@ -79,9 +83,10 @@ export function visibleErrors(errors: FieldErrors, ui: Pick<AddRuleUiState, 'tou
   return shown;
 }
 
-/** "har 10 daqiqada" / "har 90 soniyada" for the refresh hint. */
-export function refreshText(seconds: number): string {
-  return seconds % 60 === 0 ? `har ${String(seconds / 60)} daqiqada` : `har ${String(seconds)} soniyada`;
+/** "IP'lar har 10 daqiqada yangilanadi." / "… har 90 soniyada …" — the refresh hint. */
+export function refreshText(seconds: number, i18n: I18n = UZ): string {
+  const words = i18n.t.addRule;
+  return seconds % 60 === 0 ? words.refreshMinutes(seconds / 60) : words.refreshSeconds(seconds);
 }
 
 function Message({ field, error, hint }: { readonly field: FormField; readonly error: string | undefined; readonly hint: string | null }) {
@@ -102,13 +107,14 @@ const inputProps = (field: FormField, error: string | undefined, props: AddRuleP
   },
 });
 
-function TestRow(props: AddRulePanelProps & { readonly target: string | null }): ReactElement {
-  const { ui, config, engine, ruleId } = props;
+function TestRow(props: AddRulePanelProps & { readonly target: string | null; readonly i18n: I18n }): ReactElement {
+  const { ui, config, engine, ruleId, i18n } = props;
+  const t = i18n.t.addRule;
   const stored = config?.rules.find((rule) => rule.id === ruleId) ?? null;
   const ruleState = engine.state?.rules.find((state) => state.ruleId === ruleId) ?? null;
   const saved = stored === null ? null : { target: stored.target, kind: stored.kind, dns: stored.dns ?? null, state: ruleState };
   const connected = engine.helper === 'connected';
-  const subject = connected ? testAddressOf(ui.form.kind, props.target, saved) : { reason: "Helper bilan aloqa yo'q." };
+  const subject = connected ? testAddressOf(ui.form.kind, props.target, saved, i18n) : { reason: t.testNoHelper };
   const address = 'address' in subject ? subject.address : null;
   const test = ui.test;
   const current = address !== null && test.phase !== 'idle' && test.address === address ? test : null;
@@ -120,30 +126,30 @@ function TestRow(props: AddRulePanelProps & { readonly target: string | null }):
         variant="secondary"
         busy={current?.phase === 'running'}
         disabled={address === null}
-        label={address === null ? `Sinab ko'rish — ${'reason' in subject ? subject.reason : ''}` : `${address} manzilini sinab ko'rish`}
+        label={address === null ? t.testOff('reason' in subject ? subject.reason : '') : t.testAddress(address)}
         onClick={() => {
           if (address !== null) props.onTest(address);
         }}
       >
-        Sinab ko'rish
+        {t.test}
       </Button>
       <div className={styles['testResult']} role="status">
         {address === null ? (
           <span className={styles['muted']}>{'reason' in subject ? subject.reason : ''}</span>
         ) : current === null ? (
-          <span className={styles['muted']}>{address} hozir qaysi interfeys orqali ketishini tekshiradi (route -n get).</span>
+          <span className={styles['muted']}>{t.testIdle(address)}</span>
         ) : current.phase === 'running' ? (
-          <span className={styles['muted']}>{address} tekshirilmoqda…</span>
+          <span className={styles['muted']}>{t.testRunning(address)}</span>
         ) : current.phase === 'failed' ? (
           <span data-tone="danger">{current.text}</span>
         ) : (
           (() => {
-            const summary = describeTest(current.result, ui.form.iface, ruleId, savedAsTyped);
+            const summary = describeTest(current.result, ui.form.iface, ruleId, savedAsTyped, i18n);
             return (
               <>
                 <span className={styles['testRoute']}>{summary.route}</span>
                 <span className={styles['testVerdict']} data-tone={summary.tone}>
-                  <StatusDot tone={summary.tone} size="sm" label={summary.tone === 'success' ? 'Mos' : 'Mos emas'} />
+                  <StatusDot tone={summary.tone} size="sm" label={summary.tone === 'success' ? t.testMatch : t.testMismatch} />
                   {summary.verdict}
                 </span>
               </>
@@ -155,32 +161,29 @@ function TestRow(props: AddRulePanelProps & { readonly target: string | null }):
   );
 }
 
-function FormBody(props: AddRulePanelProps): ReactElement {
-  const { ui, config, engine } = props;
+function FormBody(props: AddRulePanelProps & { readonly i18n: I18n }): ReactElement {
+  const { ui, config, engine, i18n } = props;
+  const t = i18n.t.addRule;
   const form = ui.form;
-  const check = checkForm(form, props.ruleId, config);
+  const check = checkForm(form, props.ruleId, config, i18n);
   const errors = visibleErrors(check.errors, ui);
-  const field = TARGET_FIELD[form.kind];
+  const field = targetField(form.kind, i18n);
   const interfaces = engine.helper === 'connected' ? (engine.state?.interfaces ?? null) : null;
   // The preview and the test use the target only once the shared normaliser accepts it.
   const { target, dns } = acceptedValues(form);
-  const preview = commandPreview(form.kind, target, dns, form.iface, interfaces);
+  const preview = commandPreview(form.kind, target, dns, form.iface, interfaces, i18n);
   const refresh = Number(form.refreshSec.trim());
   const targetHint =
-    check.normalisedTarget !== null
-      ? `${check.normalisedTarget} sifatida saqlanadi.`
-      : check.sameAs !== null
-        ? `Bu manzil «${check.sameAs}» qoidasida ham bor (shu interfeys) — ikkinchi qoida ortiqcha.`
-        : field.hint;
+    check.normalisedTarget !== null ? t.normalised(check.normalisedTarget) : check.sameAs !== null ? t.sameAs(check.sameAs) : field.hint;
 
   return (
     <>
       <div className={styles['body']}>
         <div className={styles['field']}>
           <span id="add-rule-kind" className={styles['label']}>
-            Turi
+            {t.kindLabel}
           </span>
-          <Segment label="Turi" options={KIND_OPTIONS} value={form.kind} onChange={props.onKind} />
+          <Segment label={t.kindLabel} options={kindOptions(i18n)} value={form.kind} onChange={props.onKind} />
         </div>
 
         <label className={styles['field']}>
@@ -214,11 +217,11 @@ function FormBody(props: AddRulePanelProps): ReactElement {
                   props.onField('useDns', event.target.checked);
                 }}
               />
-              <span>Ichki DNS server orqali resolve qilish</span>
+              <span>{t.useDns}</span>
             </label>
             {form.useDns ? (
               <label className={styles['dnsField']}>
-                <span className={styles['visuallyHidden']}>DNS server manzili</span>
+                <span className={styles['visuallyHidden']}>{t.dnsAddress}</span>
                 <input
                   type="text"
                   className={styles['input']}
@@ -238,7 +241,7 @@ function FormBody(props: AddRulePanelProps): ReactElement {
               </label>
             ) : null}
             <label className={styles['refreshField']}>
-              <span>IP'larni yangilash oralig'i (soniya)</span>
+              <span>{t.refreshLabel}</span>
               <input
                 type="text"
                 inputMode="numeric"
@@ -258,17 +261,15 @@ function FormBody(props: AddRulePanelProps): ReactElement {
             </label>
             <Message field="refreshSec" error={errors.refreshSec} hint={null} />
             <div className={styles['hint']}>
-              {form.useDns && target !== null ? `/etc/resolver/${target} fayli yaratiladi. ` : ''}
-              {errors.refreshSec === undefined && check.errors.refreshSec === undefined
-                ? `IP'lar ${refreshText(refresh)} yangilanadi.`
-                : ''}
+              {form.useDns && target !== null ? t.resolverFile(target) : ''}
+              {errors.refreshSec === undefined && check.errors.refreshSec === undefined ? refreshText(refresh, i18n) : ''}
             </div>
           </div>
         ) : null}
 
         <div className={styles['field']} role="group" aria-labelledby="add-rule-iface">
           <span id="add-rule-iface" className={styles['label']}>
-            Interfeys
+            {t.ifaceLabel}
           </span>
           <div className={styles['ifaces']}>
             {ROLES.map((role) => (
@@ -278,19 +279,20 @@ function FormBody(props: AddRulePanelProps): ReactElement {
                 iface={interfaces?.[role] ?? UNKNOWN_INTERFACE}
                 selected={form.iface === role}
                 onSelect={props.onIface}
+                i18n={i18n}
               />
             ))}
           </div>
         </div>
 
         <label className={styles['field']}>
-          <span className={styles['label']}>Izoh</span>
+          <span className={styles['label']}>{t.noteLabel}</span>
           <input
             type="text"
             className={styles['input']}
             data-size="md"
             value={form.note}
-            placeholder="Masalan: buxgalteriya tizimi"
+            placeholder={t.notePlaceholder}
             aria-describedby={errors.note === undefined ? undefined : MESSAGE_ID.note}
             {...inputProps('note', errors.note, props)}
             onChange={(event) => {
@@ -303,7 +305,7 @@ function FormBody(props: AddRulePanelProps): ReactElement {
 
       <div className={styles['preview']} role="group" aria-labelledby="add-rule-preview">
         <span id="add-rule-preview" className={styles['previewLabel']}>
-          Helper qo'llaydigan buyruq — ko'rsatish uchun, ilova uni yuritmaydi
+          {t.previewLabel}
         </span>
         {preview.lines.map((line) => (
           <code key={line} className={styles['command']}>
@@ -311,18 +313,18 @@ function FormBody(props: AddRulePanelProps): ReactElement {
           </code>
         ))}
         {preview.note === null ? null : <span className={styles['previewNote']}>{preview.note}</span>}
-        <TestRow {...props} target={target} />
+        <TestRow {...props} target={target} i18n={i18n} />
       </div>
     </>
   );
 }
 
-const TITLES: Readonly<Record<AddRulePanelProps['mode'], string>> = { add: 'Yangi qoida', edit: 'Qoidani tahrirlash' };
-
 /** The dialog for given data; `AddRuleDialog` supplies the live data and the actions. */
 export function AddRulePanel(props: AddRulePanelProps): ReactElement {
   const { status, ui, engine } = props;
-  const helper = engine.helper === 'connected' ? null : HELPER_STATUS_TEXT[engine.helper];
+  const i18n = props.i18n ?? UZ;
+  const t = i18n.t.addRule;
+  const helper = engine.helper === 'connected' ? null : helperStatusText(engine.helper, i18n);
   const ready = status.kind === 'ready';
 
   return (
@@ -344,30 +346,26 @@ export function AddRulePanel(props: AddRulePanelProps): ReactElement {
       >
         <header className={styles['header']}>
           <h1 id="add-rule-title" className={styles['title']}>
-            {TITLES[props.mode]}
+            {t.titles[props.mode]}
           </h1>
           <p id="add-rule-subtitle" className={styles['subtitle']}>
-            Manzil va u qaysi kanal orqali borishini tanlang.
+            {t.subtitle}
           </p>
         </header>
 
         {helper === null ? null : (
           <p className={styles['banner']} role="status">
             <StatusDot tone={helper.tone} size="sm" label={helper.text} />
-            {helper.text} — qoidani saqlab bo'lmaydi.
+            {t.helperDown(helper.text)}
           </p>
         )}
 
         {ready ? (
-          <FormBody {...props} />
+          <FormBody {...props} i18n={i18n} />
         ) : (
           <div className={styles['body']} role={status.kind === 'loading' ? 'status' : 'alert'}>
             <p className={styles['statusText']}>
-              {status.kind === 'loading'
-                ? 'Qoida o\'qilmoqda…'
-                : status.kind === 'missing'
-                  ? "Bu qoida endi yo'q — boshqa oynada o'chirilgan bo'lishi mumkin."
-                  : status.text}
+              {status.kind === 'loading' ? t.loadingRule : status.kind === 'missing' ? t.missingRule : status.text}
             </p>
           </div>
         )}
@@ -381,11 +379,11 @@ export function AddRulePanel(props: AddRulePanelProps): ReactElement {
         <footer className={styles['footer']}>
           {/* While a save is on its way the form stays: its outcome (a refusal, say) is shown here. */}
           <Button size="lg" autoFocus={!ready} busy={ui.saving} onClick={props.onCancel}>
-            Bekor qilish
+            {t.cancel}
           </Button>
           {ready ? (
             <Button variant="primary" size="lg" type="submit" busy={ui.saving}>
-              Saqlash va qo'llash
+              {t.save}
             </Button>
           ) : null}
         </footer>
@@ -416,12 +414,13 @@ export function handleDialogEscape(event: DialogKeyEvent, saving: boolean, onCan
 }
 
 /** Why the form cannot be shown yet, from the live config. */
-export function formStatus(editor: RuleEditorTarget, config: ConfigView, loaded: boolean): FormStatus {
+export function formStatus(editor: RuleEditorTarget, config: ConfigView, loaded: boolean, i18n: I18n = UZ): FormStatus {
+  const t = i18n.t.addRule;
   if (editor.mode === 'add' || loaded) return { kind: 'ready' };
   if (config.config?.rules.some((rule) => rule.id === editor.id) === true) return { kind: 'loading' };
   if (config.phase === 'ready') return { kind: 'missing' };
-  if (config.phase === 'failed') return { kind: 'unavailable', text: `Qoidani o'qib bo'lmadi: ${config.error === null ? '' : errorText(config.error.code)}` };
-  if (config.phase === 'idle') return { kind: 'unavailable', text: "Helper bilan aloqa yo'q — qoidani o'qib bo'lmaydi." };
+  if (config.phase === 'failed') return { kind: 'unavailable', text: t.readFailed(config.error === null ? '' : errorText(config.error.code, i18n)) };
+  if (config.phase === 'idle') return { kind: 'unavailable', text: t.readNoHelper };
   return { kind: 'loading' };
 }
 
@@ -449,6 +448,10 @@ export function AddRuleDialog({ editor, onClose, rs: given, newId }: AddRuleDial
   const rs = given ?? window.rs;
   const engine = useEngineState(rs);
   const config = useConfig(rs);
+  const i18n = useI18n();
+  // The controller writes its messages in the language of the moment the outcome arrives.
+  const language = useRef(i18n);
+  language.current = i18n;
   // One id for the life of the dialog: changing the kind edits the same rule.
   const [ruleId] = useState(() => (editor.mode === 'edit' ? editor.id : (newId ?? (() => globalThis.crypto.randomUUID()))()));
   const [ui, setUi] = useState<AddRuleUiState>(() => initialAddRuleUi());
@@ -469,6 +472,7 @@ export function AddRuleDialog({ editor, onClose, rs: given, newId }: AddRuleDial
         () => {
           close.current();
         },
+        () => language.current,
       ),
     [rs, ruleId],
   );
@@ -517,7 +521,7 @@ export function AddRuleDialog({ editor, onClose, rs: given, newId }: AddRuleDial
     <AddRulePanel
       mode={editor.mode}
       ruleId={ruleId}
-      status={formStatus(editor, config, ui.loaded)}
+      status={formStatus(editor, config, ui.loaded, i18n)}
       engine={engine}
       config={config.config}
       ui={ui}
@@ -536,6 +540,7 @@ export function AddRuleDialog({ editor, onClose, rs: given, newId }: AddRuleDial
         void controller.runTest(address);
       }}
       fieldRef={fieldRef}
+      i18n={i18n}
     />
   );
 }

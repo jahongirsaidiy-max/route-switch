@@ -22,8 +22,9 @@ import {
   type TestResult,
 } from '@routeswitch/shared';
 
+import type { I18n } from '../../../../i18n';
 import { ROLE_LABELS } from '../../components';
-import { isValidationCode, VALIDATION_TEXT } from '../../text';
+import { isValidationCode, UZ } from '../../text';
 
 /** The fields that can carry an error of their own. */
 export type FormField = 'target' | 'dns' | 'refreshSec' | 'note';
@@ -76,43 +77,41 @@ export function formOfRule(rule: Rule): RuleForm {
   };
 }
 
-export const KIND_OPTIONS: readonly { readonly value: RuleKind; readonly label: string }[] = [
-  { value: 'ip', label: 'IP' },
-  { value: 'subnet', label: 'Subnet' },
-  { value: 'domain', label: 'Domen' },
-];
+const KINDS: readonly RuleKind[] = ['ip', 'subnet', 'domain'];
 
-/** Label, placeholder and hint of the address field, per kind (the design's words). */
+/** The kind segment's options in the UI language (`UZ` when not given). */
+export const kindOptions = (i18n: I18n = UZ): readonly { readonly value: RuleKind; readonly label: string }[] =>
+  KINDS.map((value) => ({ value, label: i18n.t.addRule.kinds[value] }));
+
+export const KIND_OPTIONS = kindOptions();
+
+/** Examples, not words: the same in every language. */
+const PLACEHOLDERS: Readonly<Record<RuleKind, string>> = { ip: '172.16.12.40', subnet: '10.0.0.0/8', domain: 'corp.local' };
+
+/** Label, placeholder and hint of the address field for a kind (the design's words), in the UI language. */
+export function targetField(kind: RuleKind, i18n: I18n = UZ): { readonly label: string; readonly placeholder: string; readonly hint: string } {
+  return { ...i18n.t.addRule.targetField[kind], placeholder: PLACEHOLDERS[kind] };
+}
+
 export const TARGET_FIELD: Readonly<Record<RuleKind, { readonly label: string; readonly placeholder: string; readonly hint: string }>> = {
-  ip: { label: 'IP manzil', placeholder: '172.16.12.40', hint: "Bitta host uchun route qo'shiladi." },
-  subnet: { label: 'Subnet (CIDR)', placeholder: '10.0.0.0/8', hint: 'Butun ichki tarmoq uchun eng ishonchli variant.' },
-  domain: {
-    label: 'Domen',
-    placeholder: 'corp.local',
-    hint: "Domen IP'ga resolve qilinib, har bir IP uchun route qo'shiladi.",
-  },
+  ip: targetField('ip'),
+  subnet: targetField('subnet'),
+  domain: targetField('domain'),
 };
 
 // ---------------------------------------------------------------------------
 // Words for the shared validation codes
 // ---------------------------------------------------------------------------
 
-/** Wildcard domains need a DNS proxy: out of the MVP (RouteSwitch.md §Maqsad va doira). */
-export const WILDCARD_TEXT = "Wildcard domen (*.corp.local) qo'llab-quvvatlanmaydi — aniq domen kiriting, masalan corp.local.";
-const UPPER_CASE_TEXT = 'Domenni kichik harflarda yozing, masalan corp.local.';
+/** Wildcard domains need a DNS proxy: out of the MVP (RouteSwitch.md §Maqsad va doira). Uzbek. */
+export const WILDCARD_TEXT = UZ.t.addRule.errors.wildcardDomain;
 
 /** The words for a refused domain: the shared code says "invalid", the input says which way. */
-function domainText(input: string): string {
-  if (input.includes('*')) return WILDCARD_TEXT;
-  if (/[A-Z]/.test(input) && !/[^A-Za-z0-9.-]/.test(input)) return UPPER_CASE_TEXT;
-  return VALIDATION_TEXT['invalid-domain'];
+function domainText(input: string, i18n: I18n): string {
+  if (input.includes('*')) return i18n.t.addRule.errors.wildcardDomain;
+  if (/[A-Z]/.test(input) && !/[^A-Za-z0-9.-]/.test(input)) return i18n.t.addRule.errors.upperCase;
+  return i18n.t.validation['invalid-domain'];
 }
-
-const REFRESH_TEXT = `${String(LIMITS.refreshSecMin)} dan ${String(LIMITS.refreshSecMax)} gacha butun son (soniya) kiriting.`;
-const NOTE_TEXT = `Izoh ${String(LIMITS.noteMaxLength)} belgidan oshmasin.`;
-const TARGET_EMPTY_TEXT = 'Manzilni kiriting.';
-const TARGET_LONG_TEXT = `Manzil ${String(LIMITS.targetMaxLength)} belgidan oshmasin.`;
-const DNS_EMPTY_TEXT = 'DNS server manzilini kiriting (yoki belgini olib tashlang).';
 
 // ---------------------------------------------------------------------------
 // Validation
@@ -145,21 +144,23 @@ const codeOf = (issue: IssueLike): string | null => {
 
 
 /** The words for an issue of one field of `Rule`. */
-function fieldText(field: FormField, issue: IssueLike, input: string): string {
+function fieldText(field: FormField, issue: IssueLike, input: string, i18n: I18n): string {
   const code = codeOf(issue);
+  const validation = i18n.t.validation;
+  const words = i18n.t.addRule.errors;
   if (field === 'target') {
-    if (code === 'invalid-domain') return domainText(input);
-    if (isValidationCode(code)) return VALIDATION_TEXT[code];
-    if (issue.code === 'too_small') return TARGET_EMPTY_TEXT;
-    if (issue.code === 'too_big') return TARGET_LONG_TEXT;
-    return VALIDATION_TEXT['invalid-destination'];
+    if (code === 'invalid-domain') return domainText(input, i18n);
+    if (isValidationCode(code)) return validation[code];
+    if (issue.code === 'too_small') return words.targetEmpty;
+    if (issue.code === 'too_big') return words.targetLong;
+    return validation['invalid-destination'];
   }
   if (field === 'dns') {
-    if (input === '') return DNS_EMPTY_TEXT;
-    return isValidationCode(code) ? VALIDATION_TEXT[code] : VALIDATION_TEXT['invalid-ipv4'];
+    if (input === '') return words.dnsEmpty;
+    return isValidationCode(code) ? validation[code] : validation['invalid-ipv4'];
   }
-  if (field === 'refreshSec') return REFRESH_TEXT;
-  return NOTE_TEXT;
+  if (field === 'refreshSec') return words.refresh;
+  return words.note;
 }
 
 const isFormField = (value: PropertyKey | undefined): value is FormField =>
@@ -198,7 +199,8 @@ const roleOf = (iface: IfaceRole) => ROLE_LABELS[iface];
  * Without a config (not read yet) only the rule is checked; the main process
  * checks the config again before sending it, and the helper after.
  */
-export function checkForm(form: RuleForm, id: string, config: Config | null): FormCheck {
+export function checkForm(form: RuleForm, id: string, config: Config | null, i18n: I18n = UZ): FormCheck {
+  const words = i18n.t.addRule.errors;
   const input = ruleInputOf(form, id);
   const typedTarget = form.target.trim();
   const target = normalizeTarget(form.kind, typedTarget);
@@ -210,16 +212,16 @@ export function checkForm(form: RuleForm, id: string, config: Config | null): Fo
       const field = issue.path[0];
       if (!isFormField(field) || errors[field] !== undefined) continue;
       const typed = field === 'target' ? typedTarget : field === 'dns' ? form.dns.trim() : '';
-      errors[field] = fieldText(field, issue, typed);
+      errors[field] = fieldText(field, issue, typed, i18n);
     }
     // zod stops before the rule's target check when another field is refused:
     // the target's own verdict comes from the same shared normaliser.
     if (errors.target === undefined && !target.ok && typedTarget !== '') {
-      errors.target = fieldText('target', { code: 'custom', path: ['target'], params: { code: target.error.code } }, typedTarget);
+      errors.target = fieldText('target', { code: 'custom', path: ['target'], params: { code: target.error.code } }, typedTarget, i18n);
     }
     // A refusal on a field the form does not show (the id) still blocks the save.
     const blocked = Object.keys(errors).length === 0;
-    return { rule: null, errors, formError: blocked ? 'Qoida yaroqsiz.' : null, normalisedTarget, sameAs: null };
+    return { rule: null, errors, formError: blocked ? words.invalidRule : null, normalisedTarget, sameAs: null };
   }
 
   const rule = parsed.data;
@@ -240,9 +242,9 @@ export function checkForm(form: RuleForm, id: string, config: Config | null): Fo
           if (first !== ours && second !== ours) continue;
           const other = rules[first === ours ? (second as number) : (first as number)];
           if (other === undefined || errors.target !== undefined) continue;
-          errors.target = `Bu manzil «${other.target}» qoidasida ${roleOf(other.iface)} orqali yo'naltirilgan — bitta manzil ikki interfeysga bog'lanmaydi.`;
+          errors.target = words.ifaceConflict(other.target, roleOf(other.iface));
         } else if (issue.path.length === 1 && issue.path[0] === 'rules' && issue.code === 'too_big') {
-          formError = `${String(LIMITS.maxRules)} tadan ortiq qoida qo'shib bo'lmaydi.`;
+          formError = words.tooManyRules;
         }
       }
     }
@@ -279,6 +281,7 @@ export interface CommandPreview {
   readonly note: string | null;
 }
 
+/** Argv placeholders of the preview: part of the command, not translated. */
 const PLACEHOLDER: Readonly<Record<RuleKind, string>> = { ip: '<IP>', subnet: '<subnet>', domain: '<domen>' };
 
 /**
@@ -294,12 +297,14 @@ export function commandPreview(
   dns: string | null,
   iface: IfaceRole,
   interfaces: EngineState['interfaces'] | null,
+  i18n: I18n = UZ,
 ): CommandPreview {
-  if (interfaces === null) return { lines: [], note: "Buyruq helper ulanganda ko'rinadi (gateway undan olinadi)." };
+  const words = i18n.t.addRule;
+  if (interfaces === null) return { lines: [], note: words.previewNoHelper };
   const role = interfaces[iface];
   if (!role.up || role.gateway === null) {
-    const why = role.device === null ? 'adapteri topilmadi' : role.up ? "gateway'i yo'q" : 'ulanmagan';
-    return { lines: [], note: `${roleOf(iface)} ${why} — qoida «Kutilmoqda» bo'ladi va ulanganda qo'llanadi.` };
+    const why = role.device === null ? words.previewNoAdapter : role.up ? words.previewNoGateway : words.previewDown;
+    return { lines: [], note: why(roleOf(iface)) };
   }
   const gateway = role.gateway;
   const shown = target ?? PLACEHOLDER[kind];
@@ -308,7 +313,7 @@ export function commandPreview(
     if (dns !== null) lines.push(`$ route -n add -host ${dns} ${gateway}`);
     return {
       lines,
-      note: dns === null ? "Har bir resolve qilingan IP uchun." : "Har bir resolve qilingan IP uchun; DNS server — o'z tarmog'ida bo'lmasa.",
+      note: dns === null ? words.previewEachIp : words.previewEachIpDns,
     };
   }
   if (kind === 'ip' || target === null) return { lines: [`$ route -n add -${kind === 'ip' ? 'host' : 'net'} ${shown} ${gateway}`], note: null };
@@ -339,21 +344,23 @@ export function testAddressOf(
   kind: RuleKind,
   target: string | null,
   saved: { readonly target: string; readonly kind: RuleKind; readonly dns: string | null; readonly state: RuleState | null } | null,
+  i18n: I18n = UZ,
 ): TestAddress {
-  if (target === null) return { reason: "Avval to'g'ri manzil kiriting." };
+  const words = i18n.t.addRule;
+  if (target === null) return { reason: words.testEnterValid };
   if (kind === 'ip') return { address: target };
   if (kind === 'subnet') {
     const destination = parseIpv4Destination(target);
-    if (destination === null) return { reason: "Avval to'g'ri manzil kiriting." };
+    if (destination === null) return { reason: words.testEnterValid };
     const address = destination.prefix >= 31 ? destination.address : toAddress(toInt(destination.address) + 1);
     const routable = normalizeHostAddress(address);
-    return routable.ok ? { address: routable.value } : { reason: 'Bu subnetdagi manzilni sinab bo\'lmaydi.' };
+    return routable.ok ? { address: routable.value } : { reason: words.testSubnetUntestable };
   }
   if (saved === null || saved.kind !== 'domain' || saved.target !== target) {
-    return { reason: "Domen IP'lari helper resolve qilgandan keyin sinaladi — avval saqlang." };
+    return { reason: words.testDomainSaveFirst };
   }
   const address = saved.state?.appliedDestinations.find((destination) => !destination.includes('/') && destination !== saved.dns);
-  return address === undefined ? { reason: "Domen hali resolve qilinmagan yoki route qo'yilmagan." } : { address };
+  return address === undefined ? { reason: words.testDomainNotResolved } : { address };
 }
 
 export interface TestSummary {
@@ -364,14 +371,15 @@ export interface TestSummary {
 }
 
 /** What the result of `test` says about the rule being edited. */
-export function describeTest(result: TestResult, iface: IfaceRole, ruleId: string, saved: boolean): TestSummary {
+export function describeTest(result: TestResult, iface: IfaceRole, ruleId: string, saved: boolean, i18n: I18n = UZ): TestSummary {
+  const words = i18n.t.addRule;
   const role = result.role === null ? '' : ` (${roleOf(result.role)})`;
-  const via = result.gateway === null ? "to'g'ridan-to'g'ri" : `gateway ${result.gateway}`;
+  const via = result.gateway === null ? words.testDirect : words.testGateway(result.gateway);
   const route = `${result.target} → ${result.device}${role} · ${via}`;
   if (result.role === iface) {
-    const verdict = result.ruleId === ruleId ? `Shu qoida bo'yicha ${roleOf(iface)} orqali ketadi.` : `Hozir ${roleOf(iface)} orqali ketadi.`;
+    const verdict = result.ruleId === ruleId ? words.testByThisRule(roleOf(iface)) : words.testGoesVia(roleOf(iface));
     return { tone: 'success', route, verdict };
   }
-  const now = result.role === null ? 'Hozir boshqa interfeys orqali ketadi' : `Hozir ${roleOf(result.role)} orqali ketadi`;
-  return { tone: 'warning', route, verdict: saved ? `${now}, ${roleOf(iface)} emas.` : `${now} — saqlangandan keyin ${roleOf(iface)} orqali bo'ladi.` };
+  const now = result.role === null ? words.testOtherNow : words.testRoleNow(roleOf(result.role));
+  return { tone: 'warning', route, verdict: saved ? words.testNotRole(now, roleOf(iface)) : words.testAfterSave(now, roleOf(iface)) };
 }

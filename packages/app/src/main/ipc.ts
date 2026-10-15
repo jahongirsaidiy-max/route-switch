@@ -543,8 +543,8 @@ export function registerIpcHandlers(deps: IpcDeps): IpcRegistration {
     broadcast(STATE_CHANNEL, snapshot);
   };
 
-  // The app's own journal lines: the helper cannot report that it is gone.
-  const connectionJournal = createConnectionJournal({ logBuffer, now });
+  // The app's own journal lines: the helper cannot report that it is gone. In the UI language of the moment.
+  const connectionJournal = createConnectionJournal({ logBuffer, now, language: () => preferences.language() });
 
   const unsubscribes = [
     helperClient.onStatus(push),

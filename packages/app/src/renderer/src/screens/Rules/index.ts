@@ -5,6 +5,8 @@ export {
   notesById,
   overlapWarnings,
   ROW_FILTER_LABELS,
+  ROW_FILTERS,
+  rowFilterLabels,
   rowDetail,
   rowStatus,
   ruleRows,

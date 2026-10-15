@@ -1150,6 +1150,8 @@ describe('helper away and a broken stored config (TASK-300)', () => {
     const h = await setup({ brokenConfig: true });
     await h.call('rs:resetConfig');
     h.sockets[0]?.emit('close');
+    // The app's lines go into the journal once the language is known (TASK-DELTA-12).
+    for (let i = 0; i < 6; i += 1) await flush();
     const log = valueOf(await h.call('rs:getLog')) as RsLogEntry[];
     expect(log.map((entry) => [entry.level, entry.msg, entry.source])).toEqual([
       ['error', "Helper saqlangan config'ni o'qiy olmadi — hech bir qoida qo'llanmaydi. Import yoki bo'sh config bilan tiklang", 'app'],

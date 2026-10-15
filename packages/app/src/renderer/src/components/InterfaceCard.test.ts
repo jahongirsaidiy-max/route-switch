@@ -9,6 +9,7 @@ import {
   describeInterface,
   describeInterfaceOption,
 } from './InterfaceCard';
+import { i18nFor } from '../../../i18n';
 import { renderMarkup, type ElementProps } from './test-utils';
 
 const CONNECTED: InterfaceState = { device: 'en5', ip: '10.20.4.37', gateway: '10.20.4.1', up: true };
@@ -98,5 +99,31 @@ describe('InterfaceOption', () => {
     const element = InterfaceOption({ role: 'wifi', iface: CONNECTED, selected: false, onSelect: blocked, disabled: true });
     (element.props as ElementProps).onClick?.();
     expect(blocked).not.toHaveBeenCalled();
+  });
+});
+
+describe('interfaces in every language (TASK-DELTA-14)', () => {
+  const ru = i18nFor('ru');
+  const en = i18nFor('en');
+
+  it('describeInterface and describeInterfaceOption', () => {
+    expect(describeInterface(CONNECTED, ru)).toEqual({ detail: 'en5 · 10.20.4.37 → 10.20.4.1', tone: 'success', stateLabel: 'Подключён' });
+    expect(describeInterface(NO_GATEWAY, ru)).toEqual({ detail: 'en5 · 10.20.4.37 · нет шлюза', tone: 'warning', stateLabel: 'Нет шлюза' });
+    expect(describeInterface(DOWN, en)).toEqual({ detail: 'en5 · not connected', tone: 'neutral', stateLabel: 'Not connected' });
+    expect(describeInterface(ABSENT, en)).toEqual({ detail: 'Adapter not found', tone: 'neutral', stateLabel: 'Not connected' });
+    expect(describeInterfaceOption(NO_GATEWAY, en)).toBe('en5 · no gateway');
+    expect(describeInterfaceOption(DOWN, ru)).toBe('en5 · не подключён');
+    expect(describeInterfaceOption(ABSENT, ru)).toBe('Не подключён');
+  });
+
+  it('the card: the dot name and the default tag; role names stay product names', () => {
+    const html = renderMarkup(createElement(InterfaceCard, { role: 'wifi', iface: DOWN, isDefault: true, i18n: ru }));
+    expect(html).toContain('>Wi‑Fi<');
+    expect(html).toContain('>ОСНОВНОЙ<');
+    expect(html).toContain('aria-label="Не подключён"');
+    expect(renderMarkup(createElement(InterfaceCard, { role: 'ethernet', iface: CONNECTED, i18n: en }))).toContain('aria-label="Connected"');
+    expect(renderMarkup(createElement(InterfaceOption, { role: 'ethernet', iface: DOWN, selected: false, onSelect: vi.fn(), i18n: en }))).toContain(
+      'en5 · not connected',
+    );
   });
 });

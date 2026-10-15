@@ -3,7 +3,14 @@
 import { LIMITS, MIN_SUBNET_PREFIX } from '@routeswitch/shared';
 
 import { plural, ruForms } from './plural';
+import { addRuleRu } from './sections/addRule.ru';
+import { rulesRu } from './sections/rules.ru';
+import { menuBarRu } from './sections/menuBar.ru';
+import { shellRu } from './sections/shell.ru';
 import type { Messages } from './types';
+import { componentsRu } from './sections/components.ru';
+import { logRu } from './sections/log.ru';
+import { settingsRu } from './sections/settings.ru';
 
 const unexpected = (code: string): string => `Непредвиденная ошибка (${code}).`;
 
@@ -16,6 +23,9 @@ export const ru: Messages = {
   unknownWindow: 'Неизвестное окно. Откройте приложение заново значком в строке меню.',
 
   unexpectedError: unexpected,
+
+  menuBar: menuBarRu,
+  ...shellRu,
 
   errors: {
     'not-connected': 'Нет связи с helper — ничего не отправлено.',
@@ -199,4 +209,13 @@ export const ru: Messages = {
     hint: 'Тексты приложения показываются на этом языке. Записи журнала helper остаются на английском.',
     saved: 'Язык изменён.',
   },
+
+  /** The journal, settings and shared components (TASK-DELTA-14): `sections/*.ts`. */
+  log: logRu,
+  settings: settingsRu,
+  components: componentsRu,
+
+  /** The rules window and the add-rule dialog (TASK-DELTA-13): `sections/rules.*`, `sections/addRule.*`. */
+  rules: rulesRu,
+  addRule: addRuleRu,
 };

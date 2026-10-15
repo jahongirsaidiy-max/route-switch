@@ -2,6 +2,7 @@ import { RULE_STATUSES } from '@routeswitch/shared';
 import { createElement } from 'react';
 import { describe, expect, it } from 'vitest';
 
+import { i18nFor } from '../../../i18n';
 import { RULE_STATUS_LABELS, RULE_STATUS_TONES, StatusBadge, StatusDot } from './StatusBadge';
 import { renderMarkup } from './test-utils';
 
@@ -43,5 +44,19 @@ describe('StatusDot', () => {
     expect(renderMarkup(createElement(StatusDot, { tone: 'danger', label: 'x', size: 'sm' }))).toContain(
       'data-size="sm"',
     );
+  });
+});
+
+describe('StatusBadge in every language (TASK-DELTA-14)', () => {
+  it.each([
+    ['ru', ['Активно', 'Ожидает', 'Ошибка', 'Выключено']],
+    ['en', ['Active', 'Pending', 'Error', 'Off']],
+  ] as const)('%s', (locale, labels) => {
+    const i18n = i18nFor(locale);
+    const statuses = ['active', 'pending', 'error', 'disabled'] as const;
+    statuses.forEach((status, index) => {
+      expect(renderMarkup(createElement(StatusBadge, { status, i18n }))).toContain(labels[index] ?? '');
+    });
+    expect(Object.keys(i18n.t.components.ruleStatus).sort()).toEqual([...RULE_STATUSES].sort());
   });
 });

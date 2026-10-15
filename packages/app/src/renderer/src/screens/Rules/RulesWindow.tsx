@@ -10,9 +10,11 @@
 import { useEffect, useRef, useState, type ComponentType, type ReactElement, type ReactNode } from 'react';
 
 import { HelperRecovery, requestReconnect, RouteIcon, StatusDot } from '../../components';
+import type { I18n } from '../../../../i18n';
 import { useEngineState, type EngineStateView } from '../../hooks/useEngineState';
+import { useI18n } from '../../hooks/useI18n';
 import type { RsApi } from '../../rs';
-import { HELPER_STATUS_TEXT, helperNotice, type Feedback } from '../../text';
+import { helperNotice, helperStatusText, UZ, type Feedback } from '../../text';
 import { AddRuleDialog, type RuleEditorTarget } from '../AddRule';
 import { useInstall } from '../Install';
 import { LogScreen } from '../Log';
@@ -60,10 +62,11 @@ function SettingsIcon(): ReactElement {
   );
 }
 
-export const SECTIONS: readonly { readonly id: RulesSection; readonly label: string; readonly icon: () => ReactElement }[] = [
-  { id: 'rules', label: 'Qoidalar', icon: () => <RouteIcon size={16} /> },
-  { id: 'log', label: 'Jurnal', icon: LogIcon },
-  { id: 'settings', label: 'Sozlamalar', icon: SettingsIcon },
+/** The sidebar's sections, in order; their names are `t.rules.sections`. */
+export const SECTIONS: readonly { readonly id: RulesSection; readonly icon: () => ReactElement }[] = [
+  { id: 'rules', icon: () => <RouteIcon size={16} /> },
+  { id: 'log', icon: LogIcon },
+  { id: 'settings', icon: SettingsIcon },
 ];
 
 /** What a section's screen gets from the window: the way into the add-rule form. */
@@ -95,6 +98,8 @@ export interface RulesWindowFrameProps {
   readonly installing?: boolean;
   /** How the last install ended. */
   readonly installFeedback?: Feedback | null;
+  /** The UI language (`useI18n()`); Uzbek when not given. */
+  readonly i18n?: I18n;
   readonly children: ReactNode;
 }
 
@@ -110,17 +115,19 @@ export function RulesWindowFrame({
   onInstall = () => undefined,
   installing = false,
   installFeedback = null,
+  i18n = UZ,
   children,
 }: RulesWindowFrameProps): ReactElement {
-  const helper = HELPER_STATUS_TEXT[engine.helper];
+  const t = i18n.t.rules;
+  const helper = helperStatusText(engine.helper, i18n);
   const connection = engine.connection;
   // The same words as the screens' notices, so every section says why and what to do.
-  const notice = helperNotice(engine);
+  const notice = helperNotice(engine, i18n);
   return (
     <div className={styles['window']} inert={inert || undefined}>
       <aside className={styles['sidebar']}>
-        <nav aria-label="Bo'limlar" className={styles['nav']}>
-          {SECTIONS.map(({ id, label, icon: Icon }) => (
+        <nav aria-label={t.sectionsNav} className={styles['nav']}>
+          {SECTIONS.map(({ id, icon: Icon }) => (
             <button
               key={id}
               type="button"
@@ -131,7 +138,7 @@ export function RulesWindowFrame({
               }}
             >
               <Icon />
-              {label}
+              {t.sections[id]}
             </button>
           ))}
         </nav>
@@ -140,7 +147,7 @@ export function RulesWindowFrame({
             <StatusDot tone={helper.tone} label={helper.text} size="sm" />
             <span>{helper.text}</span>
           </div>
-          {connection?.kind === 'connected' ? <div>root daemon · v{connection.helperVersion}</div> : null}
+          {connection?.kind === 'connected' ? <div>{t.helperDaemon(connection.helperVersion)}</div> : null}
           {notice === null || notice.text === '' ? null : <p className={styles['helperText']}>{notice.text}</p>}
           {onReconnect === undefined ? null : (
             <HelperRecovery
@@ -150,6 +157,7 @@ export function RulesWindowFrame({
               onInstall={onInstall}
               installing={installing}
               size="sm"
+              i18n={i18n}
             />
           )}
           {[reconnectFeedback, installFeedback].map((line, index) =>
@@ -197,13 +205,14 @@ export function RulesWindow({
 }: RulesWindowProps): ReactElement {
   const rs = given ?? window.rs;
   const engine = useEngineState(rs);
+  const i18n = useI18n();
   const [reconnecting, setReconnecting] = useState(false);
   const [reconnectFeedback, setReconnectFeedback] = useState<Feedback | null>(null);
   const reconnect = () => {
     if (reconnecting) return;
     setReconnecting(true);
     setReconnectFeedback(null);
-    void requestReconnect(rs).then((line) => {
+    void requestReconnect(rs, i18n).then((line) => {
       setReconnectFeedback(line);
       setReconnecting(false);
     });
@@ -243,6 +252,7 @@ export function RulesWindow({
         onInstall={installing.install}
         installing={installing.installing}
         installFeedback={installing.feedback}
+        i18n={i18n}
       >
         <Screen
           onAddRule={() => {

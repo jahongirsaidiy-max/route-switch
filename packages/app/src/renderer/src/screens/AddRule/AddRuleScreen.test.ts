@@ -202,8 +202,8 @@ describe('AddRulePanel — errors next to the field', () => {
     expect(visibleErrors(errors, { touched: new Set(), submitted: false })).toEqual({});
     expect(visibleErrors(errors, { touched: new Set(['dns', 'note']), submitted: false })).toEqual({ dns: 'b' });
     expect(visibleErrors(errors, { touched: new Set(), submitted: true })).toBe(errors);
-    expect(refreshText(600)).toBe('har 10 daqiqada');
-    expect(refreshText(90)).toBe('har 90 soniyada');
+    expect(refreshText(600)).toBe("IP'lar har 10 daqiqada yangilanadi.");
+    expect(refreshText(90)).toBe("IP'lar har 90 soniyada yangilanadi.");
   });
 });
 

@@ -20,12 +20,14 @@ import {
   Toggle,
   requestReconnect,
 } from '../../components';
+import type { I18n } from '../../../../i18n';
 import { configStoreFor, useConfig, type ConfigView } from '../../hooks/useConfig';
 import { useEngineState, type EngineStateView } from '../../hooks/useEngineState';
+import { useI18n } from '../../hooks/useI18n';
 import { useNow } from '../../hooks/useNow';
 import { browserShowSignal, readOnShow, type ShowSignal, type ShownReader } from '../../hooks/windowShown';
 import type { RsApi, RsServiceOrder } from '../../rs';
-import { errorText, helperNotice, LOADING_NOTICE, networkWarnings, type Feedback } from '../../text';
+import { errorText, helperNotice, loadingNotice, networkWarnings, UZ, type Feedback } from '../../text';
 import { installHelper } from '../Install';
 import { openRules, reapply, setRouting, type MenuBarApi } from './actions';
 import styles from './MenuBarScreen.module.css';
@@ -50,6 +52,8 @@ export interface MenuBarPanelProps {
   readonly onReconnect: () => void;
   /** "Helper'ni (qayta) o'rnatish" of the helper notice (TASK-214). */
   readonly onInstall: () => void;
+  /** The language of the window (`useI18n()`); Uzbek without it. */
+  readonly i18n?: I18n;
 }
 
 function AlertIcon({ size = 14 }: { readonly size?: number }): ReactElement {
@@ -72,7 +76,7 @@ function AlertIcon({ size = 14 }: { readonly size?: number }): ReactElement {
   );
 }
 
-function RuleRow({ rule }: { readonly rule: MenuRule }): ReactElement {
+function RuleRow({ rule, i18n }: { readonly rule: MenuRule; readonly i18n: I18n }): ReactElement {
   const notice = rule.notice;
   return (
     <li className={styles['row']} data-notice={notice?.kind ?? undefined}>
@@ -85,60 +89,73 @@ function RuleRow({ rule }: { readonly rule: MenuRule }): ReactElement {
           {rule.detail}
         </span>
       )}
-      {notice?.kind === 'status' ? <StatusBadge status={notice.status} detail={notice.text} /> : null}
-      {notice?.kind === 'warning' ? <StatusDot tone="warning" label={`Ogohlantirish: ${notice.text}`} /> : null}
+      {notice?.kind === 'status' ? <StatusBadge status={notice.status} detail={notice.text} i18n={i18n} /> : null}
+      {notice?.kind === 'warning' ? <StatusDot tone="warning" label={i18n.t.menuBar.warning(notice.text)} /> : null}
     </li>
   );
 }
 
-function RulesSection({ config, engine, now, onReloadConfig }: Pick<MenuBarPanelProps, 'config' | 'now' | 'onReloadConfig'> & { readonly engine: EngineStateView }): ReactElement {
+function RulesSection({
+  config,
+  engine,
+  now,
+  onReloadConfig,
+  i18n,
+}: Pick<MenuBarPanelProps, 'config' | 'now' | 'onReloadConfig'> & { readonly engine: EngineStateView; readonly i18n: I18n }): ReactElement {
+  const words = i18n.t.menuBar;
   const state = engine.state;
-  const rules = config.config === null || state === null ? null : menuRules(config.config, state, now);
+  const rules = config.config === null || state === null ? null : menuRules(config.config, state, now, undefined, i18n);
   return (
     // With routing off no rule is applied: the list is dimmed (the status row says why).
     <section className={styles['rules']} aria-labelledby="menubar-rules" data-off={state?.enabled === false || undefined}>
       <div className={styles['rulesHead']}>
         <h2 id="menubar-rules" className={styles['label']}>
-          Faol qoidalar
+          {words.activeRules}
         </h2>
-        {rules === null ? null : (
-          <span className={styles['count']}>
-            {rules.total} ta · {rules.routes} route
-          </span>
-        )}
+        {rules === null ? null : <span className={styles['count']}>{words.ruleCount(rules.total, rules.routes)}</span>}
       </div>
       {rules === null && config.phase === 'failed' ? (
         <div className={styles['empty']} role="alert">
-          <p>Qoidalarni o'qib bo'lmadi. {config.error === null ? '' : errorText(config.error.code)}</p>
+          <p>
+            {words.rulesUnreadable} {config.error === null ? '' : errorText(config.error.code, i18n)}
+          </p>
           <Button variant="ghost" onClick={onReloadConfig}>
-            Qayta o'qish
+            {words.reload}
           </Button>
         </div>
       ) : null}
       {rules === null && config.phase !== 'failed' ? (
         <p className={styles['empty']} role="status">
-          Qoidalar o'qilmoqda…
+          {words.rulesLoading}
         </p>
       ) : null}
       {rules !== null && rules.total === 0 ? (
-        <p className={styles['empty']}>Yoqilgan qoida yo'q. «Qoidalarni boshqarish» orqali qo'shing.</p>
+        <p className={styles['empty']}>{words.noRules}</p>
       ) : null}
       {rules !== null && rules.total > 0 ? (
         <ul className={styles['list']}>
           {rules.shown.map((rule) => (
-            <RuleRow key={rule.id} rule={rule} />
+            <RuleRow key={rule.id} rule={rule} i18n={i18n} />
           ))}
         </ul>
       ) : null}
-      {rules !== null && rules.hidden > 0 ? <p className={styles['more']}>Yana {rules.hidden} ta qoida</p> : null}
+      {rules !== null && rules.hidden > 0 ? <p className={styles['more']}>{words.moreRules(rules.hidden)}</p> : null}
     </section>
   );
 }
 
 /** Rules waiting for an interface, both interfaces on one subnet (`networkWarnings`). */
-function Warnings({ engine, config }: { readonly engine: EngineStateView; readonly config: ConfigView }): ReactElement | null {
+function Warnings({
+  engine,
+  config,
+  i18n,
+}: {
+  readonly engine: EngineStateView;
+  readonly config: ConfigView;
+  readonly i18n: I18n;
+}): ReactElement | null {
   const state = engine.state;
-  const warnings = state === null ? [] : networkWarnings(state, config.config);
+  const warnings = state === null ? [] : networkWarnings(state, config.config, i18n);
   if (warnings.length === 0) return null;
   return (
     <div className={styles['warnings']}>
@@ -167,9 +184,11 @@ function StatusRow({ line }: { readonly line: StatusLine }): ReactElement {
 /** The window for given data; `MenuBarScreen` supplies the live data and the actions. */
 export function MenuBarPanel(props: MenuBarPanelProps): ReactElement {
   const { engine, busy } = props;
+  const i18n = props.i18n ?? UZ;
+  const words = i18n.t.menuBar;
   const state = engine.helper === 'connected' ? engine.state : null;
   // A connected snapshot always carries a state; should one ever not, it reads as still loading.
-  const notice = state === null ? (helperNotice(engine) ?? LOADING_NOTICE) : null;
+  const notice = state === null ? (helperNotice(engine, i18n) ?? loadingNotice(i18n)) : null;
   const enabled = state?.enabled ?? false;
   const preferred = state === null ? null : defaultRole(props.serviceOrder, state.interfaces);
 
@@ -184,11 +203,11 @@ export function MenuBarPanel(props: MenuBarPanelProps): ReactElement {
             </h1>
           </div>
           <div className={styles['switch']}>
-            <span aria-hidden="true">{state === null ? '' : enabled ? 'Faol' : "O'chiq"}</span>
+            <span aria-hidden="true">{state === null ? '' : enabled ? words.on : words.off}</span>
             <Toggle
               checked={enabled}
               onChange={props.onToggle}
-              label="Routing (barcha qoidalar)"
+              label={words.toggleLabel}
               disabled={state === null}
               busy={busy.has('enabled')}
             />
@@ -200,6 +219,7 @@ export function MenuBarPanel(props: MenuBarPanelProps): ReactElement {
             <p className={styles['noticeTitle']}>{notice?.title}</p>
             {notice === null || notice.text === '' ? null : <p className={styles['noticeText']}>{notice.text}</p>}
             <HelperRecovery
+              i18n={i18n}
               recovery={notice?.recovery ?? null}
               onReconnect={props.onReconnect}
               reconnecting={busy.has('reconnect')}
@@ -211,14 +231,14 @@ export function MenuBarPanel(props: MenuBarPanelProps): ReactElement {
           <>
             <section className={styles['interfaces']} aria-labelledby="menubar-interfaces">
               <h2 id="menubar-interfaces" className={styles['label']}>
-                Interfeyslar
+                {words.interfaces}
               </h2>
-              <InterfaceCard role="wifi" iface={state.interfaces.wifi} isDefault={preferred === 'wifi'} />
-              <InterfaceCard role="ethernet" iface={state.interfaces.ethernet} isDefault={preferred === 'ethernet'} />
+              <InterfaceCard role="wifi" iface={state.interfaces.wifi} isDefault={preferred === 'wifi'} i18n={i18n} />
+              <InterfaceCard role="ethernet" iface={state.interfaces.ethernet} isDefault={preferred === 'ethernet'} i18n={i18n} />
             </section>
-            <Warnings engine={engine} config={props.config} />
-            <RulesSection config={props.config} engine={engine} now={props.now} onReloadConfig={props.onReloadConfig} />
-            <StatusRow line={statusLine(state, props.now)} />
+            <Warnings engine={engine} config={props.config} i18n={i18n} />
+            <RulesSection config={props.config} engine={engine} now={props.now} onReloadConfig={props.onReloadConfig} i18n={i18n} />
+            <StatusRow line={statusLine(state, props.now, i18n)} />
           </>
         )}
 
@@ -230,10 +250,10 @@ export function MenuBarPanel(props: MenuBarPanelProps): ReactElement {
 
         <div className={styles['actions']}>
           <Button grow onClick={props.onApply} disabled={state === null || !enabled} busy={busy.has('apply')}>
-            Qayta qo'llash
+            {words.reapply}
           </Button>
           <Button variant="primary" grow onClick={props.onOpenRules} busy={busy.has('rules')}>
-            Qoidalarni boshqarish
+            {words.manageRules}
           </Button>
         </div>
       </div>
@@ -265,6 +285,7 @@ export interface MenuBarScreenProps {
 /** The screen of the menu bar window (`?view=popover`). */
 export function MenuBarScreen({ rs: given }: MenuBarScreenProps): ReactElement {
   const rs = given ?? window.rs;
+  const i18n = useI18n();
   const engine = useEngineState(rs);
   const config = useConfig(rs);
   // Ticks, and refreshes when the popover is shown again (it is hidden, not closed).
@@ -317,24 +338,25 @@ export function MenuBarScreen({ rs: given }: MenuBarScreenProps): ReactElement {
       now={now}
       busy={busy}
       feedback={feedback}
+      i18n={i18n}
       onToggle={(next) => {
-        run('enabled', () => setRouting(rs, next));
+        run('enabled', () => setRouting(rs, next, i18n));
       }}
       onApply={() => {
-        run('apply', () => reapply(rs));
+        run('apply', () => reapply(rs, i18n));
       }}
       onOpenRules={() => {
-        run('rules', () => openRules(rs));
+        run('rules', () => openRules(rs, i18n));
       }}
       onReloadConfig={() => {
         configStoreFor(rs).reload();
       }}
       onReconnect={() => {
-        run('reconnect', () => requestReconnect(rs));
+        run('reconnect', () => requestReconnect(rs, i18n));
       }}
       onInstall={() => {
         // One install at a time; the main process would answer a second one `busy`.
-        if (!busy.has('install')) run('install', () => installHelper(rs));
+        if (!busy.has('install')) run('install', () => installHelper(rs, i18n));
       }}
     />
   );

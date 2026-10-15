@@ -18,6 +18,8 @@ export function formatAgo(words: TimeWords, iso: string, now: number): string {
 
 interface ClockFormats {
   readonly time: Intl.DateTimeFormat;
+  /** `HH:MM:SS` (the journal). */
+  readonly timeWithSeconds: Intl.DateTimeFormat;
   /** The day and month of another day: `13.10` (Uzbek, Russian), `10/13` (English, the Intl default). */
   readonly day: (at: Date) => string;
 }
@@ -38,6 +40,7 @@ const formatsFor = (locale: Locale): ClockFormats => {
     formats = {
       // 24-hour clock in every language: the times of a network log read the same way everywhere.
       time: new Intl.DateTimeFormat(locale, { hour: '2-digit', minute: '2-digit', hourCycle: 'h23' }),
+      timeWithSeconds: new Intl.DateTimeFormat(locale, { hour: '2-digit', minute: '2-digit', second: '2-digit', hourCycle: 'h23' }),
       day: locale === 'en' ? englishDay : dottedDay,
     };
     FORMATS.set(locale, formats);
@@ -45,13 +48,18 @@ const formatsFor = (locale: Locale): ClockFormats => {
   return formats;
 };
 
+export interface ClockOptions {
+  /** `HH:MM:SS` instead of `HH:MM` (the journal, TASK-DELTA-14). */
+  readonly seconds?: boolean;
+}
+
 /** Local `HH:MM`, with the day and month in front when it is not today (`13.10` uz/ru, `10/13` en); "—" for an unreadable time. */
-export function formatClock(locale: Locale, iso: string, now: number): string {
+export function formatClock(locale: Locale, iso: string, now: number, options: ClockOptions = {}): string {
   const at = new Date(iso);
   if (Number.isNaN(at.getTime())) return '—';
   const today = new Date(now);
-  const { time, day } = formatsFor(locale);
-  const clock = time.format(at);
+  const { time, timeWithSeconds, day } = formatsFor(locale);
+  const clock = (options.seconds === true ? timeWithSeconds : time).format(at);
   const sameDay =
     at.getFullYear() === today.getFullYear() && at.getMonth() === today.getMonth() && at.getDate() === today.getDate();
   return sameDay ? clock : `${day(at)} ${clock}`;

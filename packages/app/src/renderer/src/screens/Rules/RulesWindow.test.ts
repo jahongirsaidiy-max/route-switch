@@ -26,7 +26,7 @@ function elementsOf(node: ReactNode): ReactElement<AnyProps>[] {
 describe('RulesWindowFrame', () => {
   it('a sidebar with Qoidalar, Jurnal and Sozlamalar; the current one is marked', () => {
     const html = renderMarkup(frame('log'));
-    expect(SECTIONS.map((section) => section.label)).toEqual(['Qoidalar', 'Jurnal', 'Sozlamalar']);
+    expect(SECTIONS.map((section) => section.id)).toEqual(['rules', 'log', 'settings']);
     for (const label of ['Qoidalar', 'Jurnal', 'Sozlamalar']) expect(html).toContain(label);
     expect(html.match(/aria-current="page"/g)).toHaveLength(1);
     expect(html).toMatch(/aria-current="page"[^>]*>.*Jurnal/);

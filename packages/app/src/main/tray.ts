@@ -9,6 +9,8 @@
 import type { EngineState } from '@routeswitch/shared';
 import type { Menu, MenuItemConstructorOptions, NativeImage, Rectangle } from 'electron';
 
+import { DEFAULT_LOCALE, i18nFor, type I18n, type Locale, type Messages } from '../i18n';
+
 import type { HelperClient, HelperStatus } from './helperClient';
 import type { Installer } from './installer';
 import { registerIpcHandlers, type ConfigDialogs, type IpcMainLike } from './ipc';
@@ -29,7 +31,13 @@ export interface TrayAppearance {
   readonly tooltip: string;
 }
 
-export const INITIAL_APPEARANCE: TrayAppearance = { kind: 'off', tooltip: 'RouteSwitch — ulanmoqda…' };
+/** Uzbek: the default of the functions below (a caller that does not pass a language). */
+const UZ: I18n = i18nFor(DEFAULT_LOCALE);
+
+/** Before the helper client reports anything: the `off` look, "connecting". */
+export const initialAppearance = (i18n: I18n = UZ): TrayAppearance => ({ kind: 'off', tooltip: i18n.t.tray.connecting });
+
+export const INITIAL_APPEARANCE: TrayAppearance = initialAppearance();
 
 /**
  * Rules waiting for their interface (`pending`: `interface-down`,
@@ -38,15 +46,15 @@ export const INITIAL_APPEARANCE: TrayAppearance = { kind: 'off', tooltip: 'Route
  * choice). Neither is an error — the icon stays `active` — but the tooltip
  * says so.
  */
-function connectedNotes(state: EngineState): string {
+function connectedNotes(state: EngineState, words: Messages['tray']): string {
   const notes: string[] = [];
   const waiting = state.rules.filter(
     (rule) => rule.status === 'pending' && (rule.reasonCode === 'interface-down' || rule.reasonCode === 'no-gateway'),
   ).length;
-  if (waiting > 0) notes.push(`${String(waiting)} ta qoida interfeysni kutmoqda`);
+  if (waiting > 0) notes.push(words.rulesWaiting(waiting));
   const { ethernet, wifi } = state.interfaces;
   if (ethernet.up && wifi.up && ethernet.gateway !== null && ethernet.gateway === wifi.gateway) {
-    notes.push('Ethernet va Wi‑Fi bitta tarmoqda');
+    notes.push(words.sameSubnet);
   }
   return notes.map((note) => ` · ${note}`).join('');
 }
@@ -55,28 +63,61 @@ function connectedNotes(state: EngineState): string {
  * The icon for a connection status and the engine state that goes with it.
  * `connecting` (and `stopped`, on the way out) keep the current look, so a
  * helper that is retried every few seconds does not make the icon flicker.
+ * The tooltip is in the language given (Uzbek without one).
  */
-export function trayAppearance(status: HelperStatus, state: EngineState | null, current: TrayAppearance): TrayAppearance {
+export function trayAppearance(
+  status: HelperStatus,
+  state: EngineState | null,
+  current: TrayAppearance,
+  i18n: I18n = UZ,
+): TrayAppearance {
+  const words = i18n.t.tray;
   switch (status.kind) {
     case 'connecting':
     case 'stopped':
       return current;
     case 'not-installed':
-      return { kind: 'error', tooltip: "RouteSwitch — helper o'rnatilmagan" };
+      return { kind: 'error', tooltip: words.notInstalled };
     case 'disconnected':
-      return { kind: 'error', tooltip: "RouteSwitch — helper bilan aloqa yo'q" };
+      return { kind: 'error', tooltip: words.disconnected };
     case 'incompatible':
-      return { kind: 'error', tooltip: 'RouteSwitch — helper versiyasi mos emas' };
+      return { kind: 'error', tooltip: words.incompatible };
     case 'config-unreadable':
-      return { kind: 'error', tooltip: "RouteSwitch — helper config'i buzilgan, qoidalar qo'llanmaydi" };
+      return { kind: 'error', tooltip: words.configUnreadable };
     case 'connected': {
-      if (state === null || !state.enabled) return { kind: 'off', tooltip: "RouteSwitch — o'chirilgan" };
+      if (state === null || !state.enabled) return { kind: 'off', tooltip: words.off };
       const failing = state.rules.filter((rule) => rule.status === 'error').length;
-      const notes = connectedNotes(state);
-      if (failing > 0) return { kind: 'error', tooltip: `RouteSwitch — ${String(failing)} ta qoidada xato${notes}` };
-      return { kind: 'active', tooltip: `RouteSwitch — faol${notes}` };
+      const notes = connectedNotes(state, words);
+      if (failing > 0) return { kind: 'error', tooltip: `${words.failing(failing)}${notes}` };
+      return { kind: 'active', tooltip: `${words.active}${notes}` };
     }
   }
+}
+
+/** What the tray menu does; the labels come from the language. */
+export interface TrayMenuActions {
+  readonly openRules: () => void;
+  readonly quit: () => void;
+}
+
+/** The right-click menu of the tray icon, in the language given. */
+export function trayMenuTemplate(i18n: I18n, actions: TrayMenuActions): MenuItemConstructorOptions[] {
+  return [
+    {
+      label: i18n.t.tray.manageRules,
+      click: () => {
+        actions.openRules();
+      },
+    },
+    { type: 'separator' },
+    // The helper keeps routing after the app quits; only the menu bar icon goes away.
+    {
+      label: i18n.t.tray.quit,
+      click: () => {
+        actions.quit();
+      },
+    },
+  ];
 }
 
 // ---------------------------------------------------------------------------
@@ -182,13 +223,21 @@ export function startShell(deps: ShellDeps, context: ShellContext): Shell {
     openRulesWindow: windows.openRules,
   });
 
-  let appearance = INITIAL_APPEARANCE;
+  // The language of the tooltip and the menu: Uzbek until the preferences are
+  // read (a few milliseconds after start), then the user's, and every change after.
+  let i18n = i18nFor(DEFAULT_LOCALE);
+  // The last status that set the look (`connecting` / `stopped` keep it): a
+  // change of language words it again. Null: nothing reported yet.
+  let source: { readonly status: HelperStatus; readonly state: EngineState | null } | null = null;
+
+  let appearance = initialAppearance(i18n);
   const tray = deps.createTray(deps.images[appearance.kind]);
   tray.setToolTip(appearance.tooltip);
 
   const refresh = (): void => {
     const { status, state } = helperClient.snapshot();
-    const next = trayAppearance(status, state, appearance);
+    if (status.kind !== 'connecting' && status.kind !== 'stopped') source = { status, state };
+    const next = source === null ? initialAppearance(i18n) : trayAppearance(source.status, source.state, appearance, i18n);
     if (next.kind === appearance.kind && next.tooltip === appearance.tooltip) return;
     if (next.kind !== appearance.kind) logger.info('Tray icon changed', { icon: next.kind, status: status.kind });
     appearance = next;
@@ -207,27 +256,33 @@ export function startShell(deps: ShellDeps, context: ShellContext): Shell {
     windows.togglePopover(anchor(bounds));
   });
 
-  const menu = deps.buildMenu([
-    {
-      label: 'Qoidalarni boshqarish',
-      click: () => {
-        windows.openRules();
-      },
+  const menuActions: TrayMenuActions = {
+    openRules: () => {
+      windows.openRules();
     },
-    { type: 'separator' },
-    // The helper keeps routing after the app quits; only the menu bar icon goes away.
-    {
-      label: 'RouteSwitch ilovasidan chiqish',
-      click: () => {
-        deps.quit();
-      },
+    quit: () => {
+      deps.quit();
     },
-  ]);
+  };
+  let menu = deps.buildMenu(trayMenuTemplate(i18n, menuActions));
   tray.on('right-click', () => {
     tray.popUpContextMenu(menu);
   });
 
   let disposed = false;
+
+  /** A new language: the menu is built again and the tooltip worded again. */
+  const setLocale = (locale: Locale): void => {
+    if (disposed || locale === i18n.locale) return;
+    i18n = i18nFor(locale);
+    menu = deps.buildMenu(trayMenuTemplate(i18n, menuActions));
+    logger.info('Tray language changed', { language: locale });
+    refresh();
+  };
+  unsubscribes.push(deps.preferences.onLanguage(setLocale));
+  // Never rejects (`PreferencesStore.language`).
+  void deps.preferences.language().then(setLocale);
+
   return {
     showPopover: () => {
       if (disposed || tray.isDestroyed()) return;

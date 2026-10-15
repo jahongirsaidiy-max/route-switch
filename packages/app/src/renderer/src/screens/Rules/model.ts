@@ -3,8 +3,9 @@
 
 import { findOverlaps, type Config, type EngineState, type IfaceRole, type RuleState } from '@routeswitch/shared';
 
+import type { I18n } from '../../../../i18n';
 import { ROLE_TAGS } from '../../components';
-import { isActiveWarning, lastKnownText, ruleReasonText } from '../../text';
+import { isActiveWarning, lastKnownText, ruleReasonText, UZ } from '../../text';
 
 type ConfigRule = Config['rules'][number];
 
@@ -23,7 +24,7 @@ export interface RuleRow {
   readonly id: string;
   readonly enabled: boolean;
   readonly target: string;
-  /** "IP", "Subnet", "Domen", "Domen + DNS". */
+  /** "IP", "Subnet", "Domen", "Domen + DNS" (in the UI language). */
   readonly kindLabel: string;
   readonly iface: IfaceRole;
   /** The role's device now ("en5"), or null when the role has none. */
@@ -35,32 +36,34 @@ export interface RuleRow {
   readonly lastKnown: string | null;
 }
 
-export function kindLabel(rule: Pick<ConfigRule, 'kind' | 'dns'>): string {
-  if (rule.kind === 'ip') return 'IP';
-  if (rule.kind === 'subnet') return 'Subnet';
-  return rule.dns === undefined ? 'Domen' : 'Domen + DNS';
+export function kindLabel(rule: Pick<ConfigRule, 'kind' | 'dns'>, i18n: I18n = UZ): string {
+  const kinds = i18n.t.rules.kinds;
+  if (rule.kind === 'ip') return kinds.ip;
+  if (rule.kind === 'subnet') return kinds.subnet;
+  return rule.dns === undefined ? kinds.domain : kinds.domainDns;
 }
 
 /** The note; without one, a domain rule's DNS server or its address count and refresh interval. */
-export function rowDetail(rule: ConfigRule, state: RuleState | null): string {
+export function rowDetail(rule: ConfigRule, state: RuleState | null, i18n: I18n = UZ): string {
   const note = rule.note?.trim() ?? '';
   if (note !== '') return note;
   if (rule.kind !== 'domain') return '';
-  if (rule.dns !== undefined) return `DNS: ${rule.dns}`;
-  const every = `har ${String(Math.round(rule.refreshSec / 60))} daq`;
+  const words = i18n.t.rules;
+  if (rule.dns !== undefined) return words.detailDns(rule.dns);
+  const every = words.detailEvery(Math.round(rule.refreshSec / 60));
   const count = state?.appliedDestinations.length ?? 0;
-  return count === 0 ? every : `${String(count)} IP · ${every}`;
+  return count === 0 ? every : words.detailCount(count, every);
 }
 
-export function rowStatus(state: RuleState | null): RowStatus {
+export function rowStatus(state: RuleState | null, i18n: I18n = UZ): RowStatus {
   if (state === null || state.status === 'disabled') return { kind: 'none' };
-  const text = ruleReasonText(state);
+  const text = ruleReasonText(state, i18n);
   if (state.status === 'active') return isActiveWarning(state) && text !== null ? { kind: 'warning', text } : { kind: 'ok' };
   return { kind: state.status, text: text ?? '' };
 }
 
 /** Every rule of the config, in config order, with its state; `now` dates the last known addresses. */
-export function ruleRows(config: Config, state: EngineState, now: number): RuleRow[] {
+export function ruleRows(config: Config, state: EngineState, now: number, i18n: I18n = UZ): RuleRow[] {
   const states = new Map(state.rules.map((rule) => [rule.ruleId, rule]));
   return config.rules.map((rule) => {
     const ruleState = states.get(rule.id) ?? null;
@@ -68,12 +71,12 @@ export function ruleRows(config: Config, state: EngineState, now: number): RuleR
       id: rule.id,
       enabled: rule.enabled,
       target: rule.target,
-      kindLabel: kindLabel(rule),
+      kindLabel: kindLabel(rule, i18n),
       iface: rule.iface,
       device: state.interfaces[rule.iface].device,
-      detail: rowDetail(rule, ruleState),
-      status: rowStatus(ruleState),
-      lastKnown: ruleState === null || !rule.enabled ? null : lastKnownText(rule, ruleState, now),
+      detail: rowDetail(rule, ruleState, i18n),
+      status: rowStatus(ruleState, i18n),
+      lastKnown: ruleState === null || !rule.enabled ? null : lastKnownText(rule, ruleState, now, undefined, i18n),
     };
   });
 }
@@ -81,11 +84,13 @@ export function ruleRows(config: Config, state: EngineState, now: number): RuleR
 /** The "Hammasi" filter of the toolbar. */
 export type RowFilter = 'all' | 'problems' | 'off';
 
-export const ROW_FILTER_LABELS: Readonly<Record<RowFilter, string>> = {
-  all: 'Hammasi',
-  problems: 'Muammoli',
-  off: "O'chirilgan",
-};
+/** The filters in the order the toolbar lists them. */
+export const ROW_FILTERS: readonly RowFilter[] = ['all', 'problems', 'off'];
+
+/** The filters' names in the UI language (`UZ` when not given). */
+export const rowFilterLabels = (i18n: I18n = UZ): Readonly<Record<RowFilter, string>> => i18n.t.rules.filters;
+
+export const ROW_FILTER_LABELS: Readonly<Record<RowFilter, string>> = rowFilterLabels();
 
 const matchesFilter = (row: RuleRow, filter: RowFilter): boolean => {
   if (filter === 'off') return !row.enabled;

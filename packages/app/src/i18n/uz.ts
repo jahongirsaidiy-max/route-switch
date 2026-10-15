@@ -12,6 +12,13 @@ import {
 } from '@routeswitch/shared';
 
 import type { RsConnection, RsErrorCode } from '../renderer/src/rs';
+import { addRuleUz } from './sections/addRule.uz';
+import { rulesUz } from './sections/rules.uz';
+import { menuBarUz } from './sections/menuBar.uz';
+import { shellUz } from './sections/shell.uz';
+import { componentsUz } from './sections/components.uz';
+import { logUz } from './sections/log.uz';
+import { settingsUz } from './sections/settings.uz';
 
 /** What the UI shows about the helper: the connection kinds plus the renderer's own two. */
 export type HelperStatusKey = RsConnection['kind'] | 'loading' | 'unavailable';
@@ -41,6 +48,11 @@ export const uz = {
 
   /** A failure code the UI has no words for (only from a newer main process or helper). */
   unexpectedError: unexpected,
+
+  /** The menu bar window (TASK-DELTA-12; `sections/menuBar.*.ts`). */
+  menuBar: menuBarUz,
+  /** The tray, the main process's dialogs and its journal lines (TASK-DELTA-12; `sections/shell.*.ts`). */
+  ...shellUz,
 
   /** A failed `window.rs` call. */
   errors: {
@@ -237,4 +249,13 @@ export const uz = {
     hint: "Ilova matnlari shu tilda ko'rsatiladi. Helper jurnalidagi yozuvlar inglizcha qoladi.",
     saved: "Til o'zgartirildi.",
   },
+
+  /** The journal, settings and shared components (TASK-DELTA-14): `sections/*.ts`. */
+  log: logUz,
+  settings: settingsUz,
+  components: componentsUz,
+
+  /** The rules window and the add-rule dialog (TASK-DELTA-13): `sections/rules.*`, `sections/addRule.*`. */
+  rules: rulesUz,
+  addRule: addRuleUz,
 };

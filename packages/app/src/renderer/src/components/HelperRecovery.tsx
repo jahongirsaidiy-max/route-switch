@@ -1,7 +1,8 @@
 import type { ReactElement } from 'react';
 
+import type { I18n } from '../../../i18n';
 import type { RsApi } from '../rs';
-import { errorText, INSTALL_TEXT, type Feedback, type HelperRecovery as Recovery } from '../text';
+import { errorText, UZ, type Feedback, type HelperRecovery as Recovery } from '../text';
 import { Button } from './Button';
 import styles from './HelperRecovery.module.css';
 
@@ -18,6 +19,11 @@ export interface HelperRecoveryProps {
   readonly installing: boolean;
   /** `sm` for the rules window sidebar. */
   readonly size?: 'md' | 'sm';
+  /**
+   * The UI language (`useI18n()` of the screen); Uzbek when not given. A prop,
+   * not the context: screen tests render components by calling them, outside React.
+   */
+  readonly i18n?: I18n | undefined;
 }
 
 /**
@@ -32,21 +38,23 @@ export function HelperRecovery({
   onInstall,
   installing,
   size = 'md',
+  i18n = UZ,
 }: HelperRecoveryProps): ReactElement | null {
   if (recovery === null || recovery === 'repair-config') return null;
+  const { install, components } = i18n.t;
   return (
     <div className={styles['actions']} data-size={size}>
       <Button onClick={onReconnect} busy={reconnecting}>
-        {recovery === 'reconnect' ? 'Qayta ulanish' : 'Qayta tekshirish'}
+        {recovery === 'reconnect' ? components.recovery.reconnect : components.recovery.recheck}
       </Button>
       {recovery === 'reconnect' ? null : (
         <Button variant="primary" onClick={onInstall} busy={installing}>
-          {recovery === 'reinstall' ? INSTALL_TEXT.reinstall : INSTALL_TEXT.install}
+          {recovery === 'reinstall' ? install.reinstall : install.install}
         </Button>
       )}
       {installing ? (
         <p className={styles['hint']} role="status">
-          {INSTALL_TEXT.waiting}
+          {install.waiting}
         </p>
       ) : null}
     </div>
@@ -54,7 +62,7 @@ export function HelperRecovery({
 }
 
 /** "Qayta ulanish": the result arrives as a new connection in `onState`; only a refused call says something. */
-export async function requestReconnect(rs: Pick<RsApi, 'reconnectHelper'>): Promise<Feedback | null> {
+export async function requestReconnect(rs: Pick<RsApi, 'reconnectHelper'>, i18n: I18n = UZ): Promise<Feedback | null> {
   const result = await rs.reconnectHelper();
-  return result.ok ? null : { tone: 'danger', text: errorText(result.code) };
+  return result.ok ? null : { tone: 'danger', text: errorText(result.code, i18n) };
 }

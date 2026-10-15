@@ -36,6 +36,19 @@
 
 .addRule > button[data-size] {
   padding: 0 var(--rs-space-7);
+  white-space: nowrap;
+}
+
+/* The title block gives way to the button (a long Russian subtitle wraps; TASK-DELTA-13). */
+.header > div {
+  min-width: 0;
+}
+
+/* Toolbar buttons and the filter keep one line in every language. */
+.toolbar button,
+.filterSelect {
+  flex-shrink: 0;
+  white-space: nowrap;
 }
 
 /* Toolbar: padding 0 28 14, gap 10. */
@@ -219,6 +232,14 @@
   text-transform: uppercase;
 }
 
+/* A longer column name (ru "ИНТЕРФЕЙС") is cut, never pushes the grid (TASK-DELTA-13). */
+.headRow > span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 /* Row: padding 12 16, divider #F0F1F3, 13px. */
 .row {
   padding: var(--rs-space-6) var(--rs-space-8);
@@ -296,6 +317,8 @@
 
 /* Kind: 12px #5B5F68. */
 .kind {
+  min-width: 0;
+  overflow-wrap: anywhere;
   color: var(--rs-color-text-muted);
   font-size: var(--rs-text-small);
 }

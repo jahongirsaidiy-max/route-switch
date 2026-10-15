@@ -3,7 +3,14 @@
 import { LIMITS, MIN_SUBNET_PREFIX } from '@routeswitch/shared';
 
 import { plural } from './plural';
+import { addRuleEn } from './sections/addRule.en';
+import { rulesEn } from './sections/rules.en';
+import { menuBarEn } from './sections/menuBar.en';
+import { shellEn } from './sections/shell.en';
 import type { Messages } from './types';
+import { componentsEn } from './sections/components.en';
+import { logEn } from './sections/log.en';
+import { settingsEn } from './sections/settings.en';
 
 const unexpected = (code: string): string => `Unexpected error (${code}).`;
 
@@ -13,6 +20,9 @@ export const en: Messages = {
   unknownWindow: 'Unknown window. Open the app again from its menu bar icon.',
 
   unexpectedError: unexpected,
+
+  menuBar: menuBarEn,
+  ...shellEn,
 
   errors: {
     'not-connected': 'No connection to the helper — nothing was sent.',
@@ -195,4 +205,13 @@ export const en: Messages = {
     hint: 'The app shows its texts in this language. Entries the helper writes to the log stay in English.',
     saved: 'Language changed.',
   },
+
+  /** The journal, settings and shared components (TASK-DELTA-14): `sections/*.ts`. */
+  log: logEn,
+  settings: settingsEn,
+  components: componentsEn,
+
+  /** The rules window and the add-rule dialog (TASK-DELTA-13): `sections/rules.*`, `sections/addRule.*`. */
+  rules: rulesEn,
+  addRule: addRuleEn,
 };

@@ -2,7 +2,11 @@
 // (lost, back, never installed, config unreadable). The helper cannot report
 // these — it is the one that is gone — so the main process writes them into
 // the same buffer as the helper's `log` events, marked `source: 'app'`, in the
-// UI's words.
+// UI's words (`t.journal`, TASK-DELTA-12).
+//
+// A line is written in the language that is on when it is written, and stays
+// so: a later change of language does not rewrite the journal (the helper's
+// own lines are English whatever the language).
 //
 // Only real changes are written: `connecting` and `stopped` are steps, not
 // news, and a status equal to the last one written is skipped. A peer that
@@ -11,6 +15,7 @@
 
 import type { EventLogLevel } from '@routeswitch/shared';
 
+import { DEFAULT_LOCALE, i18nFor, isLocale, type I18n, type Locale } from '../i18n';
 import type { HelperStatus } from './helperClient';
 import type { LogBuffer } from './logBuffer';
 
@@ -19,44 +24,38 @@ export const CONNECTION_JOURNAL_BUDGET = 20;
 /** … of this length; one more line says that the rest of the window is not written. */
 export const CONNECTION_JOURNAL_WINDOW_MS = 10 * 60 * 1000;
 
-const DISCONNECT_WORDS: Readonly<Record<Extract<HelperStatus, { kind: 'disconnected' }>['reason'], string>> = {
-  'not-running': "helper ishlamayapti (socket bor, javob yo'q)",
-  'permission-denied': "helper socket'iga ruxsat yo'q",
-  'connection-lost': 'aloqa uzildi',
-  'protocol-error': 'helper tushunarsiz javob berdi',
-  timeout: 'helper javob bermadi',
-  error: "helper'ga ulanib bo'lmadi",
-};
-
 export interface JournalLine {
   readonly level: EventLogLevel;
   readonly msg: string;
 }
 
-/** The line for a status; null for the steps that are not written (`connecting`, `stopped`). */
-export function journalLineOf(status: HelperStatus): JournalLine | null {
+const UZ: I18n = i18nFor(DEFAULT_LOCALE);
+
+/** The line for a status, in the language given (Uzbek without one); null for the steps that are not written (`connecting`, `stopped`). */
+export function journalLineOf(status: HelperStatus, i18n: I18n = UZ): JournalLine | null {
+  const words = i18n.t.journal;
   switch (status.kind) {
     case 'connecting':
     case 'stopped':
       return null;
     case 'connected':
-      return { level: 'info', msg: `Helper bilan aloqa o'rnatildi (v${status.helperVersion})` };
+      return { level: 'info', msg: words.connected(status.helperVersion) };
     case 'not-installed':
-      return { level: 'warn', msg: "Helper o'rnatilmagan — qoidalar qo'llanmaydi" };
+      return { level: 'warn', msg: words.notInstalled };
     case 'disconnected':
-      return { level: 'warn', msg: `Helper bilan aloqa yo'q: ${DISCONNECT_WORDS[status.reason]}` };
+      return { level: 'warn', msg: words.disconnected(words.disconnectedWhy[status.reason]) };
     case 'config-unreadable':
-      return {
-        level: 'error',
-        msg: "Helper saqlangan config'ni o'qiy olmadi — hech bir qoida qo'llanmaydi. Import yoki bo'sh config bilan tiklang",
-      };
+      return { level: 'error', msg: words.configUnreadable };
     case 'incompatible':
       return {
         level: 'error',
-        msg: `Helper versiyasi mos emas: v${status.helperVersion}, protokol ${String(status.protocolVersion)} (kerak: ${String(status.expectedProtocolVersion)})`,
+        msg: words.incompatible(status.helperVersion, status.protocolVersion, status.expectedProtocolVersion),
       };
   }
 }
+
+/** The line written once when the budget of a window is spent. */
+export const flappingLineOf = (i18n: I18n = UZ): JournalLine => ({ level: 'warn', msg: i18n.t.journal.flapping });
 
 /** What makes two statuses the same news. */
 const keyOf = (status: HelperStatus): string =>
@@ -66,6 +65,12 @@ export interface ConnectionJournalDeps {
   readonly logBuffer: Pick<LogBuffer, 'push'>;
   /** Milliseconds since the epoch: the time of a line and of its budget window. */
   readonly now: () => number;
+  /**
+   * The UI language at the time of a line (`PreferencesStore.language`; never
+   * rejects). Lines then go into the buffer once it answers, in the order
+   * recorded, with the time they were recorded. Without it: Uzbek, at once.
+   */
+  readonly language?: () => Promise<Locale>;
 }
 
 export interface ConnectionJournal {
@@ -79,14 +84,32 @@ export function createConnectionJournal(deps: ConnectionJournalDeps): Connection
   let written = 0;
   let silenced = false;
 
-  const write = (line: JournalLine, at: number): void => {
+  const push = (line: JournalLine, at: number): void => {
     deps.logBuffer.push({ level: line.level, msg: line.msg, at: new Date(at).toISOString(), source: 'app' });
+  };
+
+  // Lines wait for the language one after another, so they keep their order.
+  let queue: Promise<void> = Promise.resolve();
+  const write = (lineIn: (i18n: I18n) => JournalLine | null, at: number): void => {
+    const { language } = deps;
+    if (language === undefined) {
+      const line = lineIn(UZ);
+      if (line !== null) push(line, at);
+      return;
+    }
+    queue = queue
+      .then(() => language().catch(() => DEFAULT_LOCALE))
+      .then((locale) => {
+        const line = lineIn(i18nFor(isLocale(locale) ? locale : DEFAULT_LOCALE));
+        if (line !== null) push(line, at);
+      })
+      // A failing buffer listener must not stop the lines after it (the buffer reports its own listeners' errors).
+      .catch(() => undefined);
   };
 
   return {
     record: (status) => {
-      const line = journalLineOf(status);
-      if (line === null) return;
+      if (journalLineOf(status) === null) return;
       const key = keyOf(status);
       if (key === lastKey) return;
       lastKey = key;
@@ -99,12 +122,12 @@ export function createConnectionJournal(deps: ConnectionJournalDeps): Connection
       }
       if (written < CONNECTION_JOURNAL_BUDGET) {
         written += 1;
-        write(line, at);
+        write((i18n) => journalLineOf(status, i18n), at);
         return;
       }
       if (silenced) return;
       silenced = true;
-      write({ level: 'warn', msg: "Helper bilan aloqa tez-tez o'zgarmoqda — keyingi o'zgarishlar 10 daqiqagacha jurnalga yozilmaydi" }, at);
+      write(flappingLineOf, at);
     },
   };
 }

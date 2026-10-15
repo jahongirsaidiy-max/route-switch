@@ -20,11 +20,13 @@ import {
   Toggle,
   TrashIcon,
 } from '../../components';
+import type { I18n } from '../../../../i18n';
 import { configStoreFor, useConfig, type ConfigView } from '../../hooks/useConfig';
 import { useEngineState, type EngineStateView } from '../../hooks/useEngineState';
+import { useI18n } from '../../hooks/useI18n';
 import { useNow } from '../../hooks/useNow';
 import type { RsApi } from '../../rs';
-import { errorText, helperNotice, networkWarnings, type Feedback } from '../../text';
+import { errorText, helperNotice, networkWarnings, UZ, type Feedback } from '../../text';
 import { statusLine } from '../MenuBar';
 import type { RulesApi } from './actions';
 import { createRulesController, focusTrashButton, INITIAL_RULES_UI, rulesHandlers, type RulesUiState } from './controller';
@@ -32,7 +34,7 @@ import {
   activeCount,
   notesById,
   overlapWarnings,
-  ROW_FILTER_LABELS,
+  ROW_FILTERS,
   ruleRows,
   visibleRows,
   type RowFilter,
@@ -58,11 +60,11 @@ import {
   type TransferUiState,
 } from './transfer';
 
-/** Why "Qoida qo'shish" and "Export" are off while the helper cannot load its stored config (TASK-300). */
-export const CONFIG_UNREADABLE_REASON = "Helper config'i buzilgan — avval import qiling yoki bo'sh config bilan boshlang";
+/** Why "Qoida qo'shish" and "Export" are off while the helper cannot load its stored config (TASK-300). Uzbek; the panel uses its language's. */
+export const CONFIG_UNREADABLE_REASON = UZ.t.rules.configUnreadableReason;
 
-/** Why "Qoida qo'shish" / "Tahrirlash" are off until the add-rule form exists. */
-export const ADD_RULE_UNAVAILABLE = "Qoida qo'shish oynasi hali tayyor emas";
+/** Why "Qoida qo'shish" / "Tahrirlash" are off until the add-rule form exists. Uzbek; the panel uses its language's. */
+export const ADD_RULE_UNAVAILABLE = UZ.t.rules.addRuleUnavailable;
 
 export interface RulesPanelProps {
   readonly engine: EngineStateView;
@@ -104,17 +106,22 @@ export interface RulesPanelProps {
   readonly onConfirmReset: () => void;
   /** The "Bo'sh config bilan boshlash" button, so the focus can return to it after a cancelled question. */
   readonly resetRef?: Ref<HTMLButtonElement> | undefined;
+  /** The UI language (`useI18n()`); Uzbek when not given. */
+  readonly i18n?: I18n | undefined;
 }
 
-const COLUMNS = ['Holat', 'Manzil', 'Turi', 'Interfeys', 'Izoh', ''] as const;
+const columns = (i18n: I18n): readonly string[] => {
+  const words = i18n.t.rules.columns;
+  return [words.status, words.target, words.kind, words.iface, words.note, ''];
+};
 
-function ReasonLine({ row }: { readonly row: RuleRow }): ReactElement | null {
+function ReasonLine({ row, i18n }: { readonly row: RuleRow; readonly i18n: I18n }): ReactElement | null {
   const status = row.status;
   if (status.kind === 'ok' || status.kind === 'none') return null;
   return (
     <>
       <span className={styles['reason']} data-tone={status.kind}>
-        {status.kind === 'warning' ? <StatusDot tone="warning" size="sm" label="Ogohlantirish" /> : null}
+        {status.kind === 'warning' ? <StatusDot tone="warning" size="sm" label={i18n.t.rules.warningMark} /> : null}
         {status.text}
       </span>
       {row.lastKnown === null ? null : <span className={styles['lastKnown']}>{row.lastKnown}</span>}
@@ -127,16 +134,17 @@ function ReasonLine({ row }: { readonly row: RuleRow }): ReactElement | null {
  * two ways out — the toolbar's "Import" (here too), or an empty config after
  * a confirmation.
  */
-function ConfigRecovery(props: RulesPanelProps): ReactElement {
+function ConfigRecovery(props: RulesPanelProps & { readonly i18n: I18n }): ReactElement {
   const { recovery } = props;
+  const t = props.i18n.t.rules;
   return (
     <>
       <div className={styles['recoveryActions']}>
         <Button variant="primary" busy={props.transfer.phase !== 'idle'} onClick={props.onImport}>
-          Config'ni import qilish
+          {t.importConfig}
         </Button>
         <Button ref={props.resetRef} busy={recovery.busy || recovery.confirming} onClick={props.onAskReset}>
-          Bo'sh config bilan boshlash
+          {t.startEmpty}
         </Button>
       </div>
       {recovery.confirming ? (
@@ -149,15 +157,14 @@ function ConfigRecovery(props: RulesPanelProps): ReactElement {
           }}
         >
           <p id="rules-reset-question" className={styles['confirmText']}>
-            Saqlangan (o'qib bo'lmaydigan) config bo'sh config bilan almashtirilsinmi? Undagi qoidalar qaytmaydi — qo'lda
-            tiklamoqchi bo'lsangiz, avval {PATHS.config} nusxasini oling.
+            {t.resetQuestion(PATHS.config)}
           </p>
           <Button variant="primary" busy={recovery.busy} onClick={props.onConfirmReset}>
-            Almashtirish
+            {t.replace}
           </Button>
           {/* The safe choice takes the focus (WAI-ARIA alertdialog). */}
           <Button autoFocus busy={recovery.busy} onClick={props.onCancelReset}>
-            Bekor qilish
+            {t.cancel}
           </Button>
         </div>
       ) : null}
@@ -172,15 +179,20 @@ function Row({
   onAskDelete,
   onEditRule,
   trashRef,
-}: { readonly row: RuleRow; readonly busy: boolean } & Pick<RulesPanelProps, 'onToggleRule' | 'onAskDelete' | 'onEditRule' | 'trashRef'>): ReactElement {
+  i18n,
+}: { readonly row: RuleRow; readonly busy: boolean; readonly i18n: I18n } & Pick<
+  RulesPanelProps,
+  'onToggleRule' | 'onAskDelete' | 'onEditRule' | 'trashRef'
+>): ReactElement {
   const status = row.status;
+  const t = i18n.t.rules;
   return (
     <div className={styles['row']} role="row" data-enabled={row.enabled} data-status={status.kind}>
       <span role="cell" className={styles['cell']}>
         <Toggle
           size="sm"
           checked={row.enabled}
-          label={`${row.target} qoidasi`}
+          label={t.toggleLabel(row.target)}
           busy={busy}
           onChange={(next) => {
             onToggleRule(row.id, next);
@@ -193,10 +205,10 @@ function Row({
             {row.target}
           </span>
           {/* The reason is read once, from the line below; the tag carries only the status. */}
-          {status.kind === 'warning' ? <StatusBadge status="active" /> : null}
-          {status.kind === 'pending' || status.kind === 'error' ? <StatusBadge status={status.kind} /> : null}
+          {status.kind === 'warning' ? <StatusBadge status="active" i18n={i18n} /> : null}
+          {status.kind === 'pending' || status.kind === 'error' ? <StatusBadge status={status.kind} i18n={i18n} /> : null}
         </span>
-        <ReasonLine row={row} />
+        <ReasonLine row={row} i18n={i18n} />
       </span>
       <span role="cell" className={styles['kind']}>
         {row.kindLabel}
@@ -209,11 +221,11 @@ function Row({
         {row.detail}
       </span>
       <span role="cell" className={styles['actions']}>
-        <span title={onEditRule === undefined ? ADD_RULE_UNAVAILABLE : undefined}>
+        <span title={onEditRule === undefined ? t.addRuleUnavailable : undefined}>
           <Button
             variant="ghost"
             size="icon"
-            label={onEditRule === undefined ? `Tahrirlash — ${ADD_RULE_UNAVAILABLE}` : `${row.target} qoidasini tahrirlash`}
+            label={onEditRule === undefined ? t.editOff(t.addRuleUnavailable) : t.editLabel(row.target)}
             disabled={onEditRule === undefined}
             onClick={() => {
               onEditRule?.(row.id);
@@ -225,7 +237,7 @@ function Row({
         <Button
           variant="ghost"
           size="icon"
-          label={`${row.target} qoidasini o'chirish`}
+          label={t.deleteLabel(row.target)}
           busy={busy}
           ref={trashRef?.(row.id)}
           onClick={() => {
@@ -239,25 +251,25 @@ function Row({
   );
 }
 
-function TableBody(props: RulesPanelProps & { readonly rows: readonly RuleRow[]; readonly visible: readonly RuleRow[] }): ReactElement {
-  const { rows, visible } = props;
+function TableBody(
+  props: RulesPanelProps & { readonly rows: readonly RuleRow[]; readonly visible: readonly RuleRow[]; readonly i18n: I18n },
+): ReactElement {
+  const { rows, visible, i18n } = props;
+  const t = i18n.t.rules;
   if (rows.length === 0) {
     return (
       <div className={styles['empty']} role="status">
-        <p className={styles['emptyTitle']}>Hali qoida yo'q</p>
-        <p>Qoida qo'shilgach, manzil shu yerda ko'rinadi va tanlangan interfeys orqali yo'naltiriladi.</p>
+        <p className={styles['emptyTitle']}>{t.emptyTitle}</p>
+        <p>{t.emptyText}</p>
       </div>
     );
   }
   if (visible.length === 0) {
+    const query = props.query.trim();
     return (
       <div className={styles['empty']} role="status">
-        <p className={styles['emptyTitle']}>Hech narsa topilmadi</p>
-        <p>
-          {props.query.trim() === '' ? '' : `«${props.query.trim()}» bo'yicha `}
-          {props.filter === 'all' ? '' : `«${ROW_FILTER_LABELS[props.filter]}» orasida `}
-          mos qoida yo'q.
-        </p>
+        <p className={styles['emptyTitle']}>{t.noMatchTitle}</p>
+        <p>{t.noMatchText(query === '' ? null : query, props.filter === 'all' ? null : t.filters[props.filter])}</p>
       </div>
     );
   }
@@ -272,6 +284,7 @@ function TableBody(props: RulesPanelProps & { readonly rows: readonly RuleRow[];
           onAskDelete={props.onAskDelete}
           onEditRule={props.onEditRule}
           trashRef={props.trashRef}
+          i18n={i18n}
         />
       ))}
     </div>
@@ -281,29 +294,29 @@ function TableBody(props: RulesPanelProps & { readonly rows: readonly RuleRow[];
 /** The screen for given data; `RulesScreen` supplies the live data and the actions. */
 export function RulesPanel(props: RulesPanelProps): ReactElement {
   const { engine, config } = props;
+  const i18n = props.i18n ?? UZ;
+  const t = i18n.t.rules;
   const state = engine.helper === 'connected' ? engine.state : null;
   const loaded = state !== null && config.config !== null ? { state, config: config.config } : null;
-  const rows = loaded === null ? [] : ruleRows(loaded.config, loaded.state, props.now);
-  const warnings = state === null ? [] : networkWarnings(state, config.config);
+  const rows = loaded === null ? [] : ruleRows(loaded.config, loaded.state, props.now, i18n);
+  const warnings = state === null ? [] : networkWarnings(state, config.config, i18n);
   const visible = loaded === null ? [] : visibleRows(rows, notesById(loaded.config), props.query, props.filter);
   const overlaps = loaded === null ? [] : overlapWarnings(loaded.config);
   const confirming = rows.find((row) => row.id === props.confirmingDelete) ?? null;
   const importing = props.transfer.preview;
-  const notice = state === null ? helperNotice(engine) : null;
+  const notice = state === null ? helperNotice(engine, i18n) : null;
   const configBroken = engine.helper === 'config-unreadable';
-  const addRuleOff = props.onAddRule === undefined ? ADD_RULE_UNAVAILABLE : configBroken ? CONFIG_UNREADABLE_REASON : null;
-  const line = loaded === null ? null : statusLine(loaded.state, props.now);
+  const addRuleOff = props.onAddRule === undefined ? t.addRuleUnavailable : configBroken ? t.configUnreadableReason : null;
+  const line = loaded === null ? null : statusLine(loaded.state, props.now, i18n);
 
   return (
     <section className={styles['screen']} aria-labelledby="rules-title">
       <header className={styles['header']}>
         <div>
           <h1 id="rules-title" className={styles['title']}>
-            Qoidalar
+            {t.title}
           </h1>
-          <p className={styles['subtitle']}>
-            Qaysi manzil qaysi interfeys orqali borishini belgilang. Qolgan trafik default kanal orqali ketadi.
-          </p>
+          <p className={styles['subtitle']}>{t.subtitle}</p>
         </div>
         <span className={styles['addRule']} title={addRuleOff ?? undefined}>
           <Button
@@ -313,10 +326,10 @@ export function RulesPanel(props: RulesPanelProps): ReactElement {
               props.onAddRule?.();
             }}
             disabled={addRuleOff !== null}
-            label={addRuleOff === null ? undefined : `Qoida qo'shish — ${addRuleOff}`}
+            label={addRuleOff === null ? undefined : t.addRuleOff(addRuleOff)}
           >
             <PlusIcon size={14} />
-            Qoida qo'shish
+            {t.addRule}
           </Button>
         </span>
       </header>
@@ -324,11 +337,11 @@ export function RulesPanel(props: RulesPanelProps): ReactElement {
       <div className={styles['toolbar']}>
         <label className={styles['search']}>
           <SearchIcon size={14} className={styles['searchIcon']} />
-          <span className={styles['visuallyHidden']}>Qidirish</span>
+          <span className={styles['visuallyHidden']}>{t.search}</span>
           <input
             type="search"
             className={styles['searchInput']}
-            placeholder="IP, subnet, domen yoki izoh bo'yicha qidirish"
+            placeholder={t.searchPlaceholder}
             value={props.query}
             onChange={(event) => {
               props.onQueryChange(event.target.value);
@@ -336,7 +349,7 @@ export function RulesPanel(props: RulesPanelProps): ReactElement {
           />
         </label>
         <label className={styles['filter']}>
-          <span className={styles['visuallyHidden']}>Ko'rsatish</span>
+          <span className={styles['visuallyHidden']}>{t.filterLabel}</span>
           <select
             className={styles['filterSelect']}
             value={props.filter}
@@ -344,9 +357,9 @@ export function RulesPanel(props: RulesPanelProps): ReactElement {
               props.onFilterChange(event.target.value as RowFilter);
             }}
           >
-            {(Object.keys(ROW_FILTER_LABELS) as RowFilter[]).map((filter) => (
+            {ROW_FILTERS.map((filter) => (
               <option key={filter} value={filter}>
-                {ROW_FILTER_LABELS[filter]}
+                {t.filters[filter]}
               </option>
             ))}
           </select>
@@ -355,20 +368,20 @@ export function RulesPanel(props: RulesPanelProps): ReactElement {
         <Button
           ref={props.importRef}
           busy={props.transfer.phase !== 'idle'}
-          label="Config import (JSON fayldan)"
+          label={t.importLabel}
           onClick={props.onImport}
         >
-          Import
+          {t.import}
         </Button>
         {/* Nothing to export while the stored config cannot be read; the reason is in the name (a disabled button is not focusable). */}
-        <span title={configBroken ? CONFIG_UNREADABLE_REASON : undefined}>
+        <span title={configBroken ? t.configUnreadableReason : undefined}>
           <Button
             busy={props.transfer.phase !== 'idle'}
             disabled={configBroken}
-            label={configBroken ? `Config export — ${CONFIG_UNREADABLE_REASON}` : 'Config export (JSON faylga)'}
+            label={configBroken ? t.exportOff(t.configUnreadableReason) : t.exportLabel}
             onClick={props.onExport}
           >
-            Export
+            {t.export}
           </Button>
         </span>
       </div>
@@ -403,7 +416,7 @@ export function RulesPanel(props: RulesPanelProps): ReactElement {
           }}
         >
           <p id="rules-import-question" className={styles['confirmText']}>
-            {importQuestion(importSummary(config.config, importing.config))}
+            {importQuestion(importSummary(config.config, importing.config), i18n)}
           </p>
           <Button
             variant="primary"
@@ -412,11 +425,11 @@ export function RulesPanel(props: RulesPanelProps): ReactElement {
               props.onConfirmImport(importing.token);
             }}
           >
-            Almashtirish
+            {t.replace}
           </Button>
           {/* The safe choice takes the focus (WAI-ARIA alertdialog). */}
           <Button autoFocus onClick={props.onCancelImport}>
-            Bekor qilish
+            {t.cancel}
           </Button>
         </div>
       )}
@@ -433,7 +446,7 @@ export function RulesPanel(props: RulesPanelProps): ReactElement {
           }}
         >
           <p id="rules-delete-question" className={styles['confirmText']}>
-            «{confirming.target}» qoidasi o'chirilsinmi? Uning route'lari olib tashlanadi.
+            {t.deleteQuestion(confirming.target)}
           </p>
           <Button
             variant="primary"
@@ -442,11 +455,11 @@ export function RulesPanel(props: RulesPanelProps): ReactElement {
               props.onConfirmDelete(confirming.id);
             }}
           >
-            O'chirish
+            {t.remove}
           </Button>
           {/* The safe choice takes the focus (WAI-ARIA alertdialog). */}
           <Button autoFocus onClick={props.onCancelDelete}>
-            Bekor qilish
+            {t.cancel}
           </Button>
         </div>
       )}
@@ -460,16 +473,16 @@ export function RulesPanel(props: RulesPanelProps): ReactElement {
       )}
 
       {overlaps.length === 0 ? null : (
-        <div className={styles['overlaps']} role="note" aria-label="Ustma-ust manzillar">
-          <p className={styles['overlapsTitle']}>Ustma-ust manzillar — aniqrog'i (uzunroq prefiks) ustun keladi:</p>
+        <div className={styles['overlaps']} role="note" aria-label={t.overlapsLabel}>
+          <p className={styles['overlapsTitle']}>{t.overlapsTitle}</p>
           <ul className={styles['overlapList']}>
             {overlaps.slice(0, 3).map((overlap) => (
               <li key={`${overlap.wider}|${overlap.narrower}`}>
-                {overlap.narrower} → {overlap.wider} ichida
-                {overlap.crossInterface ? ' · boshqa interfeys' : ''}
+                {t.overlapInside(overlap.narrower, overlap.wider)}
+                {overlap.crossInterface ? t.overlapOtherIface : ''}
               </li>
             ))}
-            {overlaps.length > 3 ? <li>yana {overlaps.length - 3} ta</li> : null}
+            {overlaps.length > 3 ? <li>{t.overlapMore(overlaps.length - 3)}</li> : null}
           </ul>
         </div>
       )}
@@ -480,32 +493,32 @@ export function RulesPanel(props: RulesPanelProps): ReactElement {
             <>
               <p className={styles['emptyTitle']}>{notice.title}</p>
               {notice.text === '' ? null : <p>{notice.text}</p>}
-              {notice.recovery === 'repair-config' ? <ConfigRecovery {...props} /> : null}
+              {notice.recovery === 'repair-config' ? <ConfigRecovery {...props} i18n={i18n} /> : null}
             </>
           ) : config.phase === 'failed' ? (
             <>
-              <p className={styles['emptyTitle']}>Qoidalarni o'qib bo'lmadi</p>
-              <p>{config.error === null ? '' : errorText(config.error.code)}</p>
+              <p className={styles['emptyTitle']}>{t.readFailedTitle}</p>
+              <p>{config.error === null ? '' : errorText(config.error.code, i18n)}</p>
               <Button variant="ghost" onClick={props.onReloadConfig}>
-                Qayta o'qish
+                {t.reload}
               </Button>
             </>
           ) : (
-            <p>Qoidalar o'qilmoqda…</p>
+            <p>{t.reading}</p>
           )}
         </div>
       ) : (
-        <div className={styles['table']} role="table" aria-label="Qoidalar" aria-rowcount={visible.length + 1}>
+        <div className={styles['table']} role="table" aria-label={t.title} aria-rowcount={visible.length + 1}>
           <div role="rowgroup" className={styles['head']}>
             <div className={styles['headRow']} role="row">
-              {COLUMNS.map((column, index) => (
+              {columns(i18n).map((column, index) => (
                 <span key={index} role="columnheader">
                   {column}
                 </span>
               ))}
             </div>
           </div>
-          <TableBody {...props} rows={rows} visible={visible} />
+          <TableBody {...props} rows={rows} visible={visible} i18n={i18n} />
         </div>
       )}
 
@@ -518,9 +531,7 @@ export function RulesPanel(props: RulesPanelProps): ReactElement {
           <>
             <span className={styles['footerMono']}>{line.text}</span>
             <span role="status">
-              {loaded.state.enabled
-                ? `${String(activeCount(loaded.state))} ta qoida faol · tarmoq o'zgarganda avtomatik qo'llanadi`
-                : 'Routing menu bar oynasidagi umumiy tugma bilan yoqiladi'}
+              {loaded.state.enabled ? t.activeRules(activeCount(loaded.state)) : t.routingOff}
               {line.errors === null ? null : <span className={styles['errors']}> · {line.errors}</span>}
             </span>
           </>
@@ -541,6 +552,10 @@ export interface RulesScreenProps {
 /** The rules screen of the rules window. */
 export function RulesScreen({ rs: given, onAddRule, onEditRule }: RulesScreenProps): ReactElement {
   const rs = given ?? window.rs;
+  const i18n = useI18n();
+  // The controllers write their messages in the language of the moment the outcome arrives.
+  const language = useRef(i18n);
+  language.current = i18n;
   const engine = useEngineState(rs);
   const config = useConfig(rs);
   const now = useNow();
@@ -559,6 +574,7 @@ export function RulesScreen({ rs: given, onAddRule, onEditRule }: RulesScreenPro
           setUi(latest.current);
         },
         () => latest.current,
+        () => language.current,
       ),
     [rs],
   );
@@ -597,6 +613,7 @@ export function RulesScreen({ rs: given, onAddRule, onEditRule }: RulesScreenPro
           setTransfer(latestTransfer.current);
         },
         () => latestTransfer.current,
+        () => language.current,
       ),
     [rs],
   );
@@ -618,6 +635,7 @@ export function RulesScreen({ rs: given, onAddRule, onEditRule }: RulesScreenPro
           setRecovery(latestRecovery.current);
         },
         () => latestRecovery.current,
+        () => language.current,
       ),
     [rs],
   );
@@ -651,6 +669,7 @@ export function RulesScreen({ rs: given, onAddRule, onEditRule }: RulesScreenPro
       recovery={recovery}
       {...recoveryHandlers(recoveryController)}
       resetRef={resetButton}
+      i18n={i18n}
     />
   );
 }

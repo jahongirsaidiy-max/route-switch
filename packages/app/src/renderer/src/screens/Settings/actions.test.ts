@@ -2,6 +2,7 @@ import type { AdapterInfo, Config, SetConfigResult } from '@routeswitch/shared';
 import { describe, expect, it, vi } from 'vitest';
 
 import type { RsResult, RsServiceOrder } from '../../rs';
+import { i18nFor } from '../../../../i18n';
 import { errorText } from '../../text';
 import {
   copyServiceOrderCommand,
@@ -145,5 +146,32 @@ describe('uninstallHelper', () => {
     expect(await uninstallHelper(fakeApi({ uninstallHelper: () => refused('timeout') }))).toMatchObject({
       text: expect.stringContaining("noma'lum") as unknown,
     });
+  });
+});
+
+describe('the settings actions in every language (TASK-DELTA-14)', () => {
+  it.each([
+    ['uz', "RouteSwitch login'da ishga tushadi.", "Login'da ishga tushish o'chirildi.", 'Ethernet roli endi en7 da.', "Buyruq nusxalandi — Terminal'ga qo'ying."],
+    ['ru', 'RouteSwitch будет запускаться при входе.', 'Запуск при входе выключен.', 'Роль Ethernet теперь у en7.', 'Команда скопирована — вставьте её в Терминал.'],
+    ['en', 'RouteSwitch will open at login.', 'Open at login is turned off.', 'The Ethernet role is now on en7.', 'Command copied — paste it into Terminal.'],
+  ] as const)('%s', async (locale, on, off, saved, copied) => {
+    const i18n = i18nFor(locale);
+    expect((await setOpenAtLogin(fakeApi(), true, i18n)).feedback.text).toBe(on);
+    expect((await setOpenAtLogin(fakeApi(), false, i18n)).feedback.text).toBe(off);
+    expect(await saveEthernetOverride(fakeApi(), 'en7', i18n)).toEqual({ tone: 'success', text: saved });
+    expect((await saveEthernetOverride(fakeApi(), null, i18n)).text).toBe(i18n.t.settings.ethernet.savedAuto);
+    expect((await copyServiceOrderCommand(fakeApi(), i18n)).feedback.text).toBe(copied);
+  });
+
+  it('refusals and a setting macOS did not take are worded in the language given', async () => {
+    const ru = i18nFor('ru');
+    expect((await setOpenAtLogin(fakeApi({ setOpenAtLogin: () => refused('timeout') }), true, ru)).feedback.text).toBe(errorText('timeout', ru));
+    const ignored = fakeApi({ setOpenAtLogin: () => Promise.resolve({ ok: true, value: { openAtLogin: false } } as const) });
+    expect((await setOpenAtLogin(ignored, true, ru)).feedback.text).toContain('Объекты входа');
+    expect(await saveEthernetOverride(fakeApi({ getConfig: () => refused('not-connected') }), 'en7', ru)).toEqual({
+      tone: 'danger',
+      text: errorText('not-connected', ru),
+    });
+    expect((await uninstallHelper(fakeApi(), i18nFor('en'))).text).toBe('Helper removed: its routes and resolver files are gone. Routing has stopped.');
   });
 });

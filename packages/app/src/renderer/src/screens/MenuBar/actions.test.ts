@@ -1,6 +1,7 @@
 import type { StateResult } from '@routeswitch/shared';
 import { describe, expect, it, vi } from 'vitest';
 
+import { i18nFor } from '../../../../i18n';
 import type { RsResult } from '../../rs';
 import { openRules, reapply, setRouting, type MenuBarApi } from './actions';
 import { STATE } from './fixtures';
@@ -40,5 +41,17 @@ describe('menu bar actions', () => {
   it('a rules window that would not open says so', async () => {
     const rs = api({ ok: false, code: 'forbidden', error: 'Calls are answered only for the app page' });
     expect(await openRules(rs)).toEqual({ tone: 'danger', text: "Qoidalar oynasi ochilmadi. Bu oynadan ruxsat yo'q." });
+  });
+
+  it('the messages are in the language given (TASK-DELTA-12)', async () => {
+    const forbidden = api({ ok: false, code: 'forbidden', error: 'x' });
+    expect(await openRules(forbidden, i18nFor('en'))).toEqual({
+      tone: 'danger',
+      text: 'The rules window did not open. This window is not allowed to do that.',
+    });
+    expect((await openRules(forbidden, i18nFor('ru')))?.text).toMatch(/^Окно правил не открылось\. /);
+    const lost = api({ ok: false, code: 'not-connected', error: 'x' });
+    expect(await setRouting(lost, true, i18nFor('en'))).toEqual({ tone: 'danger', text: 'No connection to the helper — nothing was sent.' });
+    expect((await reapply(lost, i18nFor('ru')))?.text).toBe(i18nFor('ru').t.errors['not-connected']);
   });
 });

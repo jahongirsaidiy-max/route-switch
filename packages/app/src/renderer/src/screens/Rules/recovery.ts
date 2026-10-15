@@ -3,8 +3,9 @@
 // toolbar's "Import". Plain functions over the preload API and an update
 // function, like `controller.ts`: every transition is tested without a DOM.
 
+import type { I18n } from '../../../../i18n';
 import type { RsApi } from '../../rs';
-import { errorText, type Feedback } from '../../text';
+import { errorText, UZ, type Feedback } from '../../text';
 
 export type RecoveryApi = Pick<RsApi, 'resetConfig'>;
 
@@ -33,9 +34,16 @@ export interface RecoveryController {
   readonly focusDone: () => void;
 }
 
-export const RESET_DONE = "Bo'sh config saqlandi — helper yana ishlayapti. Endi qoida qo'shishingiz yoki import qilishingiz mumkin.";
+/** The success message in Uzbek (the screen shows `t.rules.resetDone` of its language). */
+export const RESET_DONE = UZ.t.rules.resetDone;
 
-export function createRecoveryController(rs: RecoveryApi, update: RecoveryUiUpdate, current: () => RecoveryUiState): RecoveryController {
+/** `i18n` is read when the outcome is written. */
+export function createRecoveryController(
+  rs: RecoveryApi,
+  update: RecoveryUiUpdate,
+  current: () => RecoveryUiState,
+  i18n: () => I18n = () => UZ,
+): RecoveryController {
   return {
     ask: () => {
       update((state) => (state.busy ? state : { ...state, confirming: true, feedback: null, focusReset: false }));
@@ -48,11 +56,14 @@ export function createRecoveryController(rs: RecoveryApi, update: RecoveryUiUpda
       if (!state.confirming || state.busy) return;
       update((next) => ({ ...next, busy: true, feedback: null }));
       const result = await rs.resetConfig();
+      const words = i18n();
       update((next) => ({
         ...next,
         busy: false,
         confirming: !result.ok,
-        feedback: result.ok ? { tone: 'success', text: RESET_DONE } : { tone: 'danger', text: `Config almashtirilmadi: ${errorText(result.code)}` },
+        feedback: result.ok
+          ? { tone: 'success', text: words.t.rules.resetDone }
+          : { tone: 'danger', text: words.t.rules.replaceFailed(errorText(result.code, words)) },
       }));
     },
     focusDone: () => {

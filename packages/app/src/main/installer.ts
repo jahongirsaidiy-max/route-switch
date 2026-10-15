@@ -9,9 +9,11 @@
 // `networksetup` in `settings.ts`).
 //
 // What reaches root is fixed here and nowhere else:
-// - the AppleScript source is a constant (`ELEVATION_SCRIPT`); it takes its
-//   words from `argv` and quotes each one with AppleScript's own
-//   `quoted form of`, so no path is ever part of the script text;
+// - the AppleScript source is a constant, one per UI language
+//   (`ELEVATION_SCRIPTS`: only the dialog's sentence differs, written out in
+//   full — nothing is interpolated); it takes its words from `argv` and
+//   quotes each one with AppleScript's own `quoted form of`, so no path is
+//   ever part of the script text;
 // - the words are `/bin/bash`, a script of the app's own resources
 //   (`install-helper.sh` / `uninstall.sh`) and, for install, the resources
 //   directory itself. The page sends no argument at all.
@@ -26,6 +28,7 @@ import path from 'node:path';
 
 import { LAUNCHD_LABEL } from '@routeswitch/shared';
 
+import { DEFAULT_LOCALE, isLocale, type Locale } from '../i18n';
 import type { RsHelperSetupResult, RsResult } from '../renderer/src/rs';
 import type { Logger } from './logger';
 
@@ -41,23 +44,50 @@ export const UNINSTALL_SCRIPT = 'uninstall.sh';
 /** What `install-helper.sh <resources>` copies: the binary and its LaunchDaemon plist. */
 export const HELPER_PACKAGE_FILES = [LAUNCHD_LABEL, `${LAUNCHD_LABEL}.plist`] as const;
 
-/** The text of the system password dialog. Fixed: nothing of the page or the system goes into it. */
-export const PASSWORD_PROMPT = "RouteSwitch routing helper'ini boshqarish uchun administrator paroli kerak.";
+/**
+ * The text of the system password dialog, per UI language. Fixed: nothing of
+ * the page or the system goes into it. Each is also written out, word for
+ * word, in its `ELEVATION_SCRIPTS` line (a test holds the two together).
+ */
+export const PASSWORD_PROMPTS: Readonly<Record<Locale, string>> = {
+  uz: "RouteSwitch routing helper'ini boshqarish uchun administrator paroli kerak.",
+  ru: 'Для управления helper маршрутизации RouteSwitch нужен пароль администратора.',
+  en: 'RouteSwitch needs an administrator password to manage its routing helper.',
+};
+
+/** The Uzbek prompt (the default language). */
+export const PASSWORD_PROMPT = PASSWORD_PROMPTS.uz;
+
+/** The lines of every script before and after the `do shell script` line. */
+const SCRIPT_HEAD = ['on run argv', 'set cmd to ""', 'repeat with arg_ in argv', 'set cmd to cmd & " " & quoted form of (arg_ as text)', 'end repeat'] as const;
+const SCRIPT_TAIL = ['end run'] as const;
 
 /**
- * The AppleScript run by `osascript`, one `-e` per line. Its arguments are the
- * command's words; each is quoted by `quoted form of`, and the command runs
- * as root after the system dialog. Constant: the words come only as `argv`.
+ * The AppleScript run by `osascript`, one `-e` per line, one per UI language.
+ * Its arguments are the command's words; each is quoted by `quoted form of`,
+ * and the command runs as root after the system dialog. Constant: the words
+ * come only as `argv`, and each language's prompt line is a literal.
  */
-export const ELEVATION_SCRIPT = [
-  'on run argv',
-  'set cmd to ""',
-  'repeat with arg_ in argv',
-  'set cmd to cmd & " " & quoted form of (arg_ as text)',
-  'end repeat',
-  `do shell script cmd with prompt "${PASSWORD_PROMPT}" with administrator privileges`,
-  'end run',
-] as const;
+export const ELEVATION_SCRIPTS: Readonly<Record<Locale, readonly string[]>> = {
+  uz: [
+    ...SCRIPT_HEAD,
+    'do shell script cmd with prompt "RouteSwitch routing helper\'ini boshqarish uchun administrator paroli kerak." with administrator privileges',
+    ...SCRIPT_TAIL,
+  ],
+  ru: [
+    ...SCRIPT_HEAD,
+    'do shell script cmd with prompt "Для управления helper маршрутизации RouteSwitch нужен пароль администратора." with administrator privileges',
+    ...SCRIPT_TAIL,
+  ],
+  en: [
+    ...SCRIPT_HEAD,
+    'do shell script cmd with prompt "RouteSwitch needs an administrator password to manage its routing helper." with administrator privileges',
+    ...SCRIPT_TAIL,
+  ],
+};
+
+/** The Uzbek script (the default language). */
+export const ELEVATION_SCRIPT = ELEVATION_SCRIPTS.uz;
 
 /** Install waits for an old helper to stop (≤ 70 s) and the new one to start (≤ 20 s); the user types a password first. */
 export const ELEVATION_TIMEOUT_MS = 10 * 60 * 1000;
@@ -101,6 +131,8 @@ export interface InstallerDeps {
   readonly uid: number;
   readonly run: ElevationRunner;
   readonly fs?: PackageFileSystem;
+  /** The UI language, for the password dialog's text (`PreferencesStore.language`; never rejects). Uzbek without it. */
+  readonly language?: () => Promise<Locale>;
   readonly logger: Logger;
 }
 
@@ -169,9 +201,9 @@ export async function checkPackage(
   return { ok: true, dir };
 }
 
-/** The `osascript` arguments for one command: the fixed script, then the command's words as `argv`. */
-export function elevationArgs(words: readonly string[]): string[] {
-  return [...ELEVATION_SCRIPT.flatMap((line) => ['-e', line]), ...words];
+/** The `osascript` arguments for one command: the fixed script of the language, then the command's words as `argv`. */
+export function elevationArgs(words: readonly string[], locale: Locale = DEFAULT_LOCALE): string[] {
+  return [...ELEVATION_SCRIPTS[locale].flatMap((line) => ['-e', line]), ...words];
 }
 
 /** One line of text for the page: no control characters, at most `MAX_DETAIL_LENGTH`. */
@@ -212,6 +244,13 @@ const ACTIONS = {
   uninstall: { script: UNINSTALL_SCRIPT, files: [UNINSTALL_SCRIPT], withDir: false, verb: 'uninstall' },
 } as const;
 
+/** The language of the password dialog: Uzbek when none is given, the answer is not a language, or it fails. */
+async function languageOf(deps: Pick<InstallerDeps, 'language'>): Promise<Locale> {
+  if (deps.language === undefined) return DEFAULT_LOCALE;
+  const chosen = await deps.language().catch(() => DEFAULT_LOCALE);
+  return isLocale(chosen) ? chosen : DEFAULT_LOCALE;
+}
+
 export function createInstaller(deps: InstallerDeps): Installer {
   const logger = deps.logger.child({ component: 'installer' });
   const fs: PackageFileSystem = deps.fs ?? { lstat, realpath };
@@ -233,8 +272,9 @@ export function createInstaller(deps: InstallerDeps): Installer {
       }
       const scriptPath = path.join(checked.dir, script);
       const words = withDir ? [BASH, scriptPath, checked.dir] : [BASH, scriptPath];
-      logger.info('Asking for the administrator password', { action, binary: OSASCRIPT, command: words.join(' ') });
-      const run = await deps.run(OSASCRIPT, elevationArgs(words));
+      const locale = await languageOf(deps);
+      logger.info('Asking for the administrator password', { action, binary: OSASCRIPT, command: words.join(' '), language: locale });
+      const run = await deps.run(OSASCRIPT, elevationArgs(words, locale));
       const outcome = classifyRun(run);
       switch (outcome.kind) {
         case 'done':
