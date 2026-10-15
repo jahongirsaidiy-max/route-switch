@@ -2,8 +2,9 @@
  * The loopback DNS forwarding proxy (ADR-002): UDP and TCP on
  * `127.0.0.1:954` (`DNS_PROXY`). It forwards each query unchanged (only the
  * 2-byte ID is swapped) to one upstream server, and returns the reply byte for
- * byte with the client's ID restored. For a name a wildcard rule owns it first
- * hands the A answers to `learn` and waits — at most `LEARN_WAIT_MS` — so the
+ * byte with the client's ID restored. For a name a rule owns (a wildcard, or
+ * an exact domain rule under a wildcard's base) it first hands the A answers
+ * to `learn` and waits — at most `LEARN_WAIT_MS` — so the
  * host routes are in place before the client connects.
  *
  * Root runs this, and it is the helper's only network listener, so every

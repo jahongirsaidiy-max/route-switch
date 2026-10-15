@@ -615,5 +615,20 @@ describe('wildcard rules (TASK-DELTA-28)', () => {
       expect(result.match).toEqual({ ruleId: WILD, via: 'wildcard', precedence: 'only-match' });
       expect(result.notes).toEqual([]);
     });
+
+    it('an address the proxy learned for an exact rule under the base belongs to the exact rule (TASK-DELTA-30)', async () => {
+      const h = setup({
+        config: wildRules([{ id: EXACT, kind: 'domain', target: 'www.corp.local', iface: 'wifi' }]),
+        state: wildState(),
+        cache: { [EXACT]: { addresses: ['203.0.113.10'], truncated: false, servers: ['192.168.1.1'], source: 'interface' } },
+        applied: [
+          { dst: '203.0.113.10', gateway: '192.168.1.1', ruleIds: [EXACT] },
+          { dst: '10.30.0.6', gateway: '192.168.1.1', ruleIds: [EXACT] },
+        ],
+        routes: { '10.30.0.6': found('10.30.0.6', 'en0', '192.168.1.1') },
+      });
+      const result = await h.run('10.30.0.6');
+      expect(result.match).toEqual({ ruleId: EXACT, via: 'domain', precedence: 'only-match' });
+    });
   });
 });

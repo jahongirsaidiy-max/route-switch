@@ -311,13 +311,19 @@ export const runDiagnose = async (target: string, deps: DiagnoseDeps): Promise<D
   const applied = deps.getApplied();
   const wildcardRules = new Map(config.rules.filter(isWildcardRule).map((entry) => [entry.id, entry]));
   /** A wildcard rule's addresses are the host routes applied for it: what its DNS proxy learned. */
-  const learnedOf = (wildcard: Rule): string[] =>
+  const learnedOf = (wildcard: Pick<Rule, 'id' | 'dns'>): string[] =>
     applied
       .filter((entry) => entry.ruleIds.includes(wildcard.id) && !entry.dst.includes('/') && entry.dst !== wildcard.dns)
       .map((entry) => entry.dst);
+  const domainRules = new Map(config.rules.filter((entry) => entry.kind === 'domain').map((entry) => [entry.id, entry]));
   const cached: CachedAddresses = (ruleId) => {
     const wildcard = wildcardRules.get(ruleId);
-    return wildcard === undefined ? (deps.peekDomain(ruleId)?.addresses ?? null) : learnedOf(wildcard);
+    if (wildcard !== undefined) return learnedOf(wildcard);
+    const resolved = deps.peekDomain(ruleId)?.addresses ?? null;
+    // An exact rule under a wildcard base also routes what the DNS proxy learned for it (ADR-002 §3).
+    const exact = domainRules.get(ruleId);
+    const routed = exact === undefined ? [] : learnedOf(exact).filter((address) => !(resolved ?? []).includes(address));
+    return resolved === null && routed.length === 0 ? resolved : [...(resolved ?? []), ...routed];
   };
 
   let match: DiagnoseMatch | null;

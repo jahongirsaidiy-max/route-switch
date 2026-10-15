@@ -5436,7 +5436,9 @@ describe('wildcard rules: learn', () => {
 
   it.each([
     ['an unknown rule', [WILD], 99, 'not-learning'],
-    ['an exact domain rule', [WILD, DOMAIN_RULE], 5, 'not-learning'],
+    ['an exact domain rule under no wildcard base', [WILD, rule(6, 'domain', 'corp.example', 'ethernet')], 6, 'not-learning'],
+    ['an exact domain rule whose wildcard is disabled', [{ ...WILD, enabled: false }, rule(7, 'domain', 'www.corp.local', 'wifi')], 7, 'not-learning'],
+    ['a disabled exact domain rule under a wildcard base', [WILD, { ...rule(7, 'domain', 'www.corp.local', 'wifi'), enabled: false }], 7, 'not-learning'],
     ['an ip rule', [WILD, HOST], 1, 'not-learning'],
     ['a disabled wildcard rule', [{ ...WILD, enabled: false }], 40, 'not-learning'],
   ] as const)('ignores %s', async (_name, rules, n, reason) => {
@@ -5803,6 +5805,108 @@ describe('wildcard rules: precedence of learned addresses (shared compareClaim)'
 
     expect(h.take()).toEqual([add(L1, ETH_GW)]);
     expect(stateOf(h.engine, 40)).toMatchObject({ status: 'active', reasonCode: null });
+  });
+});
+
+// TASK-DELTA-30: split horizon. `*.corp.local` → ethernet, `www.corp.local` → wifi without `dns`.
+// The engine resolves the exact name through the wifi role's DNS (P1), but clients ask the DNS
+// proxy, which now forwards the exact name to the same servers and learns what it gave them for
+// the exact rule: whatever the clients connect to is routed through the exact rule's interface.
+describe('exact domain rules under a wildcard base: learn (split horizon)', () => {
+  const EXACT_WIFI = rule(7, 'domain', 'www.corp.local', 'wifi');
+  const P1 = '203.0.113.10';
+  const P2 = L1;
+  const exactLearning = (rules: readonly Rule[] = [WILD, EXACT_WIFI]): LearningHarness =>
+    learning(rules, { deps: { resolveDomain: (resolvedRule) => domainAnswer(resolvedRule.id === ruleId(7) ? [P1] : ['172.16.12.40']) } });
+
+  it('routes what the proxy learned for the exact rule through its interface, with its resolved addresses', async () => {
+    const h = exactLearning();
+    await h.run('startup');
+    expect(h.take()).toEqual([add(P1, WIFI_GW)]);
+
+    const result = await h.learn(7, [P2]);
+
+    expect(result).toEqual({ outcome: 'applied', reason: null, accepted: 1, rejected: 0, routed: 1 });
+    expect(h.take()).toEqual([add(P2, WIFI_GW)]);
+    expect(stateOf(h.engine, 7)).toMatchObject({ status: 'active', reasonCode: null, appliedDestinations: [P1, P2] });
+    // An address the resolver also returns is not routed twice.
+    expect((await h.learn(7, [P1])).outcome).toBe('applied');
+    expect(h.take()).toEqual([]);
+  });
+
+  it('keeps the exact-domain claim: the wildcard loses the same learned address (shared-address)', async () => {
+    const h = exactLearning();
+    await h.run('startup');
+    await h.learn(7, [P2]);
+    h.take();
+
+    await h.learn(40, [P2, L2]);
+
+    expect(h.take()).toEqual([add(L2, ETH_GW)]);
+    expect(stateOf(h.engine, 40)).toMatchObject({ status: 'active', reasonCode: 'shared-address', appliedDestinations: [L2] });
+    expect(stateOf(h.engine, 7)).toMatchObject({ status: 'active', reasonCode: null, appliedDestinations: [P1, P2] });
+  });
+
+  it('takes an address over from the wildcard when the exact rule learns it later', async () => {
+    const h = exactLearning();
+    await h.run('startup');
+    await h.learn(40, [P2]);
+    expect(h.take()).toEqual([add(P1, WIFI_GW), add(P2, ETH_GW)]);
+
+    await h.learn(7, [P2]);
+
+    expect(h.take()).toEqual([del(P2, ETH_GW), add(P2, WIFI_GW)]);
+  });
+
+  it('leaves a learned address to an explicit rule without failing the exact rule (overridden-by-rule)', async () => {
+    const ethIp = rule(1, 'ip', P2, 'ethernet');
+    const h = exactLearning([ethIp, WILD, EXACT_WIFI]);
+    await h.run('startup');
+    h.take();
+
+    await h.learn(7, [P2, L2]);
+
+    expect(h.take()).toEqual([add(L2, WIFI_GW)]);
+    expect(stateOf(h.engine, 7)).toMatchObject({ status: 'active', reasonCode: 'overridden-by-rule', appliedDestinations: [P1, L2] });
+  });
+
+  it('checks learned addresses like a wildcard does', async () => {
+    const h = exactLearning();
+    await h.run('startup');
+    h.take();
+
+    const result = await h.learn(7, ['127.0.0.1', '224.0.0.1', WIFI_GW, 'nonsense', P2]);
+
+    expect(result).toMatchObject({ outcome: 'applied', accepted: 1, rejected: 4 });
+    expect(h.take()).toEqual([add(P2, WIFI_GW)]);
+  });
+
+  it('expires learned addresses like a wildcard does; the resolved ones stay', async () => {
+    const h = exactLearning();
+    await h.run('startup');
+    await h.learn(7, [P2], 5);
+    h.take();
+
+    h.advance(LEARNED_ROUTE_LIMITS.minTtlSec);
+    expect(h.engine.getRetryNeeds().learnedExpired).toBe(1);
+    await h.run('drift-check');
+
+    expect(h.take()).toEqual([del(P2, WIFI_GW)]);
+    expect(stateOf(h.engine, 7)).toMatchObject({ status: 'active', appliedDestinations: [P1] });
+  });
+
+  it('forgets what the exact rule learned once no enabled wildcard covers it any more', async () => {
+    const h = exactLearning();
+    await h.run('startup');
+    await h.learn(7, [P2]);
+    h.take();
+
+    h.engine.setConfig(config([{ ...WILD, enabled: false }, EXACT_WIFI]));
+    await h.run('config-change');
+
+    expect(h.take()).toEqual([del(P2, WIFI_GW)]);
+    expect(stateOf(h.engine, 7)).toMatchObject({ appliedDestinations: [P1] });
+    expect((await h.learn(7, [P2])).reason).toBe('not-learning');
   });
 });
 

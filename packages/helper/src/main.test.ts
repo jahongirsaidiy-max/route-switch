@@ -2238,10 +2238,12 @@ describe('createWildcardProxyControl (TASK-DELTA-28)', () => {
   });
 
   it('answers names by the config now: learn for a wildcard name with the role\'s servers (loopback left out), passthrough for the base, REFUSED (null) outside', async () => {
-    const t = setup(parse([WILD, { id: ID_D, kind: 'domain', target: 'corp.local', iface: 'wifi' }]));
+    const t = setup(parse([WILD, { id: ID_D, kind: 'domain', target: 'www.corp.local', iface: 'wifi' }]));
     await t.control.beforeSync(WITH, CONTEXT);
     const { resolveRule } = t.options();
     expect(resolveRule('app.corp.local')).toEqual({ kind: 'learn', ruleId: ID_W, servers: ['10.20.0.53'] });
+    // An exact rule under the base learns from its own role's servers (TASK-DELTA-30).
+    expect(resolveRule('www.corp.local')).toEqual({ kind: 'learn', ruleId: ID_D, servers: ['192.168.1.1'] });
     expect(resolveRule('corp.local')).toEqual({ kind: 'passthrough', servers: ['192.0.2.53'] });
     expect(resolveRule('example.com')).toBeNull();
     t.setConfig(parse([WILD], false));

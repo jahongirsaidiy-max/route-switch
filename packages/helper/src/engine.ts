@@ -9,6 +9,7 @@ import {
   isWildcardDomain,
   normalizeHostAddress,
   parseIpv4Destination,
+  wildcardBase,
   type AdapterInfo,
   type AddressClaim,
   type Config,
@@ -79,6 +80,15 @@ import type { RouteAddResult, RouteDeleteResult, RouteGetResult, RouteOperations
  *   `setEnabled`.
  * - DNS proxy (wildcard domain rules, ADR-002): `learn` records the addresses
  *   of an answer and resolves once their routes are in place (or refused).
+ *
+ * An exact domain rule whose name lies under the base of an enabled wildcard
+ * rule (`www.corp.local` under `*.corp.local`, or the base itself) learns too
+ * (ADR-002 §3, TASK-DELTA-30): clients ask the proxy for that name, so the
+ * addresses they get are recorded for the exact rule and routed with its
+ * resolved ones, through its interface, with the same checks, bounds and
+ * lifetimes. Planned with the other exact domain rules, they keep the
+ * `exact-domain` claim; one another rule already routes through another
+ * interface is a `shared-address` warning, never an error.
  *
  * Wildcard domain rules (`*.corp.local`) are never resolved: their
  * destinations are the rule's `dns` server and the addresses `learn` was
@@ -330,7 +340,8 @@ export interface LearnOptions {
 
 /**
  * Why `learn` recorded nothing:
- * - `not-learning`      — no enabled wildcard rule with that id, or routing is off;
+ * - `not-learning`      — no enabled rule with that id that learns (a wildcard rule, or an exact
+ *                         domain rule under an enabled wildcard's base), or routing is off;
  * - `interface-down`    — the rule's interface was not routable in the last trusted detection
  *                         (or there was none yet);
  * - `no-usable-address` — every address was refused by the checks;
@@ -422,12 +433,13 @@ export interface Engine {
   /** What a periodic pass could make progress on; the monitor reads it every drift check. */
   getRetryNeeds(): RetryNeeds;
   /**
-   * Records the addresses a DNS answer gave for a name that wildcard rule
-   * `ruleId` owns (the proxy has matched it) and routes the new ones. Each
+   * Records the addresses a DNS answer gave for a name that rule `ruleId`
+   * owns (the proxy has matched it: a wildcard rule, or an exact domain rule
+   * under an enabled wildcard's base) and routes the new ones. Each
    * address passes the strict IPv4 parse, ADR-001, the DNS-server exclusion
    * and the connected-subnet guard first; it then lives for `ttlSec` clamped
-   * to `LEARNED_ROUTE_LIMITS`. Nothing happens for a rule that is not an
-   * enabled wildcard rule, while routing is off, or while the rule's interface
+   * to `LEARNED_ROUTE_LIMITS`. Nothing happens for a rule that does not
+   * learn (`learnsFromProxy`) or is disabled, while routing is off, or while the rule's interface
    * is not routable. When something new is to be routed a `dns-learned` pass
    * runs (queued like any `reconcile`) and the promise resolves when it has
    * finished, or after `waitMs` at the latest (`timed-out`; the pass goes on).
@@ -623,6 +635,22 @@ const routeKey = (destination: Destination): string => `net:${destination.cidr}`
 /** A wildcard domain rule (`*.corp.local`): its addresses are learned from DNS answers, never resolved. */
 const isWildcardRule = (rule: Pick<Rule, 'kind' | 'target'>): boolean => rule.kind === 'domain' && isWildcardDomain(rule.target);
 
+/**
+ * True when the DNS proxy answers clients for `rule`'s name: a wildcard rule,
+ * or an exact domain rule whose name is the base of an enabled wildcard rule
+ * or lies under it (the proxy's resolver file covers it). Only such a rule
+ * accepts `learn`.
+ */
+const learnsFromProxy = (rule: Pick<Rule, 'kind' | 'target'>, rules: readonly Pick<Rule, 'kind' | 'target' | 'enabled'>[]): boolean => {
+  if (rule.kind !== 'domain') return false;
+  if (isWildcardDomain(rule.target)) return true;
+  return rules.some((other) => {
+    if (!other.enabled || other.kind !== 'domain') return false;
+    const base = wildcardBase(other.target);
+    return base !== null && (rule.target === base || rule.target.endsWith(`.${base}`));
+  });
+};
+
 /** Who owns learned addresses: the rule and its target, so a rule whose target changes starts with none. */
 const learnedOwner = (rule: Pick<Rule, 'id' | 'target'>): string => `${rule.id} ${rule.target}`;
 
@@ -712,13 +740,15 @@ export const buildEngineState = (input: EngineStateInput): EngineState => {
     }
   }
 
-  // A wildcard rule lists up to its learned addresses and DNS server, any other rule up to a
-  // domain's worth; all together never more than the protocol allows (restored routes can name
-  // any rule).
+  // A rule that learns (a wildcard, or an exact name the DNS proxy answers for) lists up to its
+  // learned (and resolved) addresses and DNS server, any other rule up to a domain's worth; all
+  // together never more than the protocol allows (restored routes can name any rule).
   let room: number = PROTOCOL_LIMITS.maxAppliedDestinations;
   const rules: RuleState[] = input.config.rules.map((rule) => {
     const verdict = input.verdicts.get(rule.id);
-    const cap = isWildcardRule(rule) ? PROTOCOL_LIMITS.maxAppliedDestinationsPerRule : LIMITS.maxIpsPerDomain + 1;
+    const cap = learnsFromProxy(rule, input.config.rules)
+      ? PROTOCOL_LIMITS.maxAppliedDestinationsPerRule
+      : LIMITS.maxIpsPerDomain + 1;
     const appliedDestinations = (owned.get(rule.id) ?? []).slice(0, Math.min(cap, room));
     room -= appliedDestinations.length;
     return {
@@ -1221,6 +1251,8 @@ export const createEngine = (deps: EngineDeps): Engine => {
       const { gateway } = info;
 
       let targets: readonly string[] = [rule.target];
+      /** Addresses of an exact domain rule that were learned (from the DNS proxy), not resolved. */
+      let learnedTargets: ReadonlySet<string> = new Set();
       let draft: Draft;
       /** The destination that is the rule's own DNS server: routed like an explicit rule. */
       let serverTarget: string | null = null;
@@ -1242,12 +1274,29 @@ export const createEngine = (deps: EngineDeps): Engine => {
         if (rule.dns === undefined) noteOutsideDns(rule.iface, info);
         const resolved = await safeResolve(rule);
         const reasonCode = resolved.reasonCode ?? (resolved.status === 'active' ? null : 'internal');
-        draft = draftOf(rule, { status: resolved.status, reasonCode, reason: resolved.reason }, resolved.lastResolvedAt);
+        const owner = learnedOwner(rule);
+        const learning = learnsFromProxy(rule, snapshot.rules);
+        const truncated = learning && resolved.status === 'active' && reasonCode === null && learned.isTruncated(owner, nowMs);
+        draft = draftOf(
+          rule,
+          truncated ? TRUNCATED : { status: resolved.status, reasonCode, reason: resolved.reason },
+          resolved.lastResolvedAt,
+        );
         // The rule's own server goes first: its route is what lets the lookups (and the
         // resolver file) reach it. The resolver never returns it among the destinations.
         serverTarget = rule.dns ?? null;
         const answers = resolved.destinations.filter((target) => target !== serverTarget);
         targets = [...(serverTarget === null ? [] : [serverTarget]), ...answers].slice(0, LIMITS.maxIpsPerDomain + 1);
+        if (learning) {
+          // What the DNS proxy gave clients for this name (ADR-002 §3): routed with the resolved
+          // addresses, checked again like a wildcard's (the DNS servers known now may differ).
+          excludedForLearned ??= new Set(excludedServers());
+          const excluded = excludedForLearned;
+          const planned = new Set(targets);
+          const extra = learned.addressesOf(owner).filter((target) => !planned.has(target) && target !== serverTarget && !excluded.has(target));
+          learnedTargets = new Set(extra);
+          targets = [...targets, ...extra];
+        }
       } else {
         draft = draftOf(rule, ACTIVE);
       }
@@ -1269,7 +1318,8 @@ export const createEngine = (deps: EngineDeps): Engine => {
         if (conflict !== null && target === serverTarget && conflict.role === rule.iface) continue;
         // A learned address is one of many, refused when it was learned with the facts of then:
         // one that is in the way now is left out without failing the rule.
-        if (conflict !== null && draft.learning && target !== serverTarget) continue;
+        const isLearned = draft.learning ? target !== serverTarget : learnedTargets.has(target);
+        if (conflict !== null && isLearned) continue;
         if (conflict !== null) {
           recordIssue(draft, 'connected-network', `${dst} ${CONFLICT_TEXT[conflict.kind]} (${conflict.role})`);
           continue;
@@ -1302,9 +1352,10 @@ export const createEngine = (deps: EngineDeps): Engine => {
             key,
             `${dst} is routed through the ${existing.role} interface by an explicit rule, which takes precedence over a resolved address`,
           );
-        } else if (claim.kind === 'wildcard' && compareClaim(existing.claim, claim) < 0) {
+        } else if (isLearned && compareClaim(existing.claim, claim) < 0) {
           // A learned address another domain rule claims through another interface. Wildcard rules
-          // are planned last, deeper first, so the claim already planned is always the stronger one.
+          // are planned last, deeper first, so the claim already planned is always the stronger one;
+          // an exact rule's learned address loses only to an exact rule planned before it.
           draft.shared.set(
             key,
             `${dst} is routed through the ${existing.role} interface for another domain rule, which takes precedence over a learned address`,
@@ -2136,12 +2187,15 @@ export const createEngine = (deps: EngineDeps): Engine => {
 
   /**
    * Forgets at once what was learned for a rule that is gone, disabled, no
-   * longer a wildcard or has another target, and everything while routing is
-   * off; the pass that follows the change removes the routes.
+   * longer learns (`learnsFromProxy`: no wildcard, or no enabled wildcard
+   * base over an exact name any more) or has another target, and everything
+   * while routing is off; the pass that follows the change removes the routes.
    */
   const pruneLearned = (): void => {
     const owners = new Set(
-      config.enabled ? config.rules.filter((rule) => rule.enabled && isWildcardRule(rule)).map(learnedOwner) : [],
+      config.enabled
+        ? config.rules.filter((rule) => rule.enabled && learnsFromProxy(rule, config.rules)).map(learnedOwner)
+        : [],
     );
     const dropped = learned.retain((owner) => owners.has(owner));
     if (dropped > 0) logger.info('learned addresses forgotten after a config change', { dropped });
@@ -2386,7 +2440,7 @@ export const createEngine = (deps: EngineDeps): Engine => {
   ): { readonly result: LearnResult } | { readonly ruleId: string; readonly accepted: readonly string[]; readonly rejected: number } => {
     if (shutDown) return { result: ignored('shut-down') };
     const rule = config.enabled ? config.rules.find((candidate) => candidate.id === ruleId) : undefined;
-    if (rule === undefined || !rule.enabled || !isWildcardRule(rule)) return { result: ignored('not-learning') };
+    if (rule === undefined || !rule.enabled || !learnsFromProxy(rule, config.rules)) return { result: ignored('not-learning') };
     // The last trusted detection decides: an interface that is not routable gets nothing.
     const view = lastView;
     const info = view !== null && view.mode === 'normal' && view.detected !== null ? view.detected[rule.iface] : null;

@@ -68,12 +68,19 @@ export interface SocketFactory {
 
 /**
  * What the proxy does with one name:
- * - `learn`       — a wildcard rule owns it: forward to the rule's servers and
- *                   learn the A answers for `ruleId`;
- * - `passthrough` — it lies under a wildcard base but no wildcard owns it (the
- *                   base itself, a name an exact domain rule owns, a name that
- *                   is not a plain hostname such as `_ldap._tcp.…`): forward,
- *                   learn nothing.
+ * - `learn`       — a domain rule owns it: a wildcard rule, or an exact domain
+ *                   rule for this very name (also the base itself). Forward to
+ *                   that rule's servers — its `dns`, else its role's DNS
+ *                   servers (else the system's, for an exact rule: the
+ *                   engine's own lookup for it) — and learn the A answers for
+ *                   `ruleId`, so the addresses clients get are routed per the
+ *                   winning rule even when the two servers answer differently
+ *                   (split horizon, TASK-DELTA-30);
+ * - `passthrough` — it lies under a wildcard base but no rule owns it (the
+ *                   base itself with no exact rule for it, a name that is not
+ *                   a plain hostname such as `_ldap._tcp.…`): forward to the
+ *                   covering wildcard's `dns` (else the system's), learn
+ *                   nothing — no rule routes such a name.
  * `servers` are already filtered (`upstreamServers`); empty means SERVFAIL.
  * A name under no wildcard base at all gets no route (null → REFUSED).
  */
@@ -110,8 +117,8 @@ export const upstreamServers = (candidates: readonly string[]): string[] => {
 /**
  * Decides `QueryRoute` for a name the proxy received (ADR-002 §2, §3). The
  * owner comes from shared `matchDomainRule` (the one function the engine and
- * `diagnose` use too); only a `wildcard` win learns. `qname` is the parser's
- * form (lower case, no trailing dot).
+ * `diagnose` use too); both a `wildcard` and an exact (`domain`) win learn.
+ * `qname` is the parser's form (lower case, no trailing dot).
  */
 export const routeQuery = (qname: string, rules: readonly ProxyRule[], sources: RouteSources): QueryRoute | null => {
   let covering: { rule: ProxyRule; depth: number } | null = null;
@@ -125,10 +132,16 @@ export const routeQuery = (qname: string, rules: readonly ProxyRule[], sources: 
   if (covering === null) return null;
 
   const match = matchDomainRule(qname, rules);
-  if (match?.via === 'wildcard') {
+  if (match !== null) {
     const { rule } = match;
-    const candidates = rule.dns === undefined ? sources.roleServers(rule.iface) : [rule.dns];
-    return { kind: 'learn', ruleId: rule.id, servers: upstreamServers(candidates) };
+    if (rule.dns !== undefined) return { kind: 'learn', ruleId: rule.id, servers: upstreamServers([rule.dns]) };
+    const servers = upstreamServers(sources.roleServers(rule.iface));
+    // An exact rule's lookup falls back to the system resolvers when its role has no servers
+    // (`dns.ts`); a wildcard has no lookup of its own and fails instead.
+    if (servers.length === 0 && match.via === 'domain') {
+      return { kind: 'learn', ruleId: rule.id, servers: upstreamServers(sources.systemServers()) };
+    }
+    return { kind: 'learn', ruleId: rule.id, servers };
   }
   const { dns } = covering.rule;
   return { kind: 'passthrough', servers: upstreamServers(dns === undefined ? sources.systemServers() : [dns]) };

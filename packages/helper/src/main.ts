@@ -448,9 +448,9 @@ export interface WildcardProxyDeps {
   readonly logger: Logger;
   /** The engine's config now (not a pass's snapshot): the proxy answers by it. */
   readonly getConfig: () => Config;
-  /** `engine.learn`; it ignores an id that is no enabled wildcard rule any more, or any id once routing is off. */
+  /** `engine.learn`; it ignores an id that is no rule that learns any more (wildcard, or exact under a wildcard base), or any id once routing is off. */
   readonly learn: LearnFn;
-  /** The system's resolvers, for names under a wildcard base that no wildcard rule owns (the base itself). */
+  /** The system's resolvers: for names under a wildcard base that no rule owns, and an exact rule whose role has no servers. */
   readonly systemServers: () => readonly string[];
   /** Asks the engine for a pass: the proxy began or stopped being able to listen on its own (a retried bind). */
   readonly requestReconcile: () => unknown;

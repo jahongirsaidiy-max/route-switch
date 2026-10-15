@@ -124,12 +124,36 @@ describe('routeQuery', () => {
     expect(routeQuery('corp.local', rules, sources)).toEqual({ kind: 'passthrough', servers: ['10.9.9.1'] });
   });
 
-  it('passes through a name an exact domain rule owns (no learning)', () => {
-    const rules = [rule(RULE_A, '*.corp.local'), rule(RULE_C, 'git.corp.local')];
-    expect(routeQuery('git.corp.local', rules, sources)).toEqual({
-      kind: 'passthrough',
-      servers: ['192.168.1.1', '1.1.1.1'],
-    });
+  // TASK-DELTA-30 (split horizon): clients must get the answer the exact rule's own lookup gets,
+  // and what they get is learned for the exact rule, never left to the wildcard's server.
+  it('learns for a name an exact domain rule owns, from its role servers (not the wildcard dns)', () => {
+    const rules = [rule(RULE_A, '*.corp.local', { dns: '10.9.9.9' }), rule(RULE_C, 'www.corp.local', { iface: 'wifi' })];
+    expect(routeQuery('www.corp.local', rules, sources)).toEqual({ kind: 'learn', ruleId: RULE_C, servers: ['192.168.1.1'] });
+    // A sibling name stays the wildcard's.
+    expect(routeQuery('app.corp.local', rules, sources)).toEqual({ kind: 'learn', ruleId: RULE_A, servers: ['10.9.9.9'] });
+  });
+
+  it('learns for an exact domain rule from its own dns when it has one', () => {
+    const rules = [rule(RULE_A, '*.corp.local', { dns: '10.9.9.9' }), rule(RULE_C, 'www.corp.local', { iface: 'wifi', dns: '10.8.8.8' })];
+    expect(routeQuery('www.corp.local', rules, sources)).toEqual({ kind: 'learn', ruleId: RULE_C, servers: ['10.8.8.8'] });
+  });
+
+  it('learns for an exact rule on the base itself', () => {
+    const rules = [rule(RULE_A, '*.corp.local', { dns: '10.9.9.9' }), rule(RULE_C, 'corp.local', { iface: 'wifi' })];
+    expect(routeQuery('corp.local', rules, sources)).toEqual({ kind: 'learn', ruleId: RULE_C, servers: ['192.168.1.1'] });
+  });
+
+  it("falls back to the system servers for an exact rule whose role has none (the engine's lookup does too)", () => {
+    const none: RouteSources = { roleServers: () => [], systemServers: () => ['192.168.1.1', '127.0.0.1'] };
+    const rules = [rule(RULE_A, '*.corp.local'), rule(RULE_C, 'www.corp.local', { iface: 'wifi' })];
+    expect(routeQuery('www.corp.local', rules, none)).toEqual({ kind: 'learn', ruleId: RULE_C, servers: ['192.168.1.1'] });
+    // A wildcard has no lookup of its own: no servers, SERVFAIL.
+    expect(routeQuery('app.corp.local', rules, none)).toEqual({ kind: 'learn', ruleId: RULE_A, servers: [] });
+  });
+
+  it('lets the wildcard own a name whose exact rule is disabled', () => {
+    const rules = [rule(RULE_A, '*.corp.local'), rule(RULE_C, 'www.corp.local', { iface: 'wifi', enabled: false })];
+    expect(routeQuery('www.corp.local', rules, sources)).toMatchObject({ kind: 'learn', ruleId: RULE_A });
   });
 
   it('passes through a name that is not a hostname (SRV labels) under a base', () => {
