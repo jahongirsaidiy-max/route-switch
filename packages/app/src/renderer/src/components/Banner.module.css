@@ -1,0 +1,42 @@
+/*
+ * Warning banner (not in the design — derived): the status tones of tokens.css on a soft
+ * background, a 3px bar on the left, radius of a card. Title 12px / 600, text 12px.
+ */
+.banner {
+  display: flex;
+  flex-shrink: 0;
+  flex-direction: column;
+  gap: var(--rs-space-1);
+  padding: var(--rs-space-4) var(--rs-space-6);
+  border-left: 3px solid var(--rs-color-warning);
+  border-radius: var(--rs-radius-sm);
+  background: var(--rs-color-warning-soft);
+  color: var(--rs-color-warning-soft-text);
+  font-size: var(--rs-text-small);
+}
+
+.banner[data-tone='danger'] {
+  border-left-color: var(--rs-color-danger);
+  background: var(--rs-color-danger-soft);
+  color: var(--rs-color-danger-soft-text);
+}
+
+.banner[data-size='compact'] {
+  padding: var(--rs-space-3) var(--rs-space-5);
+  font-size: var(--rs-text-caption);
+}
+
+.title {
+  font-weight: var(--rs-weight-semibold);
+}
+
+.text {
+  color: var(--rs-color-text-secondary);
+}
+
+.actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--rs-space-4);
+  margin-top: var(--rs-space-3);
+}

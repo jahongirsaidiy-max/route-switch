@@ -1,0 +1,97 @@
+/*
+ * Rules window frame, after route-switch-docs/RouteSwitch UI.html ("Qoidalar oynasi"). The design's
+ * outer canvas, panel border and traffic lights stand for the macOS window itself and are not drawn.
+ */
+.window {
+  display: flex;
+  height: 100%;
+  overflow: hidden;
+  background: var(--rs-color-surface);
+}
+
+/* Sidebar: 220px, #F1F2F4, border-right #E2E4E7, padding 14 10, gap 4. */
+.sidebar {
+  display: flex;
+  flex-direction: column;
+  flex-shrink: 0;
+  gap: var(--rs-space-2);
+  width: 220px;
+  padding: var(--rs-space-7) var(--rs-space-5);
+  border-right: 1px solid var(--rs-color-border);
+  background: var(--rs-color-sidebar);
+}
+
+.nav {
+  display: flex;
+  flex: 1;
+  flex-direction: column;
+  gap: var(--rs-space-2);
+}
+
+/* Item: gap 10, padding 8 10, radius 6, 13px #3A3E46; current: #DDE6F7 / #123E8C / 500. */
+.item {
+  display: flex;
+  align-items: center;
+  gap: var(--rs-space-5);
+  padding: var(--rs-space-4) var(--rs-space-5);
+  border: none;
+  border-radius: var(--rs-radius-sm);
+  background: transparent;
+  color: var(--rs-color-text-strong-secondary);
+  font-size: var(--rs-text-body);
+  text-align: left;
+  cursor: pointer;
+  transition: background-color var(--rs-transition);
+}
+
+.item:hover {
+  background: var(--rs-color-hover);
+}
+
+.item[aria-current='page'] {
+  background: var(--rs-color-accent-soft);
+  color: var(--rs-color-accent-soft-text);
+  font-weight: var(--rs-weight-medium);
+}
+
+.item:focus-visible {
+  outline: none;
+  box-shadow: var(--rs-shadow-focus);
+}
+
+/* Helper box: padding 10, radius 8, white, border #E2E4E7, 11px #4A4E57, gap 4. */
+.helper {
+  display: flex;
+  flex-direction: column;
+  gap: var(--rs-space-2);
+  padding: var(--rs-space-5);
+  border: 1px solid var(--rs-color-border);
+  border-radius: var(--rs-radius-card);
+  background: var(--rs-color-raised);
+  color: var(--rs-color-text-secondary);
+  font-size: var(--rs-text-caption);
+}
+
+.helperTitle {
+  display: flex;
+  align-items: center;
+  gap: var(--rs-space-3);
+  color: var(--rs-color-text);
+  font-weight: var(--rs-weight-semibold);
+}
+
+/* Why the helper is away (derived): the box's 11px, muted; a refused reconnect in the danger tone. */
+.helperText {
+  color: var(--rs-color-text-muted);
+  line-height: var(--rs-line-height);
+}
+
+.helperText[data-tone='danger'] {
+  color: var(--rs-color-danger-soft-text);
+}
+
+.main {
+  flex: 1;
+  min-width: 0;
+  min-height: 0;
+}

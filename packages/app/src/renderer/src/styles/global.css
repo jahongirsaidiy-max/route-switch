@@ -1,0 +1,56 @@
+/*
+ * Page-wide base styles. Everything else is a CSS module: the CSP forbids
+ * <style> elements and style="" attributes, so styles live only in files.
+ */
+
+@import './tokens.css';
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+}
+
+body {
+  margin: 0;
+  background: var(--rs-color-surface);
+  color: var(--rs-color-text);
+  font-family: var(--rs-font-sans);
+  font-size: var(--rs-text-body);
+  line-height: var(--rs-line-height);
+  -webkit-font-smoothing: antialiased;
+  -webkit-user-select: none;
+  user-select: none;
+  cursor: default;
+}
+
+input,
+textarea {
+  -webkit-user-select: text;
+  user-select: text;
+}
+
+button,
+input,
+select,
+textarea {
+  font: inherit;
+  color: inherit;
+}
+
+h1,
+h2,
+h3,
+p {
+  margin: 0;
+}
+
+:focus:not(:focus-visible) {
+  outline: none;
+}

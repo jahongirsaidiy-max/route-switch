@@ -1,0 +1,31 @@
+.root {
+  height: 100%;
+  overflow: hidden;
+  background: var(--rs-color-surface);
+}
+
+/* The menu bar window is transparent: its screen draws the rounded panel inside a margin. */
+.root[data-view='popover'] {
+  background: transparent;
+}
+
+.placeholder {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: var(--rs-space-2);
+  height: 100%;
+  padding: var(--rs-space-11);
+  text-align: center;
+}
+
+.title {
+  font-size: var(--rs-text-title);
+  font-weight: var(--rs-weight-semibold);
+}
+
+.subtitle {
+  color: var(--rs-color-text-muted);
+  font-size: var(--rs-text-body);
+}

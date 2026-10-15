@@ -1,0 +1,384 @@
+/* Main column of the rules window, after route-switch-docs/RouteSwitch UI.html ("Qoidalar oynasi", 1040×680). */
+.screen {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  min-width: 0;
+  min-height: 0;
+  background: var(--rs-color-surface);
+}
+
+/* Header: padding 22 28 16; h1 22/600; subtitle 13 #5B5F68, 4px below. */
+.header {
+  display: flex;
+  flex-shrink: 0;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--rs-space-8);
+  padding: 22px var(--rs-space-12) var(--rs-space-8);
+}
+
+.title {
+  font-size: var(--rs-text-title);
+  font-weight: var(--rs-weight-semibold);
+}
+
+.subtitle {
+  margin-top: var(--rs-space-2);
+  color: var(--rs-color-text-muted);
+  font-size: var(--rs-text-body);
+}
+
+/* "Qoida qo'shish": 36px high like `lg`, but 0 14px as the design draws it (TASK-210 decision). */
+.addRule {
+  flex-shrink: 0;
+}
+
+.addRule > button[data-size] {
+  padding: 0 var(--rs-space-7);
+}
+
+/* Toolbar: padding 0 28 14, gap 10. */
+.toolbar {
+  display: flex;
+  flex-shrink: 0;
+  align-items: center;
+  gap: var(--rs-space-5);
+  padding: 0 var(--rs-space-12) var(--rs-space-7);
+}
+
+/* Search: 34px, padding 0 10, gap 8, border #D4D6DA, radius 7, white. */
+.search {
+  display: flex;
+  flex: 1;
+  align-items: center;
+  gap: var(--rs-space-4);
+  height: var(--rs-control-md);
+  padding: 0 var(--rs-space-5);
+  border: 1px solid var(--rs-color-border-strong);
+  border-radius: var(--rs-radius-control);
+  background: var(--rs-color-raised);
+}
+
+.search:focus-within {
+  box-shadow: var(--rs-shadow-focus);
+}
+
+.searchIcon {
+  flex-shrink: 0;
+  color: var(--rs-color-text-caption);
+}
+
+.searchInput {
+  flex: 1;
+  min-width: 0;
+  border: none;
+  outline: none;
+  background: transparent;
+  font-size: var(--rs-text-body);
+}
+
+.searchInput::-webkit-search-cancel-button {
+  cursor: pointer;
+}
+
+/* "Hammasi": a select drawn like the design's secondary toolbar button (34px, 0 12px). */
+.filter {
+  display: flex;
+}
+
+.filterSelect {
+  height: var(--rs-control-md);
+  padding: 0 var(--rs-space-6);
+  border: 1px solid var(--rs-color-border-strong);
+  border-radius: var(--rs-radius-control);
+  background: var(--rs-color-raised);
+  font-size: var(--rs-text-body);
+  cursor: pointer;
+}
+
+.filterSelect:hover {
+  background: var(--rs-color-hover);
+}
+
+.filterSelect:focus-visible {
+  outline: none;
+  box-shadow: var(--rs-shadow-focus);
+}
+
+.visuallyHidden {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+}
+
+.feedback {
+  flex-shrink: 0;
+  padding: 0 var(--rs-space-12) var(--rs-space-5);
+  font-size: var(--rs-text-small);
+}
+
+.feedback[data-tone='danger'] {
+  color: var(--rs-color-danger-soft-text);
+}
+
+.feedback[data-tone='success'] {
+  color: var(--rs-color-success-soft-text);
+}
+
+/* Delete confirmation and overlap warning: bars above the table (derived — not in the design). */
+.confirm,
+/* Network warnings (derived): the overlap banner's margins, one banner each, gap 6. */
+.warnings {
+  display: flex;
+  flex-shrink: 0;
+  flex-direction: column;
+  gap: var(--rs-space-3);
+  margin: 0 var(--rs-space-12) var(--rs-space-5);
+}
+
+.overlaps {
+  flex-shrink: 0;
+  margin: 0 var(--rs-space-12) var(--rs-space-5);
+  padding: var(--rs-space-5) var(--rs-space-6);
+  border-radius: var(--rs-radius-card);
+  font-size: var(--rs-text-small);
+}
+
+.confirm {
+  display: flex;
+  align-items: center;
+  gap: var(--rs-space-4);
+  border: 1px solid var(--rs-color-border-strong);
+  background: var(--rs-color-raised);
+}
+
+.confirmText {
+  flex: 1;
+  color: var(--rs-color-text);
+}
+
+.overlaps {
+  border: 1px solid var(--rs-color-warning-soft);
+  background: var(--rs-color-warning-soft);
+  color: var(--rs-color-warning-soft-text);
+}
+
+.overlapsTitle {
+  font-weight: var(--rs-weight-medium);
+}
+
+.overlapList {
+  margin: var(--rs-space-1) 0 0;
+  padding-left: var(--rs-space-8);
+  font-family: var(--rs-font-mono);
+  font-size: var(--rs-text-caption);
+}
+
+/* Table: margin 0 28, border #E2E4E7, radius 10, white. */
+.table {
+  display: flex;
+  flex: 0 1 auto;
+  flex-direction: column;
+  min-height: 0;
+  margin: 0 var(--rs-space-12);
+  /* One scroll container for head and rows, so a scrollbar narrows both alike and the columns stay aligned. */
+  overflow-y: auto;
+  border: 1px solid var(--rs-color-border);
+  border-radius: var(--rs-radius-table);
+  background: var(--rs-color-raised);
+}
+
+.headRow,
+.row {
+  display: grid;
+  grid-template-columns: 52px 1.6fr 0.8fr 1fr 1.2fr 72px;
+  align-items: center;
+  column-gap: var(--rs-space-4);
+}
+
+/* The head stays on top while the rows scroll. */
+.head {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+}
+
+/* Head: padding 10 16, #F6F7F8, 11px / 600 / 0.05em uppercase #6B6F78. */
+.headRow {
+  padding: var(--rs-space-5) var(--rs-space-8);
+  border-bottom: 1px solid var(--rs-color-border);
+  background: var(--rs-color-muted-surface);
+  color: var(--rs-color-text-caption);
+  font-size: var(--rs-text-caption);
+  font-weight: var(--rs-weight-semibold);
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+}
+
+/* Row: padding 12 16, divider #F0F1F3, 13px. */
+.row {
+  padding: var(--rs-space-6) var(--rs-space-8);
+  border-bottom: 1px solid var(--rs-color-row-divider);
+  font-size: var(--rs-text-body);
+}
+
+.row:last-child {
+  border-bottom: none;
+}
+
+.cell {
+  display: flex;
+}
+
+.addressCell {
+  display: flex;
+  flex-direction: column;
+  gap: var(--rs-space-1);
+  min-width: 0;
+}
+
+.addressLine {
+  display: flex;
+  align-items: center;
+  gap: var(--rs-space-4);
+  min-width: 0;
+}
+
+/* Address: mono 12.5px; #8A8E96 when the rule is off. */
+.target {
+  overflow: hidden;
+  font-family: var(--rs-font-mono);
+  font-size: var(--rs-text-mono-body);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.row[data-enabled='false'] .target {
+  color: var(--rs-color-text-disabled);
+}
+
+.reason {
+  display: flex;
+  align-items: center;
+  gap: var(--rs-space-2);
+  font-size: var(--rs-text-caption);
+}
+
+.reason[data-tone='error'] {
+  color: var(--rs-color-danger-soft-text);
+}
+
+/* A failed domain rule's last known addresses: mono 11px, muted (derived). */
+.lastKnown {
+  color: var(--rs-color-text-muted);
+  font-family: var(--rs-font-mono);
+  font-size: var(--rs-text-caption);
+  overflow-wrap: anywhere;
+}
+
+/* Unreadable stored config: the two ways out, centred under the notice (derived). */
+.recoveryActions {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: center;
+  gap: var(--rs-space-4);
+  margin-top: var(--rs-space-3);
+}
+
+.reason[data-tone='pending'],
+.reason[data-tone='warning'] {
+  color: var(--rs-color-warning-soft-text);
+}
+
+/* Kind: 12px #5B5F68. */
+.kind {
+  color: var(--rs-color-text-muted);
+  font-size: var(--rs-text-small);
+}
+
+/* Interface: tag + mono 12px device, gap 6. */
+.iface {
+  display: flex;
+  align-items: center;
+  gap: var(--rs-space-3);
+}
+
+.device {
+  color: var(--rs-color-text-muted);
+  font-family: var(--rs-font-mono);
+  font-size: var(--rs-text-small);
+}
+
+/* Note: 12px #4A4E57. */
+.note {
+  overflow: hidden;
+  color: var(--rs-color-text-secondary);
+  font-size: var(--rs-text-small);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: var(--rs-space-1);
+}
+
+.empty,
+.notice {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: var(--rs-space-3);
+  padding: var(--rs-space-11) var(--rs-space-10);
+  color: var(--rs-color-text-muted);
+  font-size: var(--rs-text-small);
+  text-align: center;
+}
+
+.notice {
+  margin: 0 var(--rs-space-12);
+  border: 1px solid var(--rs-color-border);
+  border-radius: var(--rs-radius-table);
+  background: var(--rs-color-raised);
+}
+
+.emptyTitle {
+  color: var(--rs-color-text);
+  font-size: var(--rs-text-body);
+  font-weight: var(--rs-weight-medium);
+}
+
+.spacer {
+  flex: 1 0 var(--rs-space-6);
+}
+
+/* Footer: padding 12 28, divider above, #F6F7F8, 12px #4A4E57; left mono. */
+.footer {
+  display: flex;
+  flex-shrink: 0;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--rs-space-8);
+  padding: var(--rs-space-6) var(--rs-space-12);
+  border-top: 1px solid var(--rs-color-divider);
+  background: var(--rs-color-muted-surface);
+  color: var(--rs-color-text-secondary);
+  font-size: var(--rs-text-small);
+}
+
+.footerMono {
+  overflow: hidden;
+  font-family: var(--rs-font-mono);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.errors {
+  color: var(--rs-color-danger-soft-text);
+  font-weight: var(--rs-weight-semibold);
+}

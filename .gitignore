@@ -5,6 +5,10 @@ node_modules/
 dist/
 out/
 build/
+# …except the app icon and its SVG source (electron-builder buildResources)
+!/build/
+/build/*
+!/build/app-resources/
 release/
 *.tsbuildinfo
 .vite/
@@ -24,3 +28,7 @@ coverage/
 *.p12
 *.cer
 *.provisionprofile
+
+# AI workflow va GitHub shablonlari — lokal, repoga tushmaydi
+CLAUDE.md
+.github/

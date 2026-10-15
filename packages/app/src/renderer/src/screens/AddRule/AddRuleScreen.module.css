@@ -1,0 +1,313 @@
+/*
+ * Add / edit rule dialog, after route-switch-docs/RouteSwitch UI.html ("Qoida qo'shish", 520×640).
+ * The design's grey canvas and 16px margin stand for the window around the panel: here the panel
+ * is a modal over the rules window, on a dimmed backdrop (derived).
+ */
+.backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 10;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: var(--rs-space-8);
+  background: rgba(27, 29, 33, 0.28); /* derived: --rs-color-text at 28% */
+}
+
+/* Panel: #FBFBFC, border #D4D6DA, radius 12, column; at most the window's height. */
+.dialog {
+  display: flex;
+  flex-direction: column;
+  width: 520px;
+  max-width: 100%;
+  max-height: 100%;
+  overflow: hidden;
+  border: 1px solid var(--rs-color-border-strong);
+  border-radius: var(--rs-radius-window);
+  background: var(--rs-color-surface);
+  color: var(--rs-color-text);
+  font-family: var(--rs-font-sans);
+  box-shadow: 0 12px 32px rgba(0, 0, 0, 0.18); /* derived */
+}
+
+/* Header: padding 20 24 6; h1 18/600; subtitle 13 #5B5F68, 4px below. */
+.header {
+  flex-shrink: 0;
+  padding: var(--rs-space-10) var(--rs-space-11) var(--rs-space-3);
+}
+
+.title {
+  margin: 0;
+  font-size: var(--rs-text-dialog-title);
+  font-weight: var(--rs-weight-semibold);
+}
+
+.subtitle {
+  margin: var(--rs-space-2) 0 0;
+  color: var(--rs-color-text-muted);
+  font-size: var(--rs-text-body);
+}
+
+/* Body: padding 14 24, column, gap 18; scrolls when the window is short. */
+.body {
+  display: flex;
+  flex: 1;
+  flex-direction: column;
+  gap: var(--rs-space-9);
+  min-height: 0;
+  overflow-y: auto;
+  padding: var(--rs-space-7) var(--rs-space-11);
+}
+
+.field {
+  display: flex;
+  flex-direction: column;
+  gap: var(--rs-space-4);
+}
+
+/* Field label: 12/600 #3A3E46. */
+.label {
+  color: var(--rs-color-text-strong-secondary);
+  font-size: var(--rs-text-small);
+  font-weight: var(--rs-weight-semibold);
+}
+
+/* Address input: 38px, padding 0 12, border, radius 7, white, mono 13. Focus: accent border + 3px ring. */
+.input {
+  height: var(--rs-control-input);
+  padding: 0 var(--rs-space-6);
+  border: 1px solid var(--rs-color-border-strong);
+  border-radius: var(--rs-radius-control);
+  outline: none;
+  background: var(--rs-color-raised);
+  color: var(--rs-color-text);
+  font-family: inherit;
+  font-size: var(--rs-text-body);
+  transition:
+    border-color var(--rs-transition),
+    box-shadow var(--rs-transition);
+}
+
+/* Note input: 36px. */
+.input[data-size='md'] {
+  height: var(--rs-control-lg);
+}
+
+.input[data-mono] {
+  font-family: var(--rs-font-mono);
+}
+
+/* DNS server input: 34px, padding 0 10, radius 6, mono 12.5. */
+.input[data-size='sm'] {
+  height: var(--rs-control-md);
+  padding: 0 var(--rs-space-5);
+  border-radius: var(--rs-radius-sm);
+  font-size: var(--rs-text-mono-body);
+}
+
+.input[data-width='short'] {
+  width: 96px;
+}
+
+.input:focus {
+  border-color: var(--rs-color-accent);
+  box-shadow: var(--rs-shadow-focus);
+}
+
+.input::placeholder {
+  color: var(--rs-color-text-disabled);
+}
+
+/* Refused value (derived from the danger palette). */
+.input[data-invalid] {
+  border-color: var(--rs-color-danger);
+}
+
+.input[data-invalid]:focus {
+  box-shadow: 0 0 0 3px var(--rs-color-danger-soft);
+}
+
+/* Hint: 12 #5B5F68; an error takes its place in the danger text colour. */
+.hint {
+  color: var(--rs-color-text-muted);
+  font-size: var(--rs-text-small);
+}
+
+.hint[data-tone='danger'] {
+  color: var(--rs-color-danger-soft-text);
+}
+
+/* DNS block: padding 12, border #E2E4E7, radius 8, white, gap 10. */
+.dnsBox {
+  display: flex;
+  flex-direction: column;
+  gap: var(--rs-space-5);
+  padding: var(--rs-space-6);
+  border: 1px solid var(--rs-color-border);
+  border-radius: var(--rs-radius-card);
+  background: var(--rs-color-raised);
+}
+
+/* Check box row: gap 10, 13px; box 16px in the accent colour. */
+.check {
+  display: flex;
+  align-items: center;
+  gap: var(--rs-space-5);
+  font-size: var(--rs-text-body);
+  cursor: pointer;
+}
+
+.check input {
+  width: 16px;
+  height: 16px;
+  margin: 0;
+  accent-color: var(--rs-color-accent);
+}
+
+.dnsField {
+  display: flex;
+  flex-direction: column;
+  gap: var(--rs-space-3);
+}
+
+/* Refresh interval (derived: the design states it in the hint only). */
+.refreshField {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--rs-space-5);
+  color: var(--rs-color-text-strong-secondary);
+  font-size: var(--rs-text-small);
+}
+
+/* Interface options: two columns, gap 10. */
+.ifaces {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: var(--rs-space-5);
+}
+
+/* Command preview: margin 0 24, padding 10 12, radius 7, #F1F2F4, mono 11.5 #3A3E46. */
+.preview {
+  display: flex;
+  flex-shrink: 0;
+  flex-direction: column;
+  gap: var(--rs-space-2);
+  margin: 0 var(--rs-space-11);
+  padding: var(--rs-space-5) var(--rs-space-6);
+  border-radius: var(--rs-radius-control);
+  background: var(--rs-color-code);
+  color: var(--rs-color-text-strong-secondary);
+  font-size: var(--rs-text-mono-small);
+}
+
+.previewLabel {
+  color: var(--rs-color-text-caption);
+  font-size: var(--rs-text-caption);
+}
+
+.command {
+  overflow-wrap: anywhere;
+  font-family: var(--rs-font-mono);
+}
+
+.previewNote {
+  color: var(--rs-color-text-muted);
+  font-size: var(--rs-text-caption);
+}
+
+/* "Sinab ko'rish" row (derived): a compact secondary button and the answer beside it. */
+.testRow {
+  display: flex;
+  align-items: center;
+  gap: var(--rs-space-5);
+  margin-top: var(--rs-space-3);
+}
+
+.testRow > button {
+  flex-shrink: 0;
+  height: var(--rs-control-sm);
+  padding: 0 var(--rs-space-5);
+  font-size: var(--rs-text-small);
+}
+
+.testResult {
+  display: flex;
+  flex-direction: column;
+  gap: var(--rs-space-1);
+  min-width: 0;
+  font-size: var(--rs-text-small);
+}
+
+.testRoute {
+  overflow-wrap: anywhere;
+  font-family: var(--rs-font-mono);
+  font-size: var(--rs-text-caption);
+}
+
+.testVerdict {
+  display: flex;
+  align-items: center;
+  gap: var(--rs-space-3);
+}
+
+.testResult [data-tone='danger'] {
+  color: var(--rs-color-danger-soft-text);
+}
+
+.muted {
+  color: var(--rs-color-text-muted);
+}
+
+/* Helper not connected (derived). */
+.banner {
+  display: flex;
+  flex-shrink: 0;
+  align-items: center;
+  gap: var(--rs-space-3);
+  margin: var(--rs-space-4) var(--rs-space-11) 0;
+  padding: var(--rs-space-4) var(--rs-space-6);
+  border-radius: var(--rs-radius-control);
+  background: var(--rs-color-warning-soft);
+  color: var(--rs-color-warning-soft-text);
+  font-size: var(--rs-text-small);
+}
+
+.statusText {
+  color: var(--rs-color-text-muted);
+  font-size: var(--rs-text-body);
+}
+
+/* A refused save (derived). */
+.feedback {
+  flex-shrink: 0;
+  margin: var(--rs-space-5) var(--rs-space-11) 0;
+  padding: var(--rs-space-4) var(--rs-space-6);
+  border-radius: var(--rs-radius-control);
+  background: var(--rs-color-danger-soft);
+  color: var(--rs-color-danger-soft-text);
+  font-size: var(--rs-text-small);
+}
+
+.feedback[data-tone='success'] {
+  background: var(--rs-color-success-soft);
+  color: var(--rs-color-success-soft-text);
+}
+
+/* Footer: end-aligned, gap 8, padding 16 24 20; buttons 36px, padding 0 16. */
+.footer {
+  display: flex;
+  flex-shrink: 0;
+  justify-content: flex-end;
+  gap: var(--rs-space-4);
+  padding: var(--rs-space-8) var(--rs-space-11) var(--rs-space-10);
+}
+
+.visuallyHidden {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+}

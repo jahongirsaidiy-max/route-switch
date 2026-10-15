@@ -1,0 +1,80 @@
+/* Shape of the design's DEFAULT tag: 10px / 600, 2px 6px, radius 4. */
+.badge {
+  --tone-fg: var(--rs-color-neutral-soft-text);
+  --tone-bg: var(--rs-color-neutral-soft);
+  --tone-dot: var(--rs-color-text-disabled);
+
+  display: inline-flex;
+  align-items: center;
+  gap: var(--rs-space-2);
+  padding: var(--rs-space-1) var(--rs-space-3);
+  border-radius: var(--rs-radius-tag);
+  background: var(--tone-bg);
+  color: var(--tone-fg);
+  font-size: var(--rs-text-tag);
+  font-weight: var(--rs-weight-semibold);
+  line-height: 1.4;
+  white-space: nowrap;
+}
+
+.badge[data-tone='success'] {
+  --tone-fg: var(--rs-color-success-soft-text);
+  --tone-bg: var(--rs-color-success-soft);
+  --tone-dot: var(--rs-color-success);
+}
+
+.badge[data-tone='warning'] {
+  --tone-fg: var(--rs-color-warning-soft-text);
+  --tone-bg: var(--rs-color-warning-soft);
+  --tone-dot: var(--rs-color-warning);
+}
+
+.badge[data-tone='danger'] {
+  --tone-fg: var(--rs-color-danger-soft-text);
+  --tone-bg: var(--rs-color-danger-soft);
+  --tone-dot: var(--rs-color-danger);
+}
+
+.badgeDot {
+  display: block;
+  width: 6px;
+  height: 6px;
+  border-radius: var(--rs-radius-pill);
+  background: var(--tone-dot);
+}
+
+.visuallyHidden {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+}
+
+/* Interface card: 8px; sidebar helper box: 7px. */
+.dot {
+  display: block;
+  flex-shrink: 0;
+  width: 8px;
+  height: 8px;
+  border-radius: var(--rs-radius-pill);
+  background: var(--rs-color-toggle-off);
+}
+
+.dot[data-size='sm'] {
+  width: 7px;
+  height: 7px;
+}
+
+.dot[data-tone='success'] {
+  background: var(--rs-color-success);
+}
+
+.dot[data-tone='warning'] {
+  background: var(--rs-color-warning);
+}
+
+.dot[data-tone='danger'] {
+  background: var(--rs-color-danger);
+}

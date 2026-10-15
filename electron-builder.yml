@@ -1,0 +1,92 @@
+# electron-builder: RouteSwitch.app in a .dmg (TASK-301). `npm run dist` (arm64) / `npm run dist:x64`.
+#
+# Runs on the staged app (`build/app-stage`, made by scripts/stage-app.sh), so every
+# relative path below starts there. Output: dist/ (gitignored).
+#
+# One .dmg per architecture: the app and the helper slice of that architecture
+# (`${arch}` = arm64 | x64). A universal .dmg would carry two Electron runtimes and
+# two Node runtimes (the helper alone is ~248 MB universal) for no gain on one Mac.
+#
+# Signing: ad hoc ("-") by default, no certificate, nothing secret in the repo.
+# A Developer ID build and notarization only ever come from the environment
+# (CSC_LINK / CSC_KEY_PASSWORD, APPLE_* for notarytool): see README.md.
+
+appId: uz.routeswitch.app
+productName: RouteSwitch
+copyright: Copyright © 2026 RouteSwitch contributors
+
+# Latest stable patch of the Electron major the app is developed on (44.x). Downloaded
+# by electron-builder with its checksum; the dev pin in packages/app stays as it is.
+electronVersion: 44.7.2
+
+directories:
+  output: ../../dist
+  buildResources: ../../build/app-resources
+
+# The package starts at packaging/entry.mjs (copied to out/ by stage-app.sh): it refuses
+# every command-line argument but LaunchServices' `-psn_…`, so every switch (`--remote-debugging-port`, `--log-net-log`, `--proxy-server`, …,
+# which fuses do not cover) before Chromium acts on them, then loads out/main/index.js.
+extraMetadata:
+  main: ./out/entry.mjs
+  # The app's name at run time (`app.getName()`), hence its userData folder:
+  # ~/Library/Application Support/RouteSwitch, apart from the dev app (@routeswitch/app).
+  productName: RouteSwitch
+
+# The app is fully bundled by electron-vite: no node_modules in the package.
+files:
+  - out/**
+  - resources/**
+  - package.json
+  - '!**/*.map'
+asar: true
+npmRebuild: false
+nodeGypRebuild: false
+includePdb: false
+
+# The helper package installer.ts reads from `process.resourcesPath/helper`:
+# the binary, its LaunchDaemon plist and both scripts (root-run through osascript).
+extraResources:
+  - from: ../../build/helper/${arch}/com.routeswitch.helper
+    to: helper/com.routeswitch.helper
+  - from: ../../packages/helper/launchd/com.routeswitch.helper.plist
+    to: helper/com.routeswitch.helper.plist
+  - from: ../../scripts/install-helper.sh
+    to: helper/install-helper.sh
+  - from: ../../scripts/uninstall.sh
+    to: helper/uninstall.sh
+
+mac:
+  category: public.app-category.utilities
+  target:
+    - target: dmg
+  extendInfo:
+    LSUIElement: true
+  # The helper is Node.js 24 (pkg SEA), built for macOS 13.5 and later (`otool -l`: minos 13.5);
+  # Electron 44 itself needs 13.0. The app is useless without its helper, so 13.5 it is.
+  minimumSystemVersion: '13.5'
+  # Ad hoc signature: runs on this Mac without a certificate. With CSC_LINK set,
+  # electron-builder signs with that Developer ID instead.
+  identity: '-'
+  # A hardened runtime needs the JIT entitlements for the Node inside the helper and a
+  # Developer ID to be useful; it comes with notarization (README.md), not ad hoc.
+  hardenedRuntime: false
+  # The helper keeps its own signature from `npm run build:helper` (pkg SEA + codesign).
+  signIgnore:
+    - 'helper/com\.routeswitch\.helper$'
+
+dmg:
+  artifactName: ${productName}-${version}-${arch}.dmg
+  writeUpdateInfo: false
+
+# Electron fuses, flipped in the packaged binary.
+electronFuses:
+  runAsNode: false
+  enableCookieEncryption: true
+  enableNodeOptionsEnvironmentVariable: false
+  enableNodeCliInspectArguments: false
+  enableEmbeddedAsarIntegrityValidation: true
+  onlyLoadAppFromAsar: true
+  loadBrowserProcessSpecificV8Snapshot: false
+  grantFileProtocolExtraPrivileges: false
+
+publish: null
