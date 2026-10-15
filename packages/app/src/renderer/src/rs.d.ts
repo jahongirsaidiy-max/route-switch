@@ -9,6 +9,7 @@ import type {
   ErrorCode,
   EventLogLevel,
   IfaceRole,
+  Language,
   RuleInput,
   SetConfigResult,
   StateResult,
@@ -96,6 +97,9 @@ export interface RsServiceOrder {
   /** `sudo networksetup -ordernetworkservices …` with every name shell-quoted; null without a Wi‑Fi service. */
   readonly command: string | null;
 }
+
+/** A UI language: `uz`, `ru` or `en` (the shared `Language` enum). */
+export type RsLanguage = Language;
 
 /** Device overrides of the roles (`Config.ifaceOverrides`): a role without one is detected automatically. */
 export type RsIfaceOverrides = Partial<Record<IfaceRole, string>>;
@@ -308,6 +312,23 @@ export interface RsApi {
    * `uninstall.sh`; then `uninstallHelper` is the way (files stay).
    */
   removeHelper(): Promise<RsResult<RsHelperSetupResult>>;
+  /**
+   * The UI language (`uz`, `ru`, `en`), kept by the main process in
+   * `userData/preferences.json`; on a first start, from the system's
+   * preferred languages.
+   */
+  getLanguage(): Promise<RsResult<RsLanguage>>;
+  /**
+   * Sets and stores the UI language; every open window hears of it through
+   * `onLanguage`. The value is the language now in force (it holds for this
+   * run even when the file could not be written; that is logged).
+   */
+  setLanguage(language: RsLanguage): Promise<RsResult<RsLanguage>>;
+  /**
+   * Calls `listener` with every new language. Nothing is replayed: subscribe
+   * first, then call `getLanguage`.
+   */
+  onLanguage(listener: (language: RsLanguage) => void): RsUnsubscribe;
 }
 
 /** Channel -> arguments and value of the call behind it. Main and preload are typed against this table. */
@@ -335,6 +356,8 @@ export interface RsInvokeChannels {
   'rs:resetConfig': { readonly args: readonly []; readonly value: SetConfigResult };
   'rs:installHelper': { readonly args: readonly []; readonly value: RsHelperSetupResult };
   'rs:removeHelper': { readonly args: readonly []; readonly value: RsHelperSetupResult };
+  'rs:getLanguage': { readonly args: readonly []; readonly value: RsLanguage };
+  'rs:setLanguage': { readonly args: readonly [language: RsLanguage]; readonly value: RsLanguage };
 }
 
 export type RsInvokeChannel = keyof RsInvokeChannels;
@@ -344,6 +367,9 @@ export type RsStateChannel = 'rs:state';
 
 /** The channel the main process sends every new journal entry on. */
 export type RsLogChannel = 'rs:log';
+
+/** The channel the main process sends every new UI language on. */
+export type RsLanguageChannel = 'rs:language';
 
 declare global {
   interface Window {

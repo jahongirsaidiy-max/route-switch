@@ -13,6 +13,8 @@ import {
   normalizeHostAddress,
   normalizeIpv4,
   normalizeSubnet,
+  isIpWildcard,
+  parseIpWildcard,
   parseIpv4Destination,
   type Normalised,
 } from './cidr';
@@ -273,6 +275,81 @@ describe('normalizeSubnet', () => {
     ['10.0.0.0', 'invalid-cidr'],
   ])('rejects %s (%s)', (input, code) => {
     expect(codeOf(normalizeSubnet(input))).toBe(code);
+  });
+});
+
+describe('parseIpWildcard', () => {
+  it.each([
+    ['192.168.5.*', '192.168.5.0/24'],
+    ['192.168.*.*', '192.168.0.0/16'],
+    ['10.*.*.*', '10.0.0.0/8'],
+    ['172.16.*.*', '172.16.0.0/16'],
+    ['255.255.255.*', '255.255.255.0/24'],
+    ['1.*.*.*', '1.0.0.0/8'],
+  ])('turns %s into %s', (input, expected) => {
+    expect(parseIpWildcard(input)).toEqual({ ok: true, value: expected });
+  });
+
+  // Syntax only: the forbidden ranges are `normalizeSubnet`'s job.
+  it.each([
+    ['224.*.*.*', '224.0.0.0/8'],
+    ['127.*.*.*', '127.0.0.0/8'],
+    ['0.*.*.*', '0.0.0.0/8'],
+    ['169.254.*.*', '169.254.0.0/16'],
+  ])('does not judge the range of %s (%s)', (input, expected) => {
+    expect(valueOf(parseIpWildcard(input))).toBe(expected);
+  });
+
+  it.each([
+    ['a * between octets', '192.*.1.*'],
+    ['a * between octets, last fixed', '10.*.*.1'],
+    ['a * in the middle only', '10.0.*.1'],
+    ['a * in the first octet', '*.168.5.1'],
+    ['every octet a *', '*.*.*.*'],
+    ['a leading * with a fixed tail', '*.*.*.1'],
+    ['too few parts', '10.*'],
+    ['three parts', '10.*.*'],
+    ['five parts', '10.*.*.*.*'],
+    ['a double *', '10.**.*.*'],
+    ['a * glued to digits', '10.1*.*.*'],
+    ['a * glued to digits in the last octet', '10.0.0.1*'],
+    ['a prefix', '10.*.*.*/8'],
+    ['a prefix on a full wildcard', '192.168.5.*/24'],
+    ['a leading space', ' 10.*.*.*'],
+    ['a trailing space', '10.*.*.* '],
+    ['an inner space', '10. *.*.*'],
+    ['a trailing newline', '10.*.*.*\n'],
+    ['empty', ''],
+    ['a lone *', '*'],
+    ['an empty octet', '.*.*.*'],
+    ['an octet out of range', '256.*.*.*'],
+    ['an octal octet', '010.*.*.*'],
+    ['a hex octet', '0x0a.*.*.*'],
+    ['a negative octet', '-1.*.*.*'],
+    ['no * at all', '10.0.0.0'],
+    ['a CIDR', '10.0.0.0/8'],
+    ['a domain wildcard', '*.corp.local'],
+    ['an IPv6 wildcard', 'fd00::*'],
+  ])('rejects %s (%j)', (_label, input) => {
+    expect(codeOf(parseIpWildcard(input))).toBe('invalid-wildcard');
+  });
+
+  it('carries a human-readable message with the code', () => {
+    const result = parseIpWildcard('192.*.1.*');
+    expect(result.ok ? '' : result.error.message).toMatch(/wildcard/);
+  });
+});
+
+describe('isIpWildcard', () => {
+  it('is true for any input with a *', () => {
+    expect(isIpWildcard('10.*.*.*')).toBe(true);
+    expect(isIpWildcard('*')).toBe(true);
+    expect(isIpWildcard('192.*.1.*')).toBe(true);
+  });
+
+  it('is false without a *', () => {
+    expect(isIpWildcard('10.0.0.0/8')).toBe(false);
+    expect(isIpWildcard('')).toBe(false);
   });
 });
 

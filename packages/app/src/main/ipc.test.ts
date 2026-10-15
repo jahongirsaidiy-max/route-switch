@@ -1,4 +1,4 @@
-import { LIMITS, type Config, type EngineState, type RuleInput } from '@routeswitch/shared';
+import { LIMITS, type Config, type EngineState, type Language, type RuleInput } from '@routeswitch/shared';
 import { mkdtemp, readdir, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
@@ -24,6 +24,7 @@ import {
   EMPTY_CONFIG,
   IMPORT_TTL_MS,
   INVOKE_CHANNELS,
+  LANGUAGE_CHANNEL,
   LOG_CHANNEL,
   registerIpcHandlers,
   STATE_CHANNEL,
@@ -33,6 +34,7 @@ import {
 } from './ipc';
 import type { HelperSetupResult, Installer } from './installer';
 import { createLogBuffer, type LogBuffer } from './logBuffer';
+import type { PreferencesStore } from './preferences';
 import { APP_ENTRY_URL } from './runtime';
 import { createSettings, type Settings } from './settings';
 
@@ -184,6 +186,28 @@ const unusedSettings = (logger: Parameters<typeof createSettings>[0]['logger']):
     logger,
   });
 
+/** An in-memory language store, like `createPreferences` without the file. */
+function memoryPreferences(initial: Language = 'uz') {
+  let current = initial;
+  const listeners = new Set<(language: Language) => void>();
+  const store = {
+    language: vi.fn(() => Promise.resolve(current)),
+    setLanguage: vi.fn((language: Language) => {
+      const changed = language !== current;
+      current = language;
+      if (changed) for (const listener of [...listeners]) listener(language);
+      return Promise.resolve(language);
+    }),
+    onLanguage: (listener: (language: Language) => void) => {
+      listeners.add(listener);
+      return () => {
+        listeners.delete(listener);
+      };
+    },
+  } satisfies PreferencesStore;
+  return { store, listeners };
+}
+
 interface SetupOptions {
   readonly connect?: boolean;
   readonly config?: Config;
@@ -198,6 +222,7 @@ interface SetupOptions {
   /** The helper's stored config cannot be loaded: the handshake ends `config-unreadable`. */
   readonly brokenConfig?: boolean;
   readonly installer?: Installer;
+  readonly preferences?: PreferencesStore;
 }
 
 /** An installer that must not be reached. */
@@ -243,6 +268,7 @@ async function setup(options: SetupOptions = {}) {
     listRecipients: () => recipients,
     ...(options.logBuffer === undefined ? {} : { logBuffer: options.logBuffer }),
     settings: options.settings ?? unusedSettings(logger),
+    preferences: options.preferences ?? memoryPreferences().store,
     openRulesWindow: options.openRulesWindow ?? (() => undefined),
     configDialogs: options.configDialogs ?? CANCELLED_DIALOGS,
     installer: options.installer ?? UNUSED_INSTALLER,
@@ -296,10 +322,10 @@ const newRule = (extra: Partial<RuleInput> = {}): RuleInput => ({
 // ---------------------------------------------------------------------------
 
 describe('registration', () => {
-  it('handles exactly the twenty-three invoke channels of the renderer API', async () => {
+  it('handles exactly the twenty-five invoke channels of the renderer API', async () => {
     const h = await setup({ connect: false });
     expect([...h.ipcMain.handlers.keys()].sort()).toEqual([...INVOKE_CHANNELS].sort());
-    expect(INVOKE_CHANNELS).toHaveLength(23);
+    expect(INVOKE_CHANNELS).toHaveLength(25);
   });
 
   it('dispose removes every handler and stops the state pushes; a second dispose does nothing', async () => {
@@ -310,7 +336,7 @@ describe('registration', () => {
     h.registration.dispose();
     h.registration.dispose();
     expect(h.ipcMain.handlers.size).toBe(0);
-    expect(h.ipcMain.removeHandler).toHaveBeenCalledTimes(23);
+    expect(h.ipcMain.removeHandler).toHaveBeenCalledTimes(25);
     h.sockets[0]?.emit('connect');
     for (let i = 0; i < 6; i += 1) await flush();
     expect(sent).toEqual([]);
@@ -913,6 +939,7 @@ describe('rs:state', () => {
       entryUrl: APP_ENTRY_URL,
       logger,
       settings: unusedSettings(logger),
+      preferences: memoryPreferences().store,
       openRulesWindow: () => undefined,
       configDialogs: CANCELLED_DIALOGS,
       listRecipients: () => {
@@ -1397,7 +1424,7 @@ describe('rs:openRulesWindow (main process only)', () => {
 });
 
 describe('the preload against the main process (window.rs)', () => {
-  it('exposes exactly the twenty-three methods of the renderer API, each wired to a handled channel', async () => {
+  it('exposes exactly the twenty-eight methods of the renderer API (twenty-five calls, three subscriptions), each wired to a handled channel', async () => {
     const openRulesWindow = vi.fn();
     const h = await setup({ settings: fakeSettings().settings, openRulesWindow });
     bridge.setInvokeTarget((channel, ...args) => {
@@ -1415,12 +1442,14 @@ describe('the preload against the main process (window.rs)', () => {
         'deleteRule',
         'exportConfig',
         'getConfig',
+        'getLanguage',
         'getLog',
         'getServiceOrder',
         'getSettings',
         'getState',
         'importConfig',
         'installHelper',
+        'onLanguage',
         'onLog',
         'onState',
         'openRulesWindow',
@@ -1430,6 +1459,7 @@ describe('the preload against the main process (window.rs)', () => {
         'saveRule',
         'setEnabled',
         'setIfaceOverrides',
+        'setLanguage',
         'setOpenAtLogin',
         'test',
         'toggleRule',
@@ -1466,6 +1496,10 @@ describe('the preload against the main process (window.rs)', () => {
     // Connected: nothing to reconnect, and a readable config is never reset.
     expect(await settle(rs.reconnectHelper())).toEqual({ ok: true, value: null });
     expect(await settle(rs.resetConfig())).toMatchObject({ ok: false, code: 'operation-failed' });
+    // The language is the app's own: no helper round trip.
+    expect(await settle(rs.getLanguage())).toEqual({ ok: true, value: 'uz' });
+    expect(await settle(rs.setLanguage('en'))).toEqual({ ok: true, value: 'en' });
+    expect(await settle(rs.getLanguage())).toEqual({ ok: true, value: 'en' });
     expect(h.sentAfterHandshake().filter((method) => method !== 'getConfig')).toEqual([
       'setConfig',
       'setConfig',
@@ -1555,5 +1589,102 @@ describe('installHelper / removeHelper', () => {
     expect(await h.call('rs:removeHelper', '--force')).toMatchObject({ ok: false, code: 'invalid-input' });
     expect(installer.install).not.toHaveBeenCalled();
     expect(installer.uninstall).not.toHaveBeenCalled();
+  });
+});
+
+describe('language: rs:getLanguage, rs:setLanguage and the rs:language push', () => {
+  const languageRecipient = (url: string = APP_ENTRY_URL) => {
+    const received: unknown[] = [];
+    const target: StateRecipient = {
+      isDestroyed: () => false,
+      getURL: () => url,
+      send: (channel, payload) => {
+        if (channel === LANGUAGE_CHANNEL) received.push(payload);
+      },
+    };
+    return { target, received };
+  };
+
+  it('reads the stored language from the main process, with or without a helper', async () => {
+    const { store } = memoryPreferences('ru');
+    const h = await setup({ connect: false, preferences: store });
+    expect(await h.call('rs:getLanguage')).toEqual({ ok: true, value: 'ru' });
+    expect(h.sent()).toEqual([]);
+  });
+
+  it('stores a new language and pushes it to every window of the app page, not to another document', async () => {
+    const { store } = memoryPreferences('uz');
+    const popover = languageRecipient();
+    const rules = languageRecipient();
+    const foreign = languageRecipient('https://example.com/');
+    const h = await setup({ connect: false, preferences: store, recipients: [popover.target, rules.target, foreign.target] });
+    expect(await h.call('rs:setLanguage', 'ru')).toEqual({ ok: true, value: 'ru' });
+    expect(store.setLanguage).toHaveBeenCalledWith('ru');
+    expect(popover.received).toEqual(['ru']);
+    expect(rules.received).toEqual(['ru']);
+    expect(foreign.received).toEqual([]);
+    expect(await h.call('rs:getLanguage')).toEqual({ ok: true, value: 'ru' });
+    // The same language again: stored, nothing pushed.
+    expect(await h.call('rs:setLanguage', 'ru')).toEqual({ ok: true, value: 'ru' });
+    expect(popover.received).toEqual(['ru']);
+    expect(h.sent()).toEqual([]);
+  });
+
+  it.each<[string, unknown[]]>([
+    ['an unknown language', ['de']],
+    ['another spelling', ['RU']],
+    ['a locale tag', ['ru-RU']],
+    ['padding', ['ru ']],
+    ['an empty string', ['']],
+    ['a number', [1]],
+    ['null', [null]],
+    ['an object', [{ language: 'ru' }]],
+    ['an array', [['ru']]],
+    ['no argument', []],
+    ['a second argument', ['ru', 'en']],
+    ['a prototype key', ['toString']],
+  ])('refuses %s before the store is touched', async (_name, args) => {
+    const { store } = memoryPreferences('uz');
+    const recipient = languageRecipient();
+    const h = await setup({ connect: false, preferences: store, recipients: [recipient.target] });
+    expect(await h.call('rs:setLanguage', ...args)).toMatchObject({ ok: false, code: 'invalid-input' });
+    expect(store.setLanguage).not.toHaveBeenCalled();
+    expect(recipient.received).toEqual([]);
+  });
+
+  it('getLanguage takes no argument', async () => {
+    const h = await setup({ connect: false });
+    expect(await h.call('rs:getLanguage', 'ru')).toMatchObject({ ok: false, code: 'invalid-input' });
+  });
+
+  it('another document or a sub-frame can neither read nor change the language', async () => {
+    const { store } = memoryPreferences('uz');
+    const h = await setup({ connect: false, preferences: store });
+    for (const event of [
+      { senderFrame: { url: 'https://example.com/', parent: null } },
+      { senderFrame: { url: APP_ENTRY_URL, parent: {} } },
+      { senderFrame: null },
+    ]) {
+      expect(await h.callAs(event, 'rs:getLanguage')).toMatchObject({ ok: false, code: 'forbidden' });
+      expect(await h.callAs(event, 'rs:setLanguage', 'en')).toMatchObject({ ok: false, code: 'forbidden' });
+    }
+    expect(store.language).not.toHaveBeenCalled();
+    expect(store.setLanguage).not.toHaveBeenCalled();
+  });
+
+  it('a store that throws is answered internal, never thrown into the page', async () => {
+    const { store } = memoryPreferences('uz');
+    store.setLanguage.mockImplementationOnce(() => Promise.reject(new Error('disk gone')));
+    const h = await setup({ connect: false, preferences: store });
+    expect(await h.call('rs:setLanguage', 'en')).toMatchObject({ ok: false, code: 'internal' });
+  });
+
+  it('dispose stops the language pushes', async () => {
+    const { store, listeners } = memoryPreferences('uz');
+    const recipient = languageRecipient();
+    const h = await setup({ connect: false, preferences: store, recipients: [recipient.target] });
+    expect(listeners.size).toBe(1);
+    h.registration.dispose();
+    expect(listeners.size).toBe(0);
   });
 });

@@ -246,6 +246,25 @@ describe('handshake failures', () => {
     expect(h.scheduler.pending()).toEqual([RECONNECT_DELAY_MS]);
   });
 
+  it('treats a 0.1.0 helper (protocol 2) as incompatible: it cannot diagnose', async () => {
+    expect(PROTOCOL_VERSION).toBe(3);
+    const h = setup();
+    h.client.start();
+    const socket = h.socket();
+    socket.emit('connect');
+    await flush();
+    socket.receive(ok(0, { protocolVersion: 2, helperVersion: '0.1.0', state: engineState(1) }));
+    await flush();
+    expect(h.client.snapshot().status).toEqual({
+      kind: 'incompatible',
+      helperVersion: '0.1.0',
+      protocolVersion: 2,
+      expectedProtocolVersion: 3,
+    });
+    expect(socket.destroyed).toBe(true);
+    expect(await h.client.request('diagnose', { target: 'corp.local' })).toMatchObject({ ok: false, code: 'not-connected' });
+  });
+
   it.each([
     ['a status without version fields', ok(0, { state: engineState(1) })],
     ['a helperVersion that is not a version', ok(0, { protocolVersion: PROTOCOL_VERSION, helperVersion: '<script>', state: engineState(1) })],
@@ -590,6 +609,7 @@ describe('requests', () => {
     ['setEnabled', { enabled: true }, DEFAULT_TIMEOUTS.mutateMs],
     ['setConfig', { config: { version: 1, rules: [] } }, DEFAULT_TIMEOUTS.mutateMs],
     ['uninstall', {}, DEFAULT_TIMEOUTS.uninstallMs],
+    ['diagnose', { target: 'corp.local' }, DEFAULT_TIMEOUTS.diagnoseMs],
   ] as const)('times %s out after its own limit, and keeps the connection', async (method, params, limit) => {
     const { client, live, scheduler } = await connected();
     let settled: unknown = null;

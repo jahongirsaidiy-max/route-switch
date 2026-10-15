@@ -1,5 +1,6 @@
 // The main-process side of `window.rs`: one `ipcMain.handle` per method of the
-// renderer API (`src/renderer/src/rs.d.ts`) and the `rs:state` push.
+// renderer API (`src/renderer/src/rs.d.ts`) and the `rs:state`, `rs:log` and
+// `rs:language` pushes.
 //
 // The renderer is treated as untrusted. Every call is checked, in this order:
 // it must come from the top frame of the app's own page; its arguments must
@@ -16,6 +17,7 @@ import {
   Config as ConfigSchema,
   describeIssues,
   findStructureViolation,
+  Language,
   Rule,
   SetEnabledRequest,
   TestRequest,
@@ -28,6 +30,8 @@ import type {
   RsConnection,
   RsInvokeChannel,
   RsInvokeChannels,
+  RsLanguage,
+  RsLanguageChannel,
   RsLogChannel,
   RsResult,
   RsSnapshot,
@@ -39,6 +43,7 @@ import type { HelperClient, HelperStatus } from './helperClient';
 import type { Installer } from './installer';
 import { createLogBuffer, type LogBuffer } from './logBuffer';
 import type { Logger } from './logger';
+import type { PreferencesStore } from './preferences';
 import { isAllowedNavigation } from './security';
 import type { Settings } from './settings';
 
@@ -48,6 +53,7 @@ const toConnection = (status: HelperStatus): RsConnection => status;
 
 export const STATE_CHANNEL: RsStateChannel = 'rs:state';
 export const LOG_CHANNEL: RsLogChannel = 'rs:log';
+export const LANGUAGE_CHANNEL: RsLanguageChannel = 'rs:language';
 
 /** The channels handled here, in the order of the renderer API. */
 export const INVOKE_CHANNELS = [
@@ -74,6 +80,8 @@ export const INVOKE_CHANNELS = [
   'rs:resetConfig',
   'rs:installHelper',
   'rs:removeHelper',
+  'rs:getLanguage',
+  'rs:setLanguage',
 ] as const satisfies readonly RsInvokeChannel[];
 
 /** What "Bo'sh config bilan boshlash" stores in place of a config the helper cannot load. */
@@ -115,6 +123,8 @@ export interface IpcDeps {
   readonly logBuffer?: LogBuffer;
   /** The login item and the network service order (settings screen). */
   readonly settings: Settings;
+  /** The UI language, kept in `userData/preferences.json`; every change is pushed to the windows as `rs:language`. */
+  readonly preferences: Pick<PreferencesStore, 'language' | 'setLanguage' | 'onLanguage'>;
   /** Runs the app's own install / uninstall script as root after the system password dialog (`installer.ts`). */
   readonly installer: Installer;
   /** Opens the rules window or brings it to the front (`WindowManager.openRules`). Main process only, no helper call. */
@@ -194,6 +204,8 @@ const RuleArgument: Schema<Rule> = Rule;
 const ImportToken: Schema<string> = Rule.in.shape.id;
 /** Device overrides per role: only `ethernet` / `wifi` keys, each an `en*` name. Required (no `undefined`). */
 const IfaceOverrides: Schema<RsIfaceOverrides> = ConfigSchema.shape.ifaceOverrides.unwrap();
+/** A UI language: exactly `uz`, `ru` or `en`. */
+const LanguageArgument: Schema<RsLanguage> = Language;
 
 const ARGUMENTS = {
   'rs:getState': argumentsOf(),
@@ -219,6 +231,8 @@ const ARGUMENTS = {
   'rs:resetConfig': argumentsOf(),
   'rs:installHelper': argumentsOf(),
   'rs:removeHelper': argumentsOf(),
+  'rs:getLanguage': argumentsOf(),
+  'rs:setLanguage': argumentsOf(LanguageArgument),
 } as const satisfies Readonly<Record<RsInvokeChannel, ArgsParser<readonly unknown[]>>>;
 
 type ParsedArgs<C extends RsInvokeChannel> = (typeof ARGUMENTS)[C] extends ArgsParser<infer A> ? A : never;
@@ -239,7 +253,7 @@ const isTrustedSender = (event: InvokeEvent, entryUrl: string): boolean => {
 type RuleEdit = (rules: Config['rules']) => RuleInput[] | null;
 
 export function registerIpcHandlers(deps: IpcDeps): IpcRegistration {
-  const { ipcMain, helperClient, entryUrl, settings } = deps;
+  const { ipcMain, helperClient, entryUrl, settings, preferences } = deps;
   const logger = deps.logger.child({ component: 'ipc' });
   // Everything below can be triggered by the page at will, so each kind of
   // line has its own rate-limit budget.
@@ -451,6 +465,9 @@ export function registerIpcHandlers(deps: IpcDeps): IpcRegistration {
       }),
     'rs:installHelper': () => setUpHelper('rs:installHelper', deps.installer.install),
     'rs:removeHelper': () => setUpHelper('rs:removeHelper', deps.installer.uninstall),
+    // The app's own preference: no helper round trip, and it works while the helper is away.
+    'rs:getLanguage': async () => ({ ok: true, value: await preferences.language() }),
+    'rs:setLanguage': async ([language]) => ({ ok: true, value: await preferences.setLanguage(language) }),
   };
 
   const register = (channel: RsInvokeChannel): void => {
@@ -492,11 +509,12 @@ export function registerIpcHandlers(deps: IpcDeps): IpcRegistration {
   // -- pushes: rs:state, rs:log ----------------------------------------------
 
   /** Sends to every window that shows the app's page; a failure is logged, never thrown into the sender. */
-  const PUSHED: Readonly<Record<RsStateChannel | RsLogChannel, string>> = {
+  const PUSHED: Readonly<Record<RsStateChannel | RsLogChannel | RsLanguageChannel, string>> = {
     'rs:state': 'the state',
     'rs:log': 'a journal entry',
+    'rs:language': 'the language',
   };
-  const broadcast = (channel: RsStateChannel | RsLogChannel, payload: unknown): void => {
+  const broadcast = (channel: RsStateChannel | RsLogChannel | RsLanguageChannel, payload: unknown): void => {
     let recipients: readonly StateRecipient[];
     try {
       recipients = deps.listRecipients();
@@ -538,6 +556,10 @@ export function registerIpcHandlers(deps: IpcDeps): IpcRegistration {
     }),
     logBuffer.subscribe((entry) => {
       broadcast(LOG_CHANNEL, entry);
+    }),
+    // Every window (the popover and the rules window) switches language at once, without a reload.
+    preferences.onLanguage((language) => {
+      broadcast(LANGUAGE_CHANNEL, language);
     }),
   ];
 

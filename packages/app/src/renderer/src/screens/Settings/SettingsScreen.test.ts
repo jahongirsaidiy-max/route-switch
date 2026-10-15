@@ -6,7 +6,9 @@ import { Button } from '../../components';
 import { renderMarkup } from '../../components/test-utils';
 import type { EngineStateView } from '../../hooks/useEngineState';
 import type { RsApi, RsServiceOrder } from '../../rs';
+import { i18nFor } from '../../../../i18n';
 import {
+  chooseLanguage,
   focusUninstallButton,
   followServiceOrderView,
   SettingsPanel,
@@ -52,6 +54,9 @@ const ORDER: RsServiceOrder = {
 
 const props = (extra: Partial<SettingsPanelProps> = {}): SettingsPanelProps => ({
   engine: CONNECTED,
+  language: 'uz',
+  languageHint: i18nFor('uz').t.settingsLanguage.hint,
+  onSelectLanguage: vi.fn(),
   openAtLogin: false,
   overrides: null,
   serviceOrder: { phase: 'ready', order: ORDER, feedback: null },
@@ -92,7 +97,10 @@ const treeOf = (extra: Partial<SettingsPanelProps> = {}) => {
 const buttonsNamed = (elements: ReactElement<AnyProps>[], text: string) =>
   elements.filter((element) => element.type === Button && element.props.children === text);
 
-const selectOf = (html: string) => /<select[^>]*>.*?<\/select>/.exec(html)?.[0] ?? '';
+/** The Ethernet adapter select (the language picker comes first, `name="language"`). */
+const selectOf = (html: string) =>
+  [...html.matchAll(/<select[^>]*>.*?<\/select>/g)].map((match) => match[0]).find((select) => !select.includes('name="language"')) ?? '';
+const languageSelectOf = (html: string) => /<select name="language"[^>]*>.*?<\/select>/.exec(html)?.[0] ?? '';
 
 describe('SettingsPanel: login item', () => {
   it('is a switch showing the setting', () => {
@@ -137,7 +145,7 @@ describe('SettingsPanel: Ethernet adapter', () => {
   it('reports a choice, but ignores changes while saving or disabled', () => {
     const pick = (extra: Partial<SettingsPanelProps>, value: string) => {
       const { all, elements } = treeOf(extra);
-      const select = elements.find((element) => element.type === 'select');
+      const select = elements.find((element) => element.type === 'select' && (element.props as { name?: string }).name !== 'language');
       select?.props.onChange?.({ target: { value } });
       return all.onSelectEthernet;
     };
@@ -263,6 +271,7 @@ describe('SettingsScreen', () => {
       copyServiceOrderCommand: vi.fn(),
       uninstallHelper: vi.fn(),
       removeHelper: vi.fn(),
+      setLanguage: vi.fn(),
     };
     const html = renderMarkup(createElement(SettingsScreen, { rs }));
     expect(html).toContain('Sozlamalar');
@@ -273,6 +282,67 @@ describe('SettingsScreen', () => {
     expect(rs.copyServiceOrderCommand).not.toHaveBeenCalled();
     expect(rs.uninstallHelper).not.toHaveBeenCalled();
     expect(rs.removeHelper).not.toHaveBeenCalled();
+    expect(rs.setLanguage).not.toHaveBeenCalled();
+  });
+});
+
+describe('SettingsPanel: language (TASK-DELTA-11)', () => {
+  it('is titled the same in every language and names each language in its own words', () => {
+    const html = render();
+    expect(html).toContain('Til / Язык / Language');
+    const select = languageSelectOf(html);
+    expect(select).toContain('aria-labelledby="settings-language"');
+    expect(select).toContain('<option value="uz" lang="uz" selected="">O&#x27;zbekcha</option>');
+    expect(select).toContain('<option value="ru" lang="ru">Русский</option>');
+    expect(select).toContain('<option value="en" lang="en">English</option>');
+  });
+
+  it('shows the language in force and its hint', () => {
+    const html = render({ language: 'ru', languageHint: i18nFor('ru').t.settingsLanguage.hint });
+    expect(languageSelectOf(html)).toContain('<option value="ru" lang="ru" selected="">');
+    expect(html).toContain('Тексты приложения показываются на этом языке');
+  });
+
+  it('comes before the other settings', () => {
+    const html = render();
+    expect(html.indexOf('settings-language')).toBeLessThan(html.indexOf('settings-login'));
+  });
+
+  it('reports a choice; ignores it while saving and ignores a value that is not a language', () => {
+    const pick = (extra: Partial<SettingsPanelProps>, value: string) => {
+      const { all, elements } = treeOf(extra);
+      const select = elements.find((element) => element.type === 'select' && (element.props as { name?: string }).name === 'language');
+      select?.props.onChange?.({ target: { value } });
+      return all.onSelectLanguage;
+    };
+    expect(pick({}, 'en')).toHaveBeenCalledWith('en');
+    expect(pick({ busy: new Set(['language']) }, 'en')).not.toHaveBeenCalled();
+    expect(pick({}, 'de')).not.toHaveBeenCalled();
+    expect(pick({}, 'toString')).not.toHaveBeenCalled();
+  });
+
+  it('stays focusable while saving: busy and aria-disabled, not disabled', () => {
+    const select = languageSelectOf(render({ busy: new Set(['language']) }));
+    expect(select).not.toContain('disabled=""');
+    expect(select).toContain('aria-disabled="true"');
+    expect(select).toContain('aria-busy="true"');
+  });
+
+  it('shows a refusal under the picker', () => {
+    expect(render({ feedback: { language: { tone: 'danger', text: 'Amal bajarilmadi.' } } })).toContain('Amal bajarilmadi.');
+  });
+});
+
+describe('chooseLanguage', () => {
+  it('sets the language; success needs no words (every window switches)', async () => {
+    const rs = { setLanguage: vi.fn(() => Promise.resolve({ ok: true as const, value: 'ru' as const })) };
+    expect(await chooseLanguage(rs, 'ru', i18nFor('uz'))).toBeNull();
+    expect(rs.setLanguage).toHaveBeenCalledWith('ru');
+  });
+
+  it('words a refusal in the language still in force', async () => {
+    const rs = { setLanguage: vi.fn(() => Promise.resolve({ ok: false as const, code: 'internal' as const, error: 'x' })) };
+    expect(await chooseLanguage(rs, 'ru', i18nFor('en'))).toEqual({ tone: 'danger', text: 'Unexpected error (internal).' });
   });
 });
 

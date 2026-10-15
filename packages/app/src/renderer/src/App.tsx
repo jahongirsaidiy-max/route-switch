@@ -6,7 +6,9 @@ import './styles/global.css';
 
 import type { ComponentType, ReactElement } from 'react';
 
+import type { Locale } from '../../i18n';
 import styles from './App.module.css';
+import { I18nProvider, useI18n, type LanguageApi } from './hooks/useI18n';
 import { MenuBarScreen } from './screens/MenuBar';
 import { RulesWindow } from './screens/Rules';
 
@@ -44,16 +46,30 @@ export interface AppProps {
   /** The page URL's query; `window.location.search` in the app. */
   readonly search?: string;
   readonly screens?: Readonly<Record<View, ComponentType>>;
+  /** The preload API for the UI language; `window.rs` in the app. */
+  readonly rs?: LanguageApi;
+  /** A fixed UI language instead of the stored one (tests). */
+  readonly language?: Locale;
 }
 
-export function App({ search = window.location.search, screens = SCREENS }: AppProps): ReactElement {
+/** The page: the screen of its window, in the UI language (TASK-DELTA-11) — every window follows a change at once. */
+export function App({ search = window.location.search, screens = SCREENS, rs, language }: AppProps): ReactElement {
+  return (
+    <I18nProvider rs={rs} language={language}>
+      <AppView search={search} screens={screens} />
+    </I18nProvider>
+  );
+}
+
+function AppView({ search, screens }: { readonly search: string; readonly screens: Readonly<Record<View, ComponentType>> }): ReactElement {
+  const { t } = useI18n();
   const view = parseView(search);
   if (view === null) {
     return (
       <main className={styles['root']} data-view="unknown">
         <div className={styles['placeholder']} role="alert">
           <h1 className={styles['title']}>RouteSwitch</h1>
-          <p className={styles['subtitle']}>Noma'lum oyna. Ilovani menu bar ikonkasidan qayta oching.</p>
+          <p className={styles['subtitle']}>{t.unknownWindow}</p>
         </div>
       </main>
     );

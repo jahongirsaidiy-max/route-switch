@@ -3,6 +3,16 @@ import { z } from 'zod';
 
 import { MAX_LINE_BYTES, createJsonLinesDecoder, encodeJsonLine, type JsonLineErrorCode } from './jsonl';
 import {
+  DIAGNOSE_ADDRESS_SOURCES,
+  DIAGNOSE_DNS_OUTCOMES,
+  DIAGNOSE_MATCH_VIA,
+  DIAGNOSE_NOTES,
+  DIAGNOSE_PRECEDENCE_CODES,
+  DIAGNOSE_TARGET_KINDS,
+  DNS_WARNING_CODES,
+  DNS_WARNING_SOURCES,
+  DiagnoseResult,
+  DnsWarning,
   ERROR_CODES,
   EVENT_LOG_LEVELS,
   EngineState,
@@ -24,8 +34,10 @@ import {
   STRUCTURE_LIMITS,
   TestResult,
   describeIssues,
+  diagnoseTargetKind,
   errorResponse,
   findStructureViolation,
+  normalizeDiagnoseTarget,
   parseRequest,
   parseResult,
   parseServerMessage,
@@ -117,6 +129,34 @@ const testResultInput = (overrides: Record<string, unknown> = {}): Record<string
   ...overrides,
 });
 
+const dnsWarningInput = (overrides: Record<string, unknown> = {}): Record<string, unknown> => ({
+  server: '192.168.1.53',
+  source: 'interface',
+  role: 'ethernet',
+  via: 'wifi',
+  code: 'other-interface-subnet',
+  ...overrides,
+});
+
+const diagnoseAddressInput = (overrides: Record<string, unknown> = {}): Record<string, unknown> => ({
+  address: '10.30.0.5',
+  source: 'rule-cache',
+  route: { device: 'en5', gateway: '10.20.4.1', role: 'ethernet' },
+  expectedRole: 'ethernet',
+  matchesExpected: true,
+  ...overrides,
+});
+
+const diagnoseResultInput = (overrides: Record<string, unknown> = {}): Record<string, unknown> => ({
+  target: 'corp.local',
+  targetKind: 'domain',
+  match: { ruleId: uuid(2), via: 'domain', precedence: 'only-match' },
+  addresses: [diagnoseAddressInput(), diagnoseAddressInput({ address: '10.30.0.6', source: 'query' })],
+  dns: { server: '10.20.0.10', role: 'ethernet', resolverFile: '/etc/resolver/corp.local', outcome: 'ok', ms: 12 },
+  notes: [],
+  ...overrides,
+});
+
 /** A valid result for every method, as the helper would send it. */
 const RESULT_INPUTS: Record<RequestMethod, Record<string, unknown>> = {
   status: { protocolVersion: PROTOCOL_VERSION, helperVersion: '0.1.0', state: stateInput() },
@@ -126,6 +166,7 @@ const RESULT_INPUTS: Record<RequestMethod, Record<string, unknown>> = {
   setEnabled: { state: stateInput() },
   test: testResultInput(),
   uninstall: {},
+  diagnose: diagnoseResultInput(),
 };
 
 /** A valid request for every method, as the app would send it. */
@@ -137,20 +178,30 @@ const REQUEST_INPUTS: Record<RequestMethod, Record<string, unknown>> = {
   setEnabled: { id: 5, method: 'setEnabled', enabled: false },
   test: { id: 6, method: 'test', target: '172.16.12.40' },
   uninstall: { id: 7, method: 'uninstall' },
+  diagnose: { id: 8, method: 'diagnose', target: 'corp.local' },
 };
 
 const errorOf = (result: { ok: true } | { ok: false; error: { code: ErrorCode; id: number | null } }): string =>
   result.ok ? 'ok' : `${result.error.code}#${String(result.error.id)}`;
 
 describe('constants', () => {
-  it('has exactly the seven methods and nothing that runs a command', () => {
-    expect(REQUEST_METHODS).toEqual(['status', 'getConfig', 'setConfig', 'apply', 'setEnabled', 'test', 'uninstall']);
+  it('has exactly the eight methods and nothing that runs a command', () => {
+    expect(REQUEST_METHODS).toEqual([
+      'status',
+      'getConfig',
+      'setConfig',
+      'apply',
+      'setEnabled',
+      'test',
+      'uninstall',
+      'diagnose',
+    ]);
     expect(Request.options.map((option) => option.shape.method.value)).toEqual([...REQUEST_METHODS]);
     expect(Object.keys(RESULT_SCHEMAS)).toEqual([...REQUEST_METHODS]);
   });
 
   it('pins the protocol version and the closed enumerations', () => {
-    expect(PROTOCOL_VERSION).toBe(2);
+    expect(PROTOCOL_VERSION).toBe(3);
     expect(RULE_STATUSES).toEqual(['active', 'pending', 'error', 'disabled']);
     expect(EVENT_LOG_LEVELS).toEqual(['info', 'warn', 'error']);
     expect(ERROR_CODES).toEqual([
@@ -191,6 +242,38 @@ describe('constants', () => {
       'overridden-by-rule',
       'dns-server-excluded',
     ]);
+    expect(DNS_WARNING_CODES).toEqual(['other-interface-subnet', 'routed-via-other-interface']);
+    expect(DNS_WARNING_SOURCES).toEqual(['interface', 'rule']);
+    expect(DIAGNOSE_TARGET_KINDS).toEqual(['ip', 'domain']);
+    expect(DIAGNOSE_MATCH_VIA).toEqual(['ip', 'subnet', 'domain', 'wildcard', 'dns-server']);
+    expect(DIAGNOSE_PRECEDENCE_CODES).toEqual([
+      'only-match',
+      'host-route',
+      'domain-address',
+      'longest-prefix',
+      'exact-domain',
+      'deeper-wildcard',
+      'config-order',
+    ]);
+    expect(DIAGNOSE_ADDRESS_SOURCES).toEqual(['rule-cache', 'query']);
+    expect(DIAGNOSE_DNS_OUTCOMES).toEqual(['ok', 'timeout', 'refused', 'error', 'not-queried']);
+    expect(DIAGNOSE_NOTES).toEqual([
+      'name-not-covered',
+      'no-matching-rule',
+      'rule-disabled',
+      'globally-disabled',
+      'interface-down',
+      'no-gateway',
+      'not-applied',
+      'route-mismatch',
+      'connected-network',
+      'dns-server-excluded',
+      'no-addresses',
+      'resolve-failed',
+      'addresses-truncated',
+    ]);
+    expect(PROTOCOL_LIMITS.maxDnsWarnings).toBe(16);
+    expect(PROTOCOL_LIMITS.maxDiagnoseAddresses).toBe(LIMITS.maxIpsPerDomain);
     expect(STRUCTURE_LIMITS).toEqual({ maxNodes: 65_536, maxArrayLength: 500, maxDepth: 12, maxStringLength: 4096 });
     expect(PROTOCOL_LIMITS.maxAppliedDestinationsPerRule).toBe(LIMITS.maxIpsPerDomain + 1);
   });
@@ -232,6 +315,8 @@ describe('Request', () => {
       { id: 1, method: 'status', [hostile]: 1 },
       { id: 1, method: hostile },
       { id: 1, method: 'test', target: hostile },
+      { id: 1, method: 'diagnose', target: hostile },
+      { id: 1, method: 'diagnose', target: hostile, extra: hostile },
       { id: 1, method: 'setEnabled', enabled: hostile },
       { id: 1, method: 'setConfig', config: { version: 1, rules: [], ifaceOverrides: { [hostile]: 'en5' } } },
       { id: 1, method: 'setConfig', config: { version: 1, rules: [], ifaceOverrides: { ethernet: hostile } } },
@@ -262,6 +347,8 @@ describe('Request', () => {
     expect(message({ id: 1, method: 'status', extra: 1 })).toBe('Message: has an unknown key');
     expect(message({ id: 1, method: 'setEnabled', enabled: 'yes' })).toBe('enabled: has the wrong type');
     expect(message({ id: 1, method: 'test', target: '127.0.0.1' })).toBe('target: is invalid (loopback)');
+    expect(message({ id: 1, method: 'diagnose', target: '127.0.0.1' })).toBe('target: is invalid (loopback)');
+    expect(message({ id: 1, method: 'diagnose', target: '*.corp.local' })).toBe('target: is invalid (invalid-domain)');
     expect(message({ id: 1, method: 'setConfig', config: { version: 1, rules: [], ifaceOverrides: { vpn: 'en5' } } })).toBe(
       'config.ifaceOverrides: has an unknown key',
     );
@@ -305,6 +392,71 @@ describe('Request', () => {
     ['null', null],
   ])('rejects a test target that is %s', (_name, target) => {
     expect(errorOf(parseRequest({ id: 6, method: 'test', target }))).toBe('invalid-request#6');
+  });
+
+  it.each([
+    ['an address', '172.16.12.40'],
+    ['a domain', 'corp.local'],
+    ['a single-label name', 'intranet'],
+    ['a long domain', `${'a'.repeat(63)}.${'b'.repeat(63)}.${'c'.repeat(63)}.${'d'.repeat(61)}`],
+  ])('accepts a diagnose target that is %s, unchanged', (_name, target) => {
+    expect(parseRequest({ id: 8, method: 'diagnose', target })).toEqual({
+      ok: true,
+      value: { id: 8, method: 'diagnose', target },
+    });
+  });
+
+  it.each([
+    ['loopback', '127.0.0.1', 'loopback'],
+    ['the unspecified address', '0.0.0.0', 'default-route'],
+    ['a this-network address', '0.1.2.3', 'this-network'],
+    ['a link-local address', '169.254.1.1', 'link-local'],
+    ['multicast', '224.0.0.251', 'multicast'],
+    ['broadcast', '255.255.255.255', 'broadcast'],
+    ['an octal octet', '010.1.1.1', 'invalid-ipv4'],
+    ['three octets', '10.1.1', 'invalid-ipv4'],
+    ['an octet out of range', '256.1.1.1', 'invalid-ipv4'],
+    ['a subnet', '10.0.0.0/8', 'invalid-domain'],
+    ['an IP wildcard', '10.*.*.*', 'invalid-domain'],
+    ['a domain wildcard', '*.corp.local', 'invalid-domain'],
+    ['a bare *', '*', 'invalid-domain'],
+    ['upper case', 'Corp.Local', 'invalid-domain'],
+    ['a URL', 'https://corp.local/x', 'invalid-domain'],
+    ['a host with a port', 'corp.local:443', 'invalid-domain'],
+    ['a path', '../etc', 'invalid-domain'],
+    ['an option', '-ifscope', 'invalid-domain'],
+    ['a padded name', ' corp.local', 'invalid-domain'],
+    ['a trailing dot', 'corp.local.', 'invalid-domain'],
+    ['an IPv6 address', '::1', 'invalid-domain'],
+    ['an empty string', '', 'invalid-domain'],
+  ])('rejects a diagnose target that is %s (%s)', (_name, target, code) => {
+    expect(errorOf(parseRequest({ id: 8, method: 'diagnose', target }))).toBe('invalid-request#8');
+    const result = normalizeDiagnoseTarget(target);
+    expect(result.ok ? null : result.error.code).toBe(code);
+  });
+
+  it.each([
+    ['a name longer than 253 characters', `${'a.'.repeat(126)}ab`],
+    ['a number', 167772161],
+    ['null', null],
+    ['an array', ['corp.local']],
+  ])('rejects a diagnose target that is %s', (_name, target) => {
+    expect(errorOf(parseRequest({ id: 8, method: 'diagnose', target }))).toBe('invalid-request#8');
+  });
+
+  it.each([
+    ['without a target', { id: 8, method: 'diagnose' }],
+    ['with an extra key', { id: 8, method: 'diagnose', target: 'corp.local', resolve: true }],
+    ['with a server to ask', { id: 8, method: 'diagnose', target: 'corp.local', dns: '10.20.0.10' }],
+  ])('rejects a diagnose request %s', (_name, request) => {
+    expect(errorOf(parseRequest(request))).toBe('invalid-request#8');
+  });
+
+  it('tells an address from a domain', () => {
+    expect(diagnoseTargetKind('10.0.0.1')).toBe('ip');
+    expect(diagnoseTargetKind('10.1.1')).toBe('ip');
+    expect(diagnoseTargetKind('corp.local')).toBe('domain');
+    expect(diagnoseTargetKind('1st.example.org')).toBe('domain');
   });
 
   it.each([
@@ -410,6 +562,8 @@ describe('Request', () => {
     expectTypeOf<ResultOf<'uninstall'>>().toEqualTypeOf<Record<string, never>>();
     expectTypeOf<ParamsOf<'setEnabled'>>().toEqualTypeOf<{ enabled: boolean }>();
     expectTypeOf<ParamsOf<'test'>>().toEqualTypeOf<{ target: string }>();
+    expectTypeOf<ParamsOf<'diagnose'>>().toEqualTypeOf<{ target: string }>();
+    expectTypeOf<ResultOf<'diagnose'>>().toEqualTypeOf<DiagnoseResult>();
     expectTypeOf<ParamsOf<'setConfig'>>().toEqualTypeOf<{ config: Config }>();
     expectTypeOf<ParamsInputOf<'setConfig'>>().toEqualTypeOf<{ config: ConfigInput }>();
     expectTypeOf<RequestOf<'apply'>>().toEqualTypeOf<{ id: number; method: 'apply' }>();
@@ -526,6 +680,51 @@ describe('EngineState', () => {
       true,
     );
     expect(EngineState.safeParse(withState({ adapters })).success).toBe(false);
+  });
+});
+
+describe('EngineState.dnsWarnings', () => {
+  it('is optional: a state without it is still valid', () => {
+    const result = EngineState.safeParse(stateInput());
+    expect(result.success && result.data.dnsWarnings).toBeUndefined();
+  });
+
+  it('accepts warnings from an interface and from a rule', () => {
+    const dnsWarnings = [
+      dnsWarningInput(),
+      dnsWarningInput({ server: '10.20.0.10', source: 'rule', role: 'ethernet', via: null, ruleId: uuid(2), code: 'routed-via-other-interface' }),
+      dnsWarningInput({ server: '10.20.4.53', role: 'wifi', via: 'ethernet' }),
+    ];
+    const result = EngineState.safeParse(withState({ dnsWarnings }));
+    expect(result.success && result.data.dnsWarnings).toEqual(dnsWarnings);
+  });
+
+  it('accepts up to the limit and no more', () => {
+    const warnings = (count: number) =>
+      Array.from({ length: count }, (_unused, index) => dnsWarningInput({ server: `192.168.1.${String(index + 1)}` }));
+    expect(EngineState.safeParse(withState({ dnsWarnings: warnings(PROTOCOL_LIMITS.maxDnsWarnings) })).success).toBe(true);
+    expect(EngineState.safeParse(withState({ dnsWarnings: warnings(PROTOCOL_LIMITS.maxDnsWarnings + 1) })).success).toBe(false);
+  });
+
+  it.each([
+    ['a rule warning without ruleId', dnsWarningInput({ source: 'rule' })],
+    ['an interface warning with a ruleId', dnsWarningInput({ ruleId: uuid(1) })],
+    ['a warning reached through its own role', dnsWarningInput({ via: 'ethernet' })],
+    ['an unknown code', dnsWarningInput({ code: 'slow' })],
+    ['an unknown source', dnsWarningInput({ source: 'dhcp' })],
+    ['a role that is a device', dnsWarningInput({ role: 'en5' })],
+    ['a server that is a name', dnsWarningInput({ server: 'dns.corp.local' })],
+    ['a server with a prefix', dnsWarningInput({ server: '10.0.0.1/32' })],
+    ['a ruleId that is not a UUID', dnsWarningInput({ source: 'rule', ruleId: 'first' })],
+    ['no via', { server: '192.168.1.53', source: 'interface', role: 'ethernet', code: 'other-interface-subnet' }],
+  ])('rejects %s', (_name, warning) => {
+    expect(DnsWarning.safeParse(warning).success).toBe(false);
+    expect(EngineState.safeParse(withState({ dnsWarnings: [warning] })).success).toBe(false);
+  });
+
+  it('rejects dnsWarnings that is not an array', () => {
+    expect(EngineState.safeParse(withState({ dnsWarnings: dnsWarningInput() })).success).toBe(false);
+    expect(EngineState.safeParse(withState({ dnsWarnings: null })).success).toBe(false);
   });
 });
 
@@ -668,9 +867,99 @@ describe('results', () => {
     ['test', testResultInput({ ruleId: 'first' })],
     ['uninstall', null],
     ['uninstall', 'done'],
+    ['diagnose', diagnoseResultInput({ target: '127.0.0.1', targetKind: 'ip' })],
+    ['diagnose', diagnoseResultInput({ target: '*.corp.local' })],
+    ['diagnose', diagnoseResultInput({ targetKind: 'ip' })],
+    ['diagnose', diagnoseResultInput({ targetKind: 'host' })],
+    ['diagnose', diagnoseResultInput({ match: { ruleId: uuid(2), via: 'regex', precedence: 'only-match' } })],
+    ['diagnose', diagnoseResultInput({ match: { ruleId: uuid(2), via: 'domain', precedence: 'luck' } })],
+    ['diagnose', diagnoseResultInput({ match: { ruleId: 'first', via: 'domain', precedence: 'only-match' } })],
+    ['diagnose', diagnoseResultInput({ addresses: [diagnoseAddressInput({ address: 'corp.local' })] })],
+    ['diagnose', diagnoseResultInput({ addresses: [diagnoseAddressInput({ source: 'guess' })] })],
+    ['diagnose', diagnoseResultInput({ addresses: [diagnoseAddressInput({ route: { device: 'en5; rm', gateway: null, role: null } })] })],
+    ['diagnose', diagnoseResultInput({ addresses: [diagnoseAddressInput({ expectedRole: 'vpn' })] })],
+    ['diagnose', diagnoseResultInput({ addresses: [diagnoseAddressInput({ matchesExpected: 'yes' })] })],
+    ['diagnose', diagnoseResultInput({ addresses: [diagnoseAddressInput(), diagnoseAddressInput()] })],
+    [
+      'diagnose',
+      diagnoseResultInput({
+        addresses: Array.from({ length: LIMITS.maxIpsPerDomain + 1 }, (_unused, index) =>
+          diagnoseAddressInput({ address: `10.30.0.${String(index + 1)}` }),
+        ),
+      }),
+    ],
+    ['diagnose', diagnoseResultInput({ dns: { server: '10.20.0.10', role: null, resolverFile: '/etc/passwd', outcome: 'ok', ms: 1 } })],
+    ['diagnose', diagnoseResultInput({ dns: { server: '10.20.0.10', role: null, resolverFile: '/etc/resolver/../passwd', outcome: 'ok', ms: 1 } })],
+    ['diagnose', diagnoseResultInput({ dns: { server: '10.20.0.10', role: null, resolverFile: '/etc/resolver/', outcome: 'ok', ms: 1 } })],
+    ['diagnose', diagnoseResultInput({ dns: { server: '10.20.0.10', role: null, resolverFile: null, outcome: 'maybe', ms: 1 } })],
+    ['diagnose', diagnoseResultInput({ dns: { server: '10.20.0.10', role: null, resolverFile: null, outcome: 'ok', ms: -1 } })],
+    ['diagnose', diagnoseResultInput({ dns: { server: '10.20.0.10', role: null, resolverFile: null, outcome: 'ok', ms: 60_001 } })],
+    ['diagnose', diagnoseResultInput({ dns: { server: '10.20.0.10', role: null, resolverFile: null, outcome: 'ok', ms: 1.5 } })],
+    ['diagnose', diagnoseResultInput({ dns: { server: 'dns.corp.local', role: null, resolverFile: null, outcome: 'ok', ms: 1 } })],
+    ['diagnose', diagnoseResultInput({ notes: ['no-matching-rule', 'no-matching-rule'] })],
+    ['diagnose', diagnoseResultInput({ notes: ['all-good'] })],
+    ['diagnose', diagnoseResultInput({ notes: undefined })],
   ] as const)('rejects a malformed %s result', (method, result) => {
     const parsed = parseResult(method, result);
     expect(errorOf(parsed)).toBe('invalid-response#null');
+  });
+
+  it('accepts a diagnose result for an address no rule covers', () => {
+    const result = parseResult(
+      'diagnose',
+      diagnoseResultInput({
+        target: '172.16.12.40',
+        targetKind: 'ip',
+        match: null,
+        addresses: [
+          diagnoseAddressInput({
+            address: '172.16.12.40',
+            source: 'query',
+            route: { device: 'utun3', gateway: null, role: null },
+            expectedRole: null,
+            matchesExpected: null,
+          }),
+        ],
+        dns: null,
+        notes: ['no-matching-rule'],
+      }),
+    );
+    expect(result.ok && result.value.notes).toEqual(['no-matching-rule']);
+  });
+
+  it('accepts a diagnose result for a name the helper did not resolve', () => {
+    const result = parseResult(
+      'diagnose',
+      diagnoseResultInput({ target: 'example.com', match: null, addresses: [], dns: null, notes: ['name-not-covered'] }),
+    );
+    expect(result.ok).toBe(true);
+  });
+
+  it('accepts every note, outcome and precedence code once', () => {
+    const result = DiagnoseResult.safeParse(
+      diagnoseResultInput({
+        notes: [...DIAGNOSE_NOTES],
+        addresses: Array.from({ length: LIMITS.maxIpsPerDomain }, (_unused, index) =>
+          diagnoseAddressInput({ address: `10.30.0.${String(index + 1)}`, route: null, matchesExpected: null }),
+        ),
+      }),
+    );
+    expect(result.success).toBe(true);
+    for (const outcome of DIAGNOSE_DNS_OUTCOMES) {
+      const dns = { server: '10.20.0.10', role: 'wifi', resolverFile: null, outcome, ms: outcome === 'not-queried' ? null : 3000 };
+      expect(DiagnoseResult.safeParse(diagnoseResultInput({ dns })).success).toBe(true);
+    }
+    for (const precedence of DIAGNOSE_PRECEDENCE_CODES) {
+      for (const via of DIAGNOSE_MATCH_VIA) {
+        const match = { ruleId: uuid(1), via, precedence };
+        expect(DiagnoseResult.safeParse(diagnoseResultInput({ match })).success).toBe(true);
+      }
+    }
+  });
+
+  it('drops unknown keys of a diagnose result from a newer helper', () => {
+    const result = DiagnoseResult.safeParse({ ...diagnoseResultInput(), hint: 'new' });
+    expect(result.success && result.data).not.toHaveProperty('hint');
   });
 
   it('accepts a test result for a route that belongs to no rule and no role', () => {
@@ -873,6 +1162,35 @@ describe('message sizes', () => {
     })),
     lastApplyAt: AT,
     lastReconcileReason: 'network-change',
+    dnsWarnings: Array.from({ length: PROTOCOL_LIMITS.maxDnsWarnings }, (_unused, index) => ({
+      server: `255.255.255.${String(200 + index)}`,
+      source: 'rule',
+      role: 'ethernet',
+      via: 'wifi',
+      ruleId: uuid(index + 1),
+      code: 'routed-via-other-interface',
+    })),
+  });
+
+  it('fits the largest possible diagnose response in one line', () => {
+    const target = longDomain(1);
+    const result = parseResult('diagnose', {
+      target,
+      targetKind: 'domain',
+      match: { ruleId: uuid(1), via: 'dns-server', precedence: 'deeper-wildcard' },
+      addresses: Array.from({ length: PROTOCOL_LIMITS.maxDiagnoseAddresses }, (_unused, index) => ({
+        address: `255.255.255.${String(100 + index)}`,
+        source: 'rule-cache',
+        route: { device: `bridge${'1'.repeat(4)}`, gateway: '255.255.255.254', role: 'ethernet' },
+        expectedRole: 'wifi',
+        matchesExpected: false,
+      })),
+      dns: { server: '255.255.255.254', role: 'ethernet', resolverFile: `/etc/resolver/${target}`, outcome: 'not-queried', ms: null },
+      notes: [...DIAGNOSE_NOTES],
+    });
+    if (!result.ok) throw new Error(result.error.message);
+    const bytes = new TextEncoder().encode(encodeJsonLine({ id: Number.MAX_SAFE_INTEGER, ok: true, result: result.value })).length;
+    expect(bytes).toBeLessThan(MAX_LINE_BYTES / 100);
   });
 
   it('fits the largest possible setConfig response, the largest message of all, in one line', () => {

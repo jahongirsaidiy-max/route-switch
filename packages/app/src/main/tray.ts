@@ -13,6 +13,7 @@ import type { HelperClient, HelperStatus } from './helperClient';
 import type { Installer } from './installer';
 import { registerIpcHandlers, type ConfigDialogs, type IpcMainLike } from './ipc';
 import type { Logger } from './logger';
+import type { PreferencesStore } from './preferences';
 import type { Settings } from './settings';
 import { createWindowManager, type CreateWindow, type WindowManagerDeps } from './windows';
 
@@ -130,6 +131,8 @@ export interface ShellDeps {
   readonly quit: () => void;
   /** The login item and the network service order, for the settings screen's IPC calls. */
   readonly settings: Settings;
+  /** The app's own preferences (the UI language, `userData/preferences.json`). */
+  readonly preferences: PreferencesStore;
   /** The system file dialogs of config import / export. */
   readonly configDialogs: ConfigDialogs;
   /** Installs / removes the helper as root (`installer.ts`). */
@@ -172,6 +175,7 @@ export function startShell(deps: ShellDeps, context: ShellContext): Shell {
     logger: deps.logger,
     listRecipients: windows.contents,
     settings: deps.settings,
+    preferences: deps.preferences,
     configDialogs: deps.configDialogs,
     installer: deps.installer,
     // "Qoidalarni boshqarish" of the menu bar window: the same window as the tray menu item.

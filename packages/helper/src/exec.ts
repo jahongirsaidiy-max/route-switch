@@ -155,7 +155,18 @@ export interface RunOptions {
    * instead of `warn`. Integers 1..255, at most `MAX_EXPECTED_EXIT_CODES`.
    */
   readonly expectedExitCodes?: readonly number[];
+  /**
+   * Arguments from this index on are private to the user (an address the
+   * user asked about): every log line at `info` and above shows them as
+   * `REDACTED_ARG` and leaves out stdout/stderr, and one `debug` line carries
+   * the real arguments and the output. The command itself runs unchanged.
+   * An integer from 0 to the number of arguments.
+   */
+  readonly redactArgsFrom?: number;
 }
+
+/** What a redacted argument looks like in the log (see `RunOptions.redactArgsFrom`). */
+export const REDACTED_ARG = '<redacted>';
 
 /**
  * The single choke point for system commands. Later helper modules depend on
@@ -217,6 +228,8 @@ interface Limits {
   readonly maxOutputBytes: number;
   /** A private copy: the caller's array is not consulted after validation. */
   readonly expectedExitCodes: readonly number[];
+  /** Null when nothing is redacted. */
+  readonly redactArgsFrom: number | null;
 }
 
 const resolveLimit = (name: string, value: number | undefined, fallback: number, max: number) => {
@@ -260,7 +273,15 @@ const resolveExpectedExitCodes = (value: unknown): readonly number[] => {
   return codes;
 };
 
-const resolveLimits = (options: RunOptions): Limits => ({
+const resolveRedaction = (value: unknown, argCount: number): number | null => {
+  if (value === undefined) return null;
+  if (typeof value !== 'number' || !Number.isInteger(value) || value < 0 || value > argCount) {
+    throw new CommandRejectedError('invalid-options', 'redactArgsFrom must be an integer index into the arguments');
+  }
+  return value;
+};
+
+const resolveLimits = (options: RunOptions, argCount: number): Limits => ({
   timeoutMs: resolveLimit('timeoutMs', options.timeoutMs, DEFAULT_TIMEOUT_MS, MAX_TIMEOUT_MS),
   maxOutputBytes: resolveLimit(
     'maxOutputBytes',
@@ -269,6 +290,7 @@ const resolveLimits = (options: RunOptions): Limits => ({
     MAX_OUTPUT_BYTES,
   ),
   expectedExitCodes: resolveExpectedExitCodes(options.expectedExitCodes),
+  redactArgsFrom: resolveRedaction(options.redactArgsFrom, argCount),
 });
 
 type Outcome = Pick<CommandResult, 'exitCode' | 'signal' | 'failure' | 'error'>;
@@ -334,7 +356,7 @@ export const createCommandRunner = (deps: CommandRunnerDeps): CommandRunner => {
       // mutates its array afterwards.
       const argv: unknown = Array.isArray(args) ? Object.freeze([...(args as unknown[])]) : args;
       assertSafeArgs(argv);
-      return { argv, limits: resolveLimits(options) };
+      return { argv, limits: resolveLimits(options, argv.length) };
     } catch (error) {
       // Logged without echoing the argv: a refused call may carry values that
       // were never validated.
@@ -384,13 +406,25 @@ export const createCommandRunner = (deps: CommandRunnerDeps): CommandRunner => {
       }
     });
 
-  const logResult = (result: CommandResult, expectedExitCodes: readonly number[]): void => {
+  const logResult = (result: CommandResult, limits: Limits): void => {
+    const { expectedExitCodes, redactArgsFrom } = limits;
+    const redacted = redactArgsFrom !== null;
     const context = {
       bin: result.bin,
-      args: result.args,
+      args: redacted ? result.args.map((arg, index) => (index < redactArgsFrom ? arg : REDACTED_ARG)) : result.args,
       exitCode: result.exitCode,
       durationMs: result.durationMs,
     };
+    if (redacted) {
+      // The private arguments and whatever the command said about them: debug only.
+      logger.debug('command arguments', {
+        bin: result.bin,
+        args: result.args,
+        error: result.error,
+        stdout: result.stdout.slice(0, STDERR_LOG_LIMIT),
+        stderr: result.stderr.slice(0, STDERR_LOG_LIMIT),
+      });
+    }
     if (result.failure === null) {
       logger.info('command finished', context);
       return;
@@ -399,8 +433,9 @@ export const createCommandRunner = (deps: CommandRunnerDeps): CommandRunner => {
       ...context,
       failure: result.failure,
       signal: result.signal,
-      error: result.error,
-      stderr: result.stderr.slice(0, STDERR_LOG_LIMIT),
+      // A spawn error's text comes from the system and may echo the command line.
+      error: redacted && result.failure === 'spawn-error' ? 'spawn error (details at debug)' : result.error,
+      ...(redacted ? {} : { stderr: result.stderr.slice(0, STDERR_LOG_LIMIT) }),
     };
     if (result.failure !== 'nonzero-exit') {
       logger.error('command failed', details);
@@ -425,7 +460,7 @@ export const createCommandRunner = (deps: CommandRunnerDeps): CommandRunner => {
         stderr,
         durationMs: Math.max(0, Math.round(now() - startedAt)),
       };
-      logResult(result, limits.expectedExitCodes);
+      logResult(result, limits);
       return result;
     },
   };

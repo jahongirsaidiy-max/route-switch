@@ -7,6 +7,7 @@ import {
   type AdapterInfo,
   type Config,
   type Destination,
+  type DnsWarning,
   type EngineState,
   type IfaceRole,
   type InterfaceState,
@@ -17,9 +18,17 @@ import {
   type RuleStatus,
 } from '@routeswitch/shared';
 
+import {
+  dnsWarningsSignature,
+  findDnsWarnings,
+  serversToLookUp,
+  type DnsWarningInput,
+  type ServerRoute,
+} from './dns-warnings';
 import type { Logger } from './logger';
 import { toWireInterfaces, type DetectedInterfaces, type InterfaceInfo, type NetInfo } from './netinfo';
-import type { RouteAddResult, RouteDeleteResult, RouteOperations } from './route';
+import { isExplicitTarget, planningOrder } from './precedence';
+import type { RouteAddResult, RouteDeleteResult, RouteGetResult, RouteOperations } from './route';
 
 /**
  * The routing engine: computes the routes that should exist (desired) from
@@ -231,7 +240,12 @@ export type StateListener = (state: EngineState) => void;
 
 export interface EngineDeps {
   readonly netinfo: NetInfo;
-  readonly routes: Pick<RouteOperations, 'routeAdd' | 'routeDelete'>;
+  /**
+   * `routeGet` is optional: without it the DNS-server warnings
+   * (`EngineState.dnsWarnings`) are only the ones the engine can tell from its
+   * own facts (connected subnets, applied routes).
+   */
+  readonly routes: Pick<RouteOperations, 'routeAdd' | 'routeDelete'> & Partial<Pick<RouteOperations, 'routeGet'>>;
   readonly logger: Logger;
   /** Version reported in `EngineState.helperVersion`. */
   readonly helperVersion: string;
@@ -387,6 +401,8 @@ export const REFUSAL_RETRY_REASONS: ReadonlySet<ReconcileReason> = new Set<Recon
  */
 /** Route deletes `clear()` runs at the same time; each one's `route get` -> `route delete` stays in order. */
 export const CLEAR_CONCURRENCY = 8;
+/** `route -n get` lookups for the DNS-server warnings that run at the same time. */
+export const DNS_LOOKUP_CONCURRENCY = 4;
 export const FAILURE_BACKOFF_AFTER = 3;
 export const FAILURE_BACKOFF_BASE_MS = 60_000;
 export const FAILURE_BACKOFF_MAX_MS = 15 * 60_000;
@@ -545,6 +561,8 @@ export interface EngineStateInput {
   readonly applied: Iterable<AppliedRoute>;
   readonly lastApplyAt: string | null;
   readonly lastReconcileReason: ReconcileReason | null;
+  /** Reported only when there is one (the field is optional on the wire: absent = none). */
+  readonly dnsWarnings?: readonly DnsWarning[] | undefined;
 }
 
 /** Pure: the wire state for a set of engine data. One `rules` entry per config rule, in config order. */
@@ -585,6 +603,9 @@ export const buildEngineState = (input: EngineStateInput): EngineState => {
     rules,
     lastApplyAt: input.lastApplyAt,
     lastReconcileReason: input.lastReconcileReason,
+    ...(input.dnsWarnings === undefined || input.dnsWarnings.length === 0
+      ? {}
+      : { dnsWarnings: input.dnsWarnings.map((warning) => ({ ...warning })) }),
   };
 };
 
@@ -708,6 +729,20 @@ export const createEngine = (deps: EngineDeps): Engine => {
   let lastDeferred = 0;
   /** `applied` changed outside a pass (`forgetApplied`): the next pass reports it to `onApplied`. */
   let appliedDirty = false;
+  /**
+   * DNS servers reached through the other role (`dns-warnings.ts`). Worked out
+   * again by every pass with a trusted detection; an untrusted one keeps them.
+   */
+  let dnsWarnings: readonly DnsWarning[] = [];
+  /** `dnsWarningsSignature` of what was logged last, so a standing warning is said once. */
+  let reportedDnsWarnings = '';
+  /**
+   * `route -n get` answers for the DNS-server warnings, valid while the
+   * interface facts stay the same; only servers that still need one are kept.
+   */
+  let dnsLookups: { facts: string; results: Map<string, ServerRoute> } | null = null;
+  /** A network change (or a forced pass) was asked for since the last lookups: run them again. */
+  let dnsLookupsStale = false;
 
   const appliedSnapshot = (): AppliedRoute[] =>
     [...applied.values()].map(({ dst, gateway, ruleIds }) => ({ dst, gateway, ruleIds: [...ruleIds] }));
@@ -917,10 +952,7 @@ export const createEngine = (deps: EngineDeps): Engine => {
     // destination the user named in an `ip` / `subnet` rule belongs to that
     // rule, and an address a domain happens to resolve to never takes it over.
     // Among themselves, rules keep the config order (the first one wins).
-    const planned = [
-      ...snapshot.rules.filter((rule) => rule.kind !== 'domain'),
-      ...snapshot.rules.filter((rule) => rule.kind === 'domain'),
-    ];
+    const planned = planningOrder(snapshot.rules);
     for (const rule of planned) {
       const disabled = disabledVerdict(snapshot, rule);
       if (disabled !== null) {
@@ -999,7 +1031,7 @@ export const createEngine = (deps: EngineDeps): Engine => {
         }
         const key = routeKey(destination);
         const existing = desired.get(key);
-        const explicit = rule.kind !== 'domain' || target === serverTarget;
+        const explicit = isExplicitTarget(rule, target);
         const isAnswer = rule.kind === 'domain' && target !== serverTarget;
         if (existing === undefined) {
           desired.set(key, { key, dst, gateway, role: rule.iface, explicit, ruleIds: [rule.id] });
@@ -1445,6 +1477,73 @@ export const createEngine = (deps: EngineDeps): Engine => {
     excludedDns = nextExcluded;
   };
 
+  const safeRouteGet = async (server: string): Promise<ServerRoute> => {
+    const routeGet = routes.routeGet;
+    if (routeGet === undefined) return null;
+    let result: RouteGetResult;
+    try {
+      result = await routeGet(server);
+    } catch (error) {
+      logger.error('route lookup for a DNS server threw', { dst: server, error: describeThrown(error) });
+      return null;
+    }
+    if (result.ok) return { device: result.route.iface };
+    logger.debug('route lookup for a DNS server gave no route', { dst: server, outcome: result.outcome });
+    return null;
+  };
+
+  /**
+   * Works out `dnsWarnings` from a trusted detection, the routes applied now
+   * and the config. `route -n get` runs only for servers none of that decides,
+   * and again only when the interface facts change, the server needs it for
+   * the first time, or a network change (or forced pass) was asked for. Never
+   * changes a route or a rule. Said at `warn` when the warnings change, then
+   * at `debug`.
+   */
+  const updateDnsWarnings = async (detected: DetectedInterfaces, snapshot: Config, reason: ReconcileReason): Promise<void> => {
+    const input: DnsWarningInput = {
+      interfaces: { ethernet: detected.ethernet, wifi: detected.wifi },
+      dnsServers: trustedDns,
+      rules: snapshot.enabled ? snapshot.rules : [],
+      applied: [...applied.values()],
+    };
+    const facts = JSON.stringify(
+      ROLES.map((role) => {
+        const { device, up, routable, ip, gateway, subnet } = detected[role];
+        return [device, up, routable, ip, gateway, subnet];
+      }),
+    );
+    if (dnsLookups === null || dnsLookups.facts !== facts || dnsLookupsStale) dnsLookups = { facts, results: new Map() };
+    dnsLookupsStale = false;
+    const { results } = dnsLookups;
+    const wanted = serversToLookUp(input);
+    for (const server of results.keys()) if (!wanted.includes(server)) results.delete(server);
+    if (routes.routeGet !== undefined) {
+      const missing = wanted.filter((server) => !results.has(server));
+      let next = 0;
+      const worker = async (): Promise<void> => {
+        for (let index = next; index < missing.length; index = next) {
+          next += 1;
+          const server = missing[index];
+          if (server !== undefined) results.set(server, await safeRouteGet(server));
+        }
+      };
+      await Promise.all(Array.from({ length: Math.min(DNS_LOOKUP_CONCURRENCY, missing.length) }, worker));
+    }
+    dnsWarnings = findDnsWarnings({ ...input, routeOf: (server) => results.get(server) });
+
+    const signature = dnsWarningsSignature(dnsWarnings);
+    if (dnsWarnings.length > 0) {
+      logger.log(signature === reportedDnsWarnings ? 'debug' : 'warn', 'a DNS server is reached through the other interface; add an `ip` rule for it', {
+        reason,
+        warnings: dnsWarnings.map((warning) => ({ ...warning })),
+      });
+    } else if (reportedDnsWarnings !== '') {
+      logger.info('DNS servers are reached through their own interfaces again', { reason });
+    }
+    reportedDnsWarnings = signature;
+  };
+
   /** Classifies the detection and keeps the streak counters. */
   const classify = (detected: DetectedInterfaces | null, reason: ReconcileReason): { mode: PassMode; retry: number | null } => {
     if (detected === null) {
@@ -1523,6 +1622,7 @@ export const createEngine = (deps: EngineDeps): Engine => {
       await notifyApplied();
     }
     if (retry !== null) requestRetry(reason, retry);
+    if (mode === 'normal' && detected !== null) await updateDnsWarnings(detected, snapshot, reason);
 
     const finishedAt = now();
     seq += 1;
@@ -1544,6 +1644,7 @@ export const createEngine = (deps: EngineDeps): Engine => {
       applied: appliedSnapshot(),
       lastApplyAt: finishedAt.toISOString(),
       lastReconcileReason: reason,
+      dnsWarnings,
     });
 
     const summary: ReconcileSummary = {
@@ -1594,6 +1695,7 @@ export const createEngine = (deps: EngineDeps): Engine => {
         applied: appliedSnapshot(),
         lastApplyAt: now().toISOString(),
         lastReconcileReason: reason,
+        dnsWarnings,
       });
       publish(next);
       return { state: next, retryRequested: false, summary: { added: 0, removed: 0, failed: 0, kept: applied.size, deferred: 0 } };
@@ -1678,6 +1780,8 @@ export const createEngine = (deps: EngineDeps): Engine => {
     }
     const force = options?.force === true;
     const retryRefused = options?.retryRefused === true;
+    // Noted at the call, not in the pass: a merged follow-up keeps only the latest reason.
+    if (reason === 'network-change' || force) dnsLookupsStale = true;
     if (!running) {
       const request = newPending(reason, force, retryRefused);
       start(request);
@@ -1833,6 +1937,7 @@ export const createEngine = (deps: EngineDeps): Engine => {
         applied: appliedSnapshot(),
         lastApplyAt: finishedAt.toISOString(),
         lastReconcileReason: state.lastReconcileReason,
+        dnsWarnings,
       }),
     );
     logger.info('applied routes cleared', { ...counts, left: applied.size, durationMs: Math.max(0, finishedAt.getTime() - startedAt) });

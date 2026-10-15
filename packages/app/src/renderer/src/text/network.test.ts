@@ -1,6 +1,7 @@
 import type { EngineState } from '@routeswitch/shared';
 import { describe, expect, it } from 'vitest';
 
+import { i18nFor } from '../../../i18n';
 import { CONFIG, ID, NOW, STATE, ruleState } from '../screens/MenuBar/fixtures';
 import { LAST_KNOWN_SHOWN, lastKnownShort, lastKnownText, networkWarnings, sameSubnetGateway } from './network';
 
@@ -115,5 +116,33 @@ describe('lastKnownText / lastKnownShort — a domain rule in error', () => {
     expect(lastKnownText(domain, ruleState(domain.id, { appliedDestinations: ['1.1.1.1'] }), NOW)).toBeNull();
     expect(lastKnownText({ kind: 'subnet' }, ruleState(ID.subnet, { status: 'error', reasonCode: 'route-failed' }), NOW)).toBeNull();
     expect(lastKnownShort({ kind: 'ip' }, ruleState(ID.host, { status: 'error', reasonCode: 'route-failed', appliedDestinations: ['1.1.1.1'] }))).toBeNull();
+  });
+});
+
+describe('network texts in Russian and English (TASK-DELTA-11)', () => {
+  it('waiting rules, with the Russian plural forms', () => {
+    const ru = i18nFor('ru');
+    expect(networkWarnings(withEthernet(down, [ID.subnet, ID.host]), CONFIG, ru)).toEqual([
+      { id: 'waiting-ethernet', title: 'Ethernet не подключён', text: '2 правила ждут — применятся автоматически, когда интерфейс подключится.' },
+    ]);
+    expect(networkWarnings(withEthernet(down, [ID.subnet]), CONFIG, ru)[0]?.text.startsWith('1 правило ждёт')).toBe(true);
+    const missing = networkWarnings(withEthernet({ device: null, ip: null, gateway: null, up: false }, [ID.subnet]), CONFIG, i18nFor('en'));
+    expect(missing[0]).toMatchObject({ title: 'Ethernet adapter not found' });
+    expect(missing[0]?.text.startsWith('1 rule is waiting — it applies')).toBe(true);
+    const noGateway = networkWarnings(withEthernet({ device: 'en5', ip: '10.20.4.37', gateway: null, up: true }, [ID.subnet], 'no-gateway'), CONFIG, ru);
+    expect(noGateway[0]?.title).toBe('У Ethernet нет шлюза');
+  });
+
+  it('last known addresses with the time in the language', () => {
+    const domain = CONFIG.rules[4];
+    if (domain === undefined) throw new Error('fixture');
+    const state = ruleState(domain.id, {
+      status: 'error',
+      reasonCode: 'resolve-failed',
+      appliedDestinations: ['140.82.112.3'],
+      lastResolvedAt: new Date(NOW - 12 * MINUTE).toISOString(),
+    });
+    expect(lastKnownText(domain, state, NOW, LAST_KNOWN_SHOWN, i18nFor('ru'))).toBe('Последние известные IP (ещё направляются): 140.82.112.3 · 12 минут назад');
+    expect(lastKnownText(domain, state, NOW, LAST_KNOWN_SHOWN, i18nFor('en'))).toBe('Last known IPs (still routed): 140.82.112.3 · 12 min ago');
   });
 });

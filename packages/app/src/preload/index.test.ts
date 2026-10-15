@@ -52,6 +52,8 @@ const INVOKES = [
   ['resetConfig', [], 'rs:resetConfig'],
   ['installHelper', [], 'rs:installHelper'],
   ['removeHelper', [], 'rs:removeHelper'],
+  ['getLanguage', [], 'rs:getLanguage'],
+  ['setLanguage', ['ru'], 'rs:setLanguage'],
 ] as const;
 
 describe('preload', () => {
@@ -59,9 +61,10 @@ describe('preload', () => {
     expect([...electron.exposed.keys()]).toEqual(['rs']);
   });
 
-  it('every method but the two subscriptions is in INVOKES (a new method cannot go untested)', () => {
+  it('every method but the three subscriptions is in INVOKES (a new method cannot go untested)', () => {
     const invokes = INVOKES.map(([method]) => method as string);
-    expect(Object.keys(rs).filter((key) => key !== 'onState' && key !== 'onLog').sort()).toEqual([...invokes].sort());
+    const subscriptions = ['onState', 'onLog', 'onLanguage'];
+    expect(Object.keys(rs).filter((key) => !subscriptions.includes(key)).sort()).toEqual([...invokes].sort());
   });
 
   it.each(INVOKES)('%s is a bare invoke on %s with the arguments unchanged', async (method, args, channel) => {
@@ -116,5 +119,19 @@ describe('preload', () => {
 
     unsubscribe();
     expect(electron.removeListener).toHaveBeenCalledWith('rs:log', forward);
+  });
+
+  it('onLanguage delivers the language without the event object, and the returned function unsubscribes', () => {
+    const received: unknown[][] = [];
+    const unsubscribe = rs.onLanguage((...args: unknown[]) => {
+      received.push(args);
+    });
+    const [channel, forward] = electron.on.mock.lastCall ?? [];
+    expect(channel).toBe('rs:language');
+    forward?.({ sender: 'ipc-renderer-event' }, 'en');
+    expect(received).toEqual([['en']]);
+
+    unsubscribe();
+    expect(electron.removeListener).toHaveBeenCalledWith('rs:language', forward);
   });
 });

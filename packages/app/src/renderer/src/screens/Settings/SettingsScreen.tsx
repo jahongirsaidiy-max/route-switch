@@ -1,4 +1,4 @@
-// "Sozlamalar": login item, Ethernet adapter override, Wi‑Fi as the default
+// "Sozlamalar": the UI language (TASK-DELTA-11), login item, Ethernet adapter override, Wi‑Fi as the default
 // channel (a command shown for the user to run — the app never runs it,
 // decision GAP-04) and removing the helper. The design has no settings screen
 // (GAP-01): it follows the rules window — page header, bordered cards.
@@ -6,8 +6,10 @@
 import type { Config } from '@routeswitch/shared';
 import { useCallback, useEffect, useRef, useState, type ReactElement, type Ref } from 'react';
 
+import { LANGUAGE_NAMES, LANGUAGE_PICKER_TITLE, LOCALES, isLocale, type I18n, type Locale } from '../../../../i18n';
 import { Button, ROLE_LABELS, StatusDot, Toggle } from '../../components';
 import { useEngineState, type EngineStateView } from '../../hooks/useEngineState';
+import { useI18n } from '../../hooks/useI18n';
 import { browserShowSignal, readOnShow, type ShowSignal, type ShownReader } from '../../hooks/windowShown';
 import type { RsApi, RsServiceOrder } from '../../rs';
 import {
@@ -22,7 +24,7 @@ import {
 import { errorText, HELPER_STATUS_TEXT } from '../../text';
 import styles from './SettingsScreen.module.css';
 
-export type SettingsSection = 'login' | 'ethernet' | 'wifi' | 'helper';
+export type SettingsSection = 'language' | 'login' | 'ethernet' | 'wifi' | 'helper';
 
 export interface ServiceOrderView {
   readonly phase: 'loading' | 'ready' | 'failed';
@@ -32,6 +34,11 @@ export interface ServiceOrderView {
 
 export interface SettingsPanelProps {
   readonly engine: EngineStateView;
+  /** The UI language in force (`useI18n().locale`). */
+  readonly language: Locale;
+  /** The language card's hint, in the language in force (`t.settingsLanguage.hint`). */
+  readonly languageHint: string;
+  readonly onSelectLanguage: (language: Locale) => void;
   /** Null while it is being read or when it could not be read. */
   readonly openAtLogin: boolean | null;
   /** The stored overrides; undefined when the config has not been read (no helper). */
@@ -92,6 +99,35 @@ export function SettingsPanel(props: SettingsPanelProps): ReactElement {
       </header>
 
       <div className={styles['sections']}>
+        <section className={styles['card']} aria-labelledby="settings-language">
+          {/* The title reads the same in every language, and each option is in its own: findable whatever language is on. */}
+          <h2 id="settings-language" className={styles['cardTitle']}>
+            {LANGUAGE_PICKER_TITLE}
+          </h2>
+          <p className={styles['hint']}>{props.languageHint}</p>
+          <div className={styles['field']}>
+            <select
+              name="language"
+              aria-labelledby="settings-language"
+              className={`${styles['select'] ?? ''} ${styles['selectText'] ?? ''}`}
+              value={props.language}
+              aria-disabled={busy.has('language') ? true : undefined}
+              aria-busy={busy.has('language') || undefined}
+              onChange={(event) => {
+                if (busy.has('language') || !isLocale(event.target.value)) return;
+                props.onSelectLanguage(event.target.value);
+              }}
+            >
+              {LOCALES.map((locale) => (
+                <option key={locale} value={locale} lang={locale}>
+                  {LANGUAGE_NAMES[locale]}
+                </option>
+              ))}
+            </select>
+          </div>
+          <FeedbackLine feedback={feedback.language} />
+        </section>
+
         <section className={styles['card']} aria-labelledby="settings-login">
           <div className={styles['row']}>
             <div className={styles['text']}>
@@ -250,12 +286,23 @@ export function SettingsPanel(props: SettingsPanelProps): ReactElement {
 
 export interface SettingsScreenProps {
   /** The preload API; `window.rs` in the app. */
-  readonly rs?: SettingsApi & Pick<RsApi, 'getState' | 'onState'>;
+  readonly rs?: SettingsApi & Pick<RsApi, 'getState' | 'onState' | 'setLanguage'>;
+}
+
+/**
+ * Sets the UI language. Every window then switches through `onLanguage`, this
+ * one included, so a success needs no words; a refusal does, in the language
+ * still in force.
+ */
+export async function chooseLanguage(rs: Pick<RsApi, 'setLanguage'>, language: Locale, i18n: I18n): Promise<Feedback | null> {
+  const result = await rs.setLanguage(language);
+  return result.ok ? null : { tone: 'danger', text: errorText(result.code, i18n) };
 }
 
 /** The settings screen of the rules window. */
 export function SettingsScreen({ rs: given }: SettingsScreenProps): ReactElement {
   const rs = given ?? window.rs;
+  const i18n = useI18n();
   const engine = useEngineState(rs);
   const [openAtLogin, setOpenAtLoginValue] = useState<boolean | null>(null);
   const [overrides, setOverrides] = useState<Config['ifaceOverrides'] | null | undefined>(undefined);
@@ -331,6 +378,20 @@ export function SettingsScreen({ rs: given }: SettingsScreenProps): ReactElement
   return (
     <SettingsPanel
       engine={engine}
+      language={i18n.locale}
+      languageHint={i18n.t.settingsLanguage.hint}
+      onSelectLanguage={(language) => {
+        mark('language', true);
+        void chooseLanguage(rs, language, i18n).then((line) => {
+          setFeedback((current) => {
+            const next = { ...current };
+            if (line === null) delete next.language;
+            else next.language = line;
+            return next;
+          });
+          mark('language', false);
+        });
+      }}
       openAtLogin={openAtLogin}
       overrides={overrides}
       serviceOrder={serviceOrder}

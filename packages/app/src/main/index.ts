@@ -16,6 +16,7 @@ import { createDevelopmentRuntime } from './development';
 import { createHelperClient } from './helperClient';
 import { createInstaller, HELPER_RESOURCES_DIR, runWithExecFile } from './installer';
 import { createJsonLinesSink, createLogger } from './logger';
+import { createPreferences } from './preferences';
 import { createSettings, listServiceOrderWithNetworksetup } from './settings';
 import { loadTrayImage, startShell } from './tray';
 
@@ -66,6 +67,12 @@ startApp({
         quit: () => {
           app.quit();
         },
+        // Per user, in the app's own data directory; read on the first `getLanguage`.
+        preferences: createPreferences({
+          dir: app.getPath('userData'),
+          preferredLanguages: () => app.getPreferredSystemLanguages(),
+          logger,
+        }),
         settings: createSettings({
           loginItem: {
             get: () => app.getLoginItemSettings().openAtLogin,

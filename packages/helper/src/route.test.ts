@@ -1555,6 +1555,32 @@ describe('routeGet', () => {
     });
   });
 
+  it('a private lookup: same command and result, the target at debug only, redacted from the command log', async () => {
+    const { runner, ops, entries } = setup();
+    runner.when(ROUTE, GET('172.16.12.40'), { stdout: GET_VIA_GATEWAY });
+    const result = await ops.routeGet('172.16.12.40', { private: true });
+    expect(result).toMatchObject({ ok: true, outcome: 'found', route: { target: '172.16.12.40', iface: 'en5' } });
+    expect(argvOf(runner)).toEqual([GET('172.16.12.40')]);
+    expect(runner.calls[0]?.options).toEqual({ redactArgsFrom: 3 });
+    expect(entries.filter((entry) => entry.level !== 'debug')).toMatchObject([
+      { level: 'info', msg: 'route looked up', context: { op: 'get', gateway: '10.20.4.1', iface: 'en5', outcome: 'found' } },
+    ]);
+    expect(JSON.stringify(entries.filter((entry) => entry.level !== 'debug'))).not.toContain('172.16.12.40');
+    expect(JSON.stringify(entries.filter((entry) => entry.level === 'debug'))).toContain('172.16.12.40');
+  });
+
+  it('a private lookup that finds nothing, fails or is refused names no target above debug', async () => {
+    const { runner, ops, entries } = setup();
+    runner.when(ROUTE, GET('172.16.12.41'), { exitCode: 0, stderr: 'route: writing to routing socket: not in table\n' });
+    runner.when(ROUTE, GET('172.16.12.42'), { stdout: 'garbage about 172.16.12.42' });
+    expect(await ops.routeGet('172.16.12.41', { private: true })).toMatchObject({ outcome: 'not-found' });
+    expect(await ops.routeGet('172.16.12.42', { private: true })).toMatchObject({ outcome: 'failed' });
+    expect(await ops.routeGet('172.16.12.4x', { private: true })).toMatchObject({ outcome: 'rejected' });
+    const loud = entries.filter((entry) => entry.level !== 'debug');
+    expect(loud.map((entry) => entry.msg)).toEqual(['no route to target', 'route command failed', 'route request rejected']);
+    expect(JSON.stringify(loud)).not.toMatch(/172\.16\.12\.4/);
+  });
+
   it('parses a lookup that falls through to the default route', async () => {
     const { runner, ops } = setup();
     runner.when(ROUTE, GET('1.1.1.1'), { stdout: GET_VIA_DEFAULT });

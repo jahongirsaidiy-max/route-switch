@@ -10,6 +10,8 @@ import { createFakeScheduler, flush } from './dns-test-utils';
 import type { AppliedRoute, ReconcileOutcome } from './engine';
 import { createLogger, createMemorySink, type LogEntry } from './logger';
 import type { RouteGetResult } from './route';
+import { DIAGNOSE_LIMITS } from './diagnose';
+import type { CachedDomain, ProbeResult } from './dns';
 import {
   MAX_CONCURRENT_TESTS,
   PEER_LOG_BUDGET,
@@ -20,6 +22,7 @@ import {
   createSocketServer,
   type HandlerOutcome,
   type RequestDispatcher,
+  type RequestOrigin,
   type RequestHandlerDeps,
   type ServerLimits,
   type SocketFs,
@@ -83,6 +86,24 @@ const startServer = async (
 };
 
 describe('socket server: transport', () => {
+  it('tells the handler which connection a request came from', async () => {
+    const origins: (number | undefined)[] = [];
+    const dispatch: RequestDispatcher = (request, origin) => {
+      origins.push(origin?.connection);
+      return okDispatch(request);
+    };
+    const { connect } = await startServer({ dispatch });
+    const first = await connect();
+    const second = await connect();
+    await first.request({ id: 1, method: 'status' });
+    await second.request({ id: 1, method: 'status' });
+    await first.request({ id: 2, method: 'status' });
+    expect(origins).toHaveLength(3);
+    expect(origins[0]).toBe(origins[2]);
+    expect(origins[0]).not.toBe(origins[1]);
+    expect(origins.every((connection) => typeof connection === 'number')).toBe(true);
+  });
+
   it('creates the socket with mode 0660 under a name of its own, then renames it into place', async () => {
     const calls: string[] = [];
     const fs: SocketFs = {
@@ -558,6 +579,12 @@ const handlerHarness = (overrides: Partial<RequestHandlerDeps> = {}) => {
     afterUninstall: () => {
       events.push('afterUninstall');
     },
+    peekDomain: () => null,
+    probeDns: () => {
+      events.push('probeDns');
+      return Promise.resolve({ outcome: 'ok', ms: 1, addresses: [], truncated: false });
+    },
+    monotonicNow: () => scheduler.now().getTime(),
     setTimer: scheduler.setTimer,
     clearTimer: scheduler.clearTimer,
     ...overrides,
@@ -565,13 +592,13 @@ const handlerHarness = (overrides: Partial<RequestHandlerDeps> = {}) => {
   return { ...fake, handler, scheduler, saved, events };
 };
 
-const send = (dispatch: RequestDispatcher, request: Request) => dispatch(request);
+const send = (dispatch: RequestDispatcher, request: Request, origin: RequestOrigin = { connection: 1 }) => dispatch(request, origin);
 
 describe('request handler', () => {
   it('status: protocol and helper version with the current state', async () => {
     const h = handlerHarness();
     const { response } = await send(h.handler.dispatch, { id: 1, method: 'status' });
-    expect(response).toMatchObject({ id: 1, ok: true, result: { protocolVersion: 2, helperVersion: '0.0.0', state: { seq: 0 } } });
+    expect(response).toMatchObject({ id: 1, ok: true, result: { protocolVersion: 3, helperVersion: '0.0.0', state: { seq: 0 } } });
   });
 
   it('getConfig: the config together with its own revision', async () => {
@@ -762,6 +789,231 @@ describe('request handler', () => {
     }
     await Promise.all(all);
     expect(most).toBe(MAX_CONCURRENT_TESTS);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// diagnose
+// ---------------------------------------------------------------------------
+
+const ROUTE_INFO = { target: '198.51.100.9', destination: '198.51.100.0', mask: '255.255.255.0', gateway: '10.20.4.1', iface: 'en5', flags: ['UP'] };
+const ROUTE_FOUND: RouteGetResult = { ok: true, outcome: 'found', route: ROUTE_INFO };
+
+/**
+ * A `routeGet` whose answers are released by hand, counting the lookups running at once.
+ * After `releaseAll` it answers at once.
+ */
+const heldRouteGet = () => {
+  const releases: (() => void)[] = [];
+  const counts = { calls: 0, running: 0, most: 0 };
+  let open = false;
+  const routeGet = async (): Promise<RouteGetResult> => {
+    counts.calls += 1;
+    counts.running += 1;
+    counts.most = Math.max(counts.most, counts.running);
+    if (!open) await new Promise<void>((resolve) => releases.push(resolve));
+    counts.running -= 1;
+    return ROUTE_FOUND;
+  };
+  const releaseAll = async (): Promise<void> => {
+    open = true;
+    for (let round = 0; round < 64 && (releases.length > 0 || counts.running > 0); round += 1) {
+      for (const release of releases.splice(0)) release();
+      await flush();
+    }
+  };
+  return { routeGet, releases, counts, releaseAll };
+};
+
+const diagnoseRequest = (id: number, target = '198.51.100.9'): Request => ({ id, method: 'diagnose', target });
+
+describe('request handler: diagnose', () => {
+  it('explains an address: the matching rule, the route the kernel picks, nothing changed', async () => {
+    const h = handlerHarness();
+    const { response } = await send(h.handler.dispatch, diagnoseRequest(1));
+    expect(response).toEqual({
+      id: 1,
+      ok: true,
+      result: {
+        target: '198.51.100.9',
+        targetKind: 'ip',
+        match: { ruleId: ID_A, via: 'subnet', precedence: 'only-match' },
+        addresses: [
+          {
+            address: '198.51.100.9',
+            source: 'query',
+            route: { device: 'en5', gateway: '10.20.4.1', role: 'ethernet' },
+            expectedRole: 'ethernet',
+            matchesExpected: true,
+          },
+        ],
+        dns: null,
+        notes: [],
+      },
+    });
+    expect(h.passes).toEqual([]);
+    expect(h.saved).toEqual([]);
+    expect(h.events).toEqual([]);
+  });
+
+  it('never resolves a name no enabled domain rule covers: no query, no lookup', async () => {
+    let lookups = 0;
+    const h = handlerHarness({
+      routeGet: () => {
+        lookups += 1;
+        return Promise.resolve(ROUTE_FOUND);
+      },
+    });
+    const { response } = await send(h.handler.dispatch, diagnoseRequest(1, 'example.com'));
+    expect(response).toMatchObject({ ok: true, result: { target: 'example.com', match: null, addresses: [], dns: null, notes: ['name-not-covered'] } });
+    expect(lookups).toBe(0);
+    expect(h.events).not.toContain('probeDns');
+  });
+
+  it('resolves a covered name with the one probe query when nothing is cached', async () => {
+    const ID_D = '00000000-0000-4000-8000-00000000000d';
+    const probes: string[] = [];
+    const h = handlerHarness({
+      probeDns: (server, name) => {
+        probes.push(`${server} ${name}`);
+        return Promise.resolve({ outcome: 'ok', ms: 7, addresses: ['198.51.100.20'], truncated: false });
+      },
+    });
+    h.engine.setConfig(Config.parse({ version: 1, rules: [...CONFIG.rules, { id: ID_D, kind: 'domain', target: 'corp.local', iface: 'ethernet', dns: '10.20.0.10' }] }));
+    const { response } = await send(h.handler.dispatch, diagnoseRequest(1, 'corp.local'));
+    expect(probes).toEqual(['10.20.0.10 corp.local']);
+    expect(response).toMatchObject({
+      ok: true,
+      result: {
+        match: { ruleId: ID_D, via: 'domain', precedence: 'only-match' },
+        // The address is inside the ethernet subnet rule, which owns it while the domain has not routed it.
+        addresses: [{ address: '198.51.100.20', source: 'query', expectedRole: 'ethernet', matchesExpected: true }],
+        dns: { server: '10.20.0.10', role: 'ethernet', resolverFile: '/etc/resolver/corp.local', outcome: 'ok', ms: 7 },
+      },
+    });
+  });
+
+  it(`refuses a second diagnosis on the same connection while one runs (${String(DIAGNOSE_LIMITS.perConnectionParallel)} at a time)`, async () => {
+    const held = heldRouteGet();
+    const h = handlerHarness({ routeGet: held.routeGet });
+    const first = send(h.handler.dispatch, diagnoseRequest(1), { connection: 1 });
+    await flush();
+    const second = await send(h.handler.dispatch, diagnoseRequest(2), { connection: 1 });
+    expect(second.response).toEqual({ id: 2, ok: false, code: 'operation-failed', error: 'A diagnosis is already running on this connection' });
+    await held.releaseAll();
+    expect((await first).response).toMatchObject({ ok: true });
+    expect((await send(h.handler.dispatch, diagnoseRequest(3), { connection: 1 })).response).toMatchObject({ ok: true });
+  });
+
+  it(`runs at most ${String(DIAGNOSE_LIMITS.totalParallel)} diagnoses at once over all connections`, async () => {
+    const held = heldRouteGet();
+    const h = handlerHarness({ routeGet: held.routeGet });
+    const running = [send(h.handler.dispatch, diagnoseRequest(1), { connection: 1 }), send(h.handler.dispatch, diagnoseRequest(2), { connection: 2 })];
+    await flush();
+    const third = await send(h.handler.dispatch, diagnoseRequest(3), { connection: 3 });
+    expect(third.response).toEqual({ id: 3, ok: false, code: 'operation-failed', error: 'Too many diagnoses are running; try again shortly' });
+    await held.releaseAll();
+    for (const outcome of await Promise.all(running)) expect(outcome.response).toMatchObject({ ok: true });
+  });
+
+  it(`allows ${String(DIAGNOSE_LIMITS.perConnectionPerWindow)} diagnoses per minute and connection`, async () => {
+    const h = handlerHarness();
+    for (let id = 1; id <= DIAGNOSE_LIMITS.perConnectionPerWindow; id += 1) {
+      expect((await send(h.handler.dispatch, diagnoseRequest(id), { connection: 1 })).response).toMatchObject({ ok: true });
+    }
+    const refused = await send(h.handler.dispatch, diagnoseRequest(99), { connection: 1 });
+    expect(refused.response).toEqual({ id: 99, ok: false, code: 'operation-failed', error: 'Too many diagnoses on this connection; try again in a minute' });
+    // Another connection has its own budget.
+    expect((await send(h.handler.dispatch, diagnoseRequest(100), { connection: 2 })).response).toMatchObject({ ok: true });
+    h.scheduler.advance(DIAGNOSE_LIMITS.windowMs);
+    expect((await send(h.handler.dispatch, diagnoseRequest(101), { connection: 1 })).response).toMatchObject({ ok: true });
+  });
+
+  it('a request without an origin shares one budget instead of escaping the limits', async () => {
+    const held = heldRouteGet();
+    const h = handlerHarness({ routeGet: held.routeGet });
+    const first = h.handler.dispatch(diagnoseRequest(1));
+    await flush();
+    expect((await h.handler.dispatch(diagnoseRequest(2))).response).toMatchObject({ ok: false, code: 'operation-failed' });
+    await held.releaseAll();
+    expect((await first).response).toMatchObject({ ok: true });
+  });
+
+  it(`answers operation-failed after ${String(DIAGNOSE_LIMITS.deadlineMs)} ms and keeps the slot until the work is over`, async () => {
+    const held = heldRouteGet();
+    const h = handlerHarness({ routeGet: held.routeGet });
+    const first = send(h.handler.dispatch, diagnoseRequest(1), { connection: 1 });
+    await flush();
+    h.scheduler.advance(DIAGNOSE_LIMITS.deadlineMs - 1);
+    await flush();
+    let settled = false;
+    void first.then(() => {
+      settled = true;
+    });
+    await flush();
+    expect(settled).toBe(false);
+    h.scheduler.advance(1);
+    expect((await first).response).toEqual({ id: 1, ok: false, code: 'operation-failed', error: 'The diagnosis did not finish in time or failed' });
+    // The lookup still runs: the connection's one slot is still taken.
+    expect((await send(h.handler.dispatch, diagnoseRequest(2), { connection: 1 })).response).toMatchObject({
+      ok: false,
+      error: 'A diagnosis is already running on this connection',
+    });
+    await held.releaseAll();
+    expect((await send(h.handler.dispatch, diagnoseRequest(3), { connection: 1 })).response).toMatchObject({ ok: true });
+  });
+
+  it(`shares the ${String(MAX_CONCURRENT_TESTS)} route lookups with test`, async () => {
+    const ID_D = '00000000-0000-4000-8000-00000000000d';
+    const held = heldRouteGet();
+    const cached: CachedDomain = {
+      addresses: Array.from({ length: 8 }, (_, index) => `198.51.100.${String(index + 1)}`),
+      truncated: false,
+      servers: ['10.20.0.10'],
+      source: 'rule',
+    };
+    const h = handlerHarness({ routeGet: held.routeGet, peekDomain: (ruleId) => (ruleId === ID_D ? cached : null) });
+    h.engine.setConfig(Config.parse({ version: 1, rules: [...CONFIG.rules, { id: ID_D, kind: 'domain', target: 'corp.local', iface: 'ethernet', dns: '10.20.0.10' }] }));
+    const all = [
+      send(h.handler.dispatch, diagnoseRequest(1, 'corp.local'), { connection: 1 }),
+      send(h.handler.dispatch, { id: 2, method: 'test', target: '198.51.100.9' }, { connection: 2 }),
+      send(h.handler.dispatch, { id: 3, method: 'test', target: '198.51.100.9' }, { connection: 2 }),
+    ];
+    for (let round = 0; round < 20; round += 1) {
+      await flush();
+      held.releases.shift()?.();
+    }
+    await held.releaseAll();
+    await Promise.all(all);
+    expect(held.counts.calls).toBe(10);
+    expect(held.counts.most).toBe(MAX_CONCURRENT_TESTS);
+  });
+
+  it('does not send a result that does not fit the protocol', async () => {
+    const h = handlerHarness({
+      routeGet: () =>
+        Promise.resolve({ ok: true, outcome: 'found', route: { ...ROUTE_INFO, iface: 'en0; rm' } }),
+    });
+    const { response } = await send(h.handler.dispatch, diagnoseRequest(1));
+    expect(response).toEqual({ id: 1, ok: false, code: 'operation-failed', error: 'The diagnosis gave an answer that cannot be reported' });
+  });
+
+  it('is refused after uninstall like every other request', async () => {
+    const h = handlerHarness();
+    await send(h.handler.dispatch, { id: 1, method: 'uninstall' });
+    expect((await send(h.handler.dispatch, diagnoseRequest(2))).response).toMatchObject({ ok: false, code: 'operation-failed' });
+  });
+
+  it('a probe that fails makes a covered name resolve-failed, not a failed request', async () => {
+    const ID_D = '00000000-0000-4000-8000-00000000000d';
+    const probe: ProbeResult = { outcome: 'timeout', ms: 3000, addresses: [], truncated: false };
+    const h = handlerHarness({ probeDns: () => Promise.resolve(probe) });
+    h.engine.setConfig(Config.parse({ version: 1, rules: [{ id: ID_D, kind: 'domain', target: 'corp.local', iface: 'wifi', dns: '10.20.0.10' }] }));
+    const { response } = await send(h.handler.dispatch, diagnoseRequest(1, 'corp.local'));
+    expect(response).toMatchObject({
+      ok: true,
+      result: { addresses: [], dns: { outcome: 'timeout', ms: 3000 }, notes: ['resolve-failed'] },
+    });
   });
 });
 

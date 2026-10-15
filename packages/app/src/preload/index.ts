@@ -12,6 +12,8 @@ import type {
   RsApi,
   RsInvokeChannel,
   RsInvokeChannels,
+  RsLanguage,
+  RsLanguageChannel,
   RsLogChannel,
   RsLogEntry,
   RsResult,
@@ -28,6 +30,7 @@ const invoke = <C extends RsInvokeChannel>(
 
 const STATE_CHANNEL: RsStateChannel = 'rs:state';
 const LOG_CHANNEL: RsLogChannel = 'rs:log';
+const LANGUAGE_CHANNEL: RsLanguageChannel = 'rs:language';
 
 const api: RsApi = {
   getState: () => invoke('rs:getState'),
@@ -70,6 +73,17 @@ const api: RsApi = {
     ipcRenderer.on(LOG_CHANNEL, forward);
     return () => {
       ipcRenderer.removeListener(LOG_CHANNEL, forward);
+    };
+  },
+  getLanguage: () => invoke('rs:getLanguage'),
+  setLanguage: (language) => invoke('rs:setLanguage', language),
+  onLanguage: (listener) => {
+    const forward = (_event: IpcRendererEvent, language: RsLanguage): void => {
+      listener(language);
+    };
+    ipcRenderer.on(LANGUAGE_CHANNEL, forward);
+    return () => {
+      ipcRenderer.removeListener(LANGUAGE_CHANNEL, forward);
     };
   },
 };

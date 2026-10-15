@@ -1,6 +1,7 @@
 import { RECONCILE_REASONS, RULE_REASON_CODES } from '@routeswitch/shared';
 import { describe, expect, it } from 'vitest';
 
+import { i18nFor, LOCALES } from '../../../i18n';
 import type { EngineStateView } from '../hooks/useEngineState';
 import type { RsConnection } from '../rs';
 import {
@@ -16,7 +17,9 @@ import {
   errorText,
   formatAgo,
   formatClock,
+  helperStatusText,
   isActiveWarning,
+  loadingNotice,
   ruleReasonText,
 } from '.';
 
@@ -69,11 +72,17 @@ describe('formatAgo', () => {
 });
 
 describe('formatClock', () => {
-  it('local HH:MM today, with the date before it on another day', () => {
+  it('local HH:MM today, with the date before it on another day (Uzbek: DD.MM)', () => {
     expect(formatClock(new Date(2026, 9, 14, 9, 5).toISOString(), NOW)).toBe('09:05');
     expect(formatClock(new Date(2026, 9, 13, 23, 59).toISOString(), NOW)).toBe('13.10 23:59');
     expect(formatClock(new Date(2025, 9, 14, 10, 0).toISOString(), NOW)).toBe('14.10 10:00');
     expect(formatClock('nope', NOW)).toBe('—');
+  });
+
+  it('in the language it is given', () => {
+    expect(formatClock(new Date(2026, 9, 13, 23, 59).toISOString(), NOW, i18nFor('ru'))).toBe('13.10 23:59');
+    expect(formatAgo(ago(2 * MINUTE), NOW, i18nFor('ru'))).toBe('2 минуты назад');
+    expect(formatAgo(ago(2 * MINUTE), NOW, i18nFor('en'))).toBe('2 min ago');
   });
 });
 
@@ -164,5 +173,55 @@ describe('validation and config-file texts', () => {
     expect(errorText('file-unreadable')).toContain("o'qib bo'lmadi");
     expect(errorText('import-expired')).toContain('qayta tanlang');
     expect(errorText('write-failed')).toContain("yozib bo'lmadi");
+  });
+});
+
+describe('every text in the three languages (TASK-DELTA-11)', () => {
+  it.each(LOCALES)('%s: rule and reconcile reasons come from that language', (locale) => {
+    const i18n = i18nFor(locale);
+    for (const code of RULE_REASON_CODES) expect(ruleReasonText({ reasonCode: code }, i18n)).toBe(i18n.t.ruleReason[code]);
+    expect(Object.keys(i18n.t.ruleReason).sort()).toEqual([...RULE_REASON_CODES].sort());
+    expect(Object.keys(i18n.t.reconcileReason).sort()).toEqual([...RECONCILE_REASONS].sort());
+  });
+
+  it('errorText and helper texts follow the language; tones do not', () => {
+    expect(errorText('not-connected', i18nFor('ru'))).toBe('Нет связи с helper — ничего не отправлено.');
+    expect(errorText('not-connected', i18nFor('en'))).toBe('No connection to the helper — nothing was sent.');
+    expect(errorText('internal', i18nFor('en'))).toBe('Unexpected error (internal).');
+    expect(helperStatusText('connected', i18nFor('ru'))).toEqual({ text: 'Helper работает', tone: 'success' });
+    expect(helperStatusText('disconnected', i18nFor('en'))).toEqual({ text: 'Helper is not running', tone: 'danger' });
+    expect(loadingNotice(i18nFor('en')).title).toBe('Reading the status…');
+  });
+
+  it('a code from a newer main process still gets words', () => {
+    expect(errorText('brand-new' as never)).toBe('Kutilmagan xato (brand-new).');
+    expect(errorText('brand-new' as never, i18nFor('ru'))).toBe('Непредвиденная ошибка (brand-new).');
+  });
+
+  it('helperNotice speaks the language it is given', () => {
+    const engine: EngineStateView = {
+      helper: 'incompatible',
+      connection: { kind: 'incompatible', helperVersion: '0.0.9', protocolVersion: 1, expectedProtocolVersion: 2 },
+      state: null,
+      error: null,
+    };
+    expect(helperNotice(engine, i18nFor('ru'))).toEqual({
+      title: 'Версия helper не подходит',
+      text: 'Helper v0.0.9 использует другой протокол (1, нужен: 2). Переустановите helper.',
+      tone: 'danger',
+      recovery: 'reinstall',
+    });
+    const lost: EngineStateView = { helper: 'disconnected', connection: { kind: 'disconnected', reason: 'timeout' }, state: null, error: null };
+    expect(helperNotice(lost, i18nFor('en'))?.text).toBe('The helper did not answer — reconnecting. Routes already applied stay with the helper.');
+  });
+
+  it('configIssueText speaks the language it is given', () => {
+    expect(configIssueText({ path: ['rules', 0, 'target'], code: 'loopback' }, i18nFor('ru'))).toBe(
+      'Правило 1, адрес: Loopback-адреса (127.0.0.0/8) не маршрутизируются.',
+    );
+    expect(configIssueText({ path: ['rules', 2], code: 'duplicate-id' }, i18nFor('en'))).toBe('Rule 3: a rule id is repeated.');
+    expect(configIssueText({ path: ['rules', 0, 'target'], code: 'invalid-wildcard' })).toContain('10.*.*.*');
+    expect(configIssueText({ path: ['enabled'], code: 'toString' }, i18nFor('en'))).toBe('Overall state: the value is invalid.');
+    expect(configIssueText(undefined, i18nFor('ru'))).toBe('Файл не похож на конфигурацию.');
   });
 });

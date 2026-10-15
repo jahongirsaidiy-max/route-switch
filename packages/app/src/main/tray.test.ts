@@ -331,6 +331,11 @@ function shellHarness() {
         writeClipboard: () => Promise.resolve(),
         logger,
       }),
+      preferences: {
+        language: () => Promise.resolve('uz'),
+        setLanguage: (language) => Promise.resolve(language),
+        onLanguage: () => () => undefined,
+      },
       configDialogs: { chooseImportFile: () => Promise.resolve(null), chooseExportFile: () => Promise.resolve(null) },
       installer: {
         install: () => Promise.reject(new Error('not used')),

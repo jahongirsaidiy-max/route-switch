@@ -2,26 +2,36 @@
 // sidebar, settings screen) and the notice a screen shows in place of its
 // content while there is no live state, with the way out of it.
 
+import type { I18n } from '../../../i18n';
 import type { EngineStateView } from '../hooks/useEngineState';
-import type { RsConnection } from '../rs';
-import { errorText } from './errors';
+import { errorText, UZ } from './errors';
 
 export interface HelperStatusText {
   readonly text: string;
   readonly tone: 'success' | 'warning' | 'danger' | 'neutral';
 }
 
-export const HELPER_STATUS_TEXT: Readonly<Record<EngineStateView['helper'], HelperStatusText>> = {
-  loading: { text: 'Tekshirilmoqda…', tone: 'neutral' },
-  connected: { text: 'Helper ishlayapti', tone: 'success' },
-  connecting: { text: 'Helper bilan ulanmoqda…', tone: 'warning' },
-  'not-installed': { text: "Helper o'rnatilmagan", tone: 'neutral' },
-  disconnected: { text: 'Helper ishlamayapti', tone: 'danger' },
-  'config-unreadable': { text: "Helper config'i buzilgan", tone: 'danger' },
-  incompatible: { text: 'Helper versiyasi mos emas', tone: 'danger' },
-  stopped: { text: "Ilova to'xtamoqda", tone: 'neutral' },
-  unavailable: { text: "Holatni o'qib bo'lmadi", tone: 'danger' },
+const HELPER_STATUS_TONE: Readonly<Record<EngineStateView['helper'], HelperStatusText['tone']>> = {
+  loading: 'neutral',
+  connected: 'success',
+  connecting: 'warning',
+  'not-installed': 'neutral',
+  disconnected: 'danger',
+  'config-unreadable': 'danger',
+  incompatible: 'danger',
+  stopped: 'neutral',
+  unavailable: 'danger',
 };
+
+/** The short status line of a helper status, in the language of `i18n`. */
+export function helperStatusText(status: EngineStateView['helper'], i18n: I18n = UZ): HelperStatusText {
+  return { text: i18n.t.helperStatus[status], tone: HELPER_STATUS_TONE[status] };
+}
+
+/** Every status line in Uzbek (screens that do not pass their language yet). */
+export const HELPER_STATUS_TEXT: Readonly<Record<EngineStateView['helper'], HelperStatusText>> = Object.fromEntries(
+  Object.keys(HELPER_STATUS_TONE).map((status) => [status, helperStatusText(status as EngineStateView['helper'])]),
+) as Record<EngineStateView['helper'], HelperStatusText>;
 
 /**
  * What the user can do about a helper status:
@@ -32,15 +42,8 @@ export const HELPER_STATUS_TEXT: Readonly<Record<EngineStateView['helper'], Help
  */
 export type HelperRecovery = 'reconnect' | 'install' | 'reinstall' | 'repair-config';
 
-/** The words of installing the helper from the app (TASK-214). */
-export const INSTALL_TEXT = {
-  install: "Helper'ni o'rnatish",
-  reinstall: "Helper'ni qayta o'rnatish",
-  /** Under the busy button: the system dialog may be behind another window. */
-  waiting: "Administrator paroli so'raladi (macOS oynasi). O'rnatish bir daqiqagacha davom etishi mumkin.",
-  installed: "Helper o'rnatildi — ulanmoqda…",
-  removed: "Helper butunlay o'chirildi: route'lar, resolver fayllari, daemon, config va log olib tashlandi.",
-} as const;
+/** The words of installing the helper from the app (TASK-214), in Uzbek; `i18n.t.install` in a screen's language. */
+export const INSTALL_TEXT: I18n['t']['install'] = UZ.t.install;
 
 export interface HelperNotice {
   readonly title: string;
@@ -50,67 +53,49 @@ export interface HelperNotice {
   readonly recovery: HelperRecovery | null;
 }
 
-const DISCONNECTED_TEXT: Readonly<Record<Extract<RsConnection, { kind: 'disconnected' }>['reason'], string>> = {
-  'not-running': "Helper ishlamayapti. U launchd orqali qayta ishga tushadi; bo'lmasa qayta o'rnating.",
-  'permission-denied': "Helper socket'iga ruxsat yo'q (foydalanuvchi staff guruhida emas).",
-  'connection-lost': 'Aloqa uzildi — qayta ulanmoqda.',
-  'protocol-error': 'Helper tushunarsiz javob berdi — qayta ulanmoqda.',
-  timeout: 'Helper javob bermadi — qayta ulanmoqda.',
-  error: "Helper'ga ulanib bo'lmadi — qayta urinilmoqda.",
-};
+/** The notice while the first snapshot is on its way. */
+export const loadingNotice = (i18n: I18n = UZ): HelperNotice => ({ title: i18n.t.notice.loadingTitle, text: '', tone: 'neutral', recovery: null });
 
-export const LOADING_NOTICE: HelperNotice = { title: "Holat o'qilmoqda…", text: '', tone: 'neutral', recovery: null };
+export const LOADING_NOTICE: HelperNotice = loadingNotice();
 
 /** The notice for every helper status but `connected`; where it matters it says that applied routes stay with the helper. */
-export function helperNotice(engine: EngineStateView): HelperNotice | null {
+export function helperNotice(engine: EngineStateView, i18n: I18n = UZ): HelperNotice | null {
   const connection = engine.connection;
+  const words = i18n.t.notice;
   switch (engine.helper) {
     case 'connected':
       return null;
     case 'loading':
-      return LOADING_NOTICE;
+      return loadingNotice(i18n);
     case 'connecting':
-      return { title: 'Helper bilan ulanmoqda…', text: '', tone: 'neutral', recovery: null };
+      return { title: words.connectingTitle, text: '', tone: 'neutral', recovery: null };
     case 'not-installed':
-      return {
-        title: "Helper o'rnatilmagan",
-        text: "Routing uchun helper bir marta administrator paroli bilan o'rnatiladi. Hozircha hech bir qoida qo'llanmaydi.",
-        tone: 'warning',
-        recovery: 'install',
-      };
+      return { title: words.notInstalledTitle, text: words.notInstalledText, tone: 'warning', recovery: 'install' };
     case 'disconnected':
       return {
-        title: "Helper bilan aloqa yo'q",
-        text:
-          connection?.kind === 'disconnected'
-            ? `${DISCONNECTED_TEXT[connection.reason]} Qo'llangan route'lar helper'da qoladi.`
-            : "Qo'llangan route'lar helper'da qoladi.",
+        title: words.disconnectedTitle,
+        text: connection?.kind === 'disconnected' ? `${words.disconnected[connection.reason]} ${words.routesStay}` : words.routesStay,
         tone: 'danger',
         recovery: 'reconnect',
       };
     case 'config-unreadable':
-      return {
-        title: "Helper config'i buzilgan",
-        text: "Helper ishlayapti, lekin saqlangan config'ni o'qiy olmadi — hech bir qoida qo'llanmayapti. «Qoidalar» bo'limida config'ni import qiling yoki bo'sh config bilan boshlang.",
-        tone: 'danger',
-        recovery: 'repair-config',
-      };
+      return { title: words.configUnreadableTitle, text: words.configUnreadableText, tone: 'danger', recovery: 'repair-config' };
     case 'incompatible':
       return {
-        title: 'Helper versiyasi mos emas',
+        title: words.incompatibleTitle,
         text:
           connection?.kind === 'incompatible'
-            ? `Helper v${connection.helperVersion} boshqa protokolda (${String(connection.protocolVersion)}, kerak: ${String(connection.expectedProtocolVersion)}). Helper'ni qayta o'rnating.`
-            : "Helper'ni qayta o'rnating.",
+            ? words.incompatibleText(connection.helperVersion, connection.protocolVersion, connection.expectedProtocolVersion)
+            : words.reinstall,
         tone: 'danger',
         recovery: 'reinstall',
       };
     case 'stopped':
-      return { title: "Ilova to'xtamoqda", text: '', tone: 'neutral', recovery: null };
+      return { title: words.stoppedTitle, text: '', tone: 'neutral', recovery: null };
     case 'unavailable':
       return {
-        title: "Holatni o'qib bo'lmadi",
-        text: engine.error === null ? '' : errorText(engine.error.code),
+        title: words.unavailableTitle,
+        text: engine.error === null ? '' : errorText(engine.error.code, i18n),
         tone: 'danger',
         recovery: null,
       };

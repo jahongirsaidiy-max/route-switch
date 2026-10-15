@@ -219,9 +219,21 @@ export interface RouteOperations {
    * `failed` (step `inspect`), nothing deleted.
    */
   routeDelete(request: RouteDeleteRequest): Promise<RouteDeleteResult>;
-  /** `/sbin/route -n get -host <ip>`: which interface and gateway reach `target`. */
-  routeGet(target: string): Promise<RouteGetResult>;
+  /**
+   * `/sbin/route -n get -host <ip>`: which interface and gateway reach `target`.
+   * With `private: true` (an address a user asked to diagnose) the target is
+   * logged at `debug` only: every line at `info` and above, here and in the
+   * command log, leaves it out. The lookup itself is the same.
+   */
+  routeGet(target: string, options?: RouteGetOptions): Promise<RouteGetResult>;
 }
+
+export interface RouteGetOptions {
+  readonly private?: boolean;
+}
+
+/** Index of the target in the `route -n get -host <ip>` arguments: redacted from the command log of a private lookup. */
+const GET_TARGET_ARG = 3;
 
 export interface RouteDeps {
   readonly runner: CommandRunner;
@@ -877,7 +889,10 @@ export const createRouteOperations = (deps: RouteDeps): RouteOperations => {
     return { ok: true, outcome, dst, kind };
   };
 
-  const routeGet = async (target: string): Promise<RouteGetResult> => {
+  const routeGet = async (target: string, options: RouteGetOptions = {}): Promise<RouteGetResult> => {
+    const hidden = options.private === true;
+    // A private lookup: the target only ever at debug. `dst` is left out of every louder line.
+    const where = (dst: unknown): Record<string, unknown> => (hidden ? {} : { dst });
     // A lookup changes nothing, so the forbidden list does not apply (asking
     // how 127.0.0.1 is routed is harmless); the target still has to be a
     // strict IPv4 address so no keyword, host name or option reaches `route`.
@@ -885,27 +900,49 @@ export const createRouteOperations = (deps: RouteDeps): RouteOperations => {
     const address = typeof raw === 'string' ? normalizeIpv4(raw) : null;
     if (address === null || !address.ok) {
       const rejection = rejected('target', 'invalid-ipv4', REJECTION_MESSAGES.target);
-      logRejected('get', rejection, raw, undefined);
+      if (hidden) {
+        logger.debug('route request rejected', { op: 'get', dst: describeInput(raw) });
+        logger.warn('route request rejected', { op: 'get', outcome: rejection.outcome, field: rejection.field, reason: rejection.reason });
+      } else {
+        logRejected('get', rejection, raw, undefined);
+      }
       return rejection;
     }
 
     const dst = address.value;
+    if (hidden) logger.debug('private route lookup', { op: 'get', dst });
     // `-host` for the same reason as in `add`: `10.0.0.0` is an address here.
-    const result = await runner.run(ALLOWED_BINARIES.route, ['-n', 'get', '-host', dst]);
+    const result = await runner.run(
+      ALLOWED_BINARIES.route,
+      ['-n', 'get', '-host', dst],
+      hidden ? { redactArgsFrom: GET_TARGET_ARG } : {},
+    );
     const verdict = judge(result, 'get');
     if (verdict === 'not-in-table') {
-      logger.info('no route to target', { op: 'get', dst, gateway: null, outcome: 'not-found' });
+      logger.info('no route to target', { op: 'get', ...where(dst), gateway: null, outcome: 'not-found' });
       return { ok: false, outcome: 'not-found', target: dst };
     }
     const route = verdict === 'ok' ? parseRouteGetOutput(dst, result.stdout) : null;
     if (route === null) {
       const failure = failed('get', result, 'unrecognised output from route get');
-      logFailed('get', failure, dst, null);
+      if (hidden) {
+        // The message may quote what `route` printed about the target.
+        logger.debug('route command failed', { op: 'get', dst, error: failure.message });
+        logger.error('route command failed', {
+          op: 'get',
+          outcome: failure.outcome,
+          step: failure.step,
+          failure: failure.failure,
+          exitCode: failure.exitCode,
+        });
+      } else {
+        logFailed('get', failure, dst, null);
+      }
       return failure;
     }
     logger.info('route looked up', {
       op: 'get',
-      dst,
+      ...where(dst),
       gateway: route.gateway,
       iface: route.iface,
       outcome: 'found',

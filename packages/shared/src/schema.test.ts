@@ -11,6 +11,7 @@ import {
   findDuplicateIds,
   findIfaceConflicts,
   findOverlaps,
+  normalizeRuleTarget,
   normalizeTarget,
   type ConfigInput,
   type RuleInput,
@@ -200,6 +201,72 @@ describe('Rule', () => {
     });
   });
 
+  describe('IP wildcard target', () => {
+    it.each([
+      ['subnet', '10.*.*.*', '10.0.0.0/8'],
+      ['ip', '10.*.*.*', '10.0.0.0/8'],
+      ['subnet', '192.168.*.*', '192.168.0.0/16'],
+      ['ip', '192.168.5.*', '192.168.5.0/24'],
+      ['subnet', '169.253.*.*', '169.253.0.0/16'],
+    ] as const)('stores a %s wildcard %s as subnet %s', (kind, target, expected) => {
+      const parsed = Rule.parse(rule({ kind, target }));
+      expect(parsed.kind).toBe('subnet');
+      expect(parsed.target).toBe(expected);
+    });
+
+    it('keeps every other field of the rule', () => {
+      expect(Rule.parse(rule({ kind: 'ip', target: '10.*.*.*', iface: 'wifi', note: 'Lab', enabled: false }))).toEqual({
+        id: uuid(1),
+        enabled: false,
+        kind: 'subnet',
+        target: '10.0.0.0/8',
+        iface: 'wifi',
+        refreshSec: 600,
+        note: 'Lab',
+      });
+    });
+
+    it.each([
+      ['224.*.*.*', 'multicast'],
+      ['239.*.*.*', 'multicast'],
+      ['127.*.*.*', 'loopback'],
+      ['0.*.*.*', 'this-network'],
+      ['169.254.*.*', 'link-local'],
+      ['169.254.10.*', 'link-local'],
+      ['255.255.255.*', null],
+    ] as const)('passes %s through the forbidden ranges (%s)', (target, code) => {
+      for (const kind of ['ip', 'subnet'] as const) {
+        const result = Rule.safeParse(rule({ kind, target }));
+        if (code === null) {
+          expect(result.success).toBe(true);
+        } else {
+          expect(result.success ? [] : result.error.issues).toMatchObject([
+            { code: 'custom', path: ['target'], params: { code } },
+          ]);
+        }
+      }
+    });
+
+    it.each(['192.*.1.*', '*.*.*.*', '10.*', '10.**.*.*', '10.*.*.*/8', ' 10.*.*.*', '10.*.*.* ', '*'])(
+      'rejects %j as invalid-wildcard for ip and subnet',
+      (target) => {
+        for (const kind of ['ip', 'subnet'] as const) {
+          const result = Rule.safeParse(rule({ kind, target }));
+          expect(result.success ? [] : result.error.issues).toMatchObject([
+            { code: 'custom', path: ['target'], params: { code: 'invalid-wildcard' } },
+          ]);
+        }
+      },
+    );
+
+    it.each(['*.corp.local', '10.*.*.*', '*'])('still rejects %j in a domain rule as invalid-domain', (target) => {
+      const result = Rule.safeParse(rule({ kind: 'domain', target }));
+      expect(result.success ? [] : result.error.issues).toMatchObject([
+        { code: 'custom', path: ['target'], params: { code: 'invalid-domain' } },
+      ]);
+    });
+  });
+
   it('rejects an empty target', () => {
     expect(issuesOf(Rule.safeParse(rule({ target: '' })))).toEqual(['target: too_small']);
   });
@@ -295,6 +362,41 @@ describe('normalizeTarget', () => {
     expect(normalizeTarget('domain', 'corp.local')).toEqual({ ok: true, value: 'corp.local' });
     expect(normalizeTarget('domain', '../etc').ok).toBe(false);
   });
+
+  it('returns the CIDR of an ip or subnet wildcard', () => {
+    expect(normalizeTarget('ip', '10.*.*.*')).toEqual({ ok: true, value: '10.0.0.0/8' });
+    expect(normalizeTarget('subnet', '192.168.5.*')).toEqual({ ok: true, value: '192.168.5.0/24' });
+  });
+
+  it('reports the wildcard and forbidden-range codes', () => {
+    const codeOf = (result: ReturnType<typeof normalizeTarget>) => (result.ok ? null : result.error.code);
+    expect(codeOf(normalizeTarget('ip', '192.*.1.*'))).toBe('invalid-wildcard');
+    expect(codeOf(normalizeTarget('subnet', '224.*.*.*'))).toBe('multicast');
+    expect(codeOf(normalizeTarget('domain', '*.corp.local'))).toBe('invalid-domain');
+  });
+});
+
+describe('normalizeRuleTarget', () => {
+  it('keeps the kind of a plain target', () => {
+    expect(normalizeRuleTarget('ip', '172.16.12.40')).toEqual({ ok: true, value: { kind: 'ip', target: '172.16.12.40' } });
+    expect(normalizeRuleTarget('subnet', '10.1.2.3/8')).toEqual({ ok: true, value: { kind: 'subnet', target: '10.0.0.0/8' } });
+    expect(normalizeRuleTarget('domain', 'corp.local')).toEqual({ ok: true, value: { kind: 'domain', target: 'corp.local' } });
+  });
+
+  it('turns an ip or subnet wildcard into a subnet', () => {
+    expect(normalizeRuleTarget('ip', '10.*.*.*')).toEqual({ ok: true, value: { kind: 'subnet', target: '10.0.0.0/8' } });
+    expect(normalizeRuleTarget('subnet', '192.168.*.*')).toEqual({
+      ok: true,
+      value: { kind: 'subnet', target: '192.168.0.0/16' },
+    });
+  });
+
+  it('refuses a wildcard that is malformed or lands in a forbidden range', () => {
+    const codeOf = (result: ReturnType<typeof normalizeRuleTarget>) => (result.ok ? null : result.error.code);
+    expect(codeOf(normalizeRuleTarget('ip', '*.*.*.*'))).toBe('invalid-wildcard');
+    expect(codeOf(normalizeRuleTarget('subnet', '10.*.1.*'))).toBe('invalid-wildcard');
+    expect(codeOf(normalizeRuleTarget('ip', '127.*.*.*'))).toBe('loopback');
+  });
 });
 
 describe('Config', () => {
@@ -319,6 +421,17 @@ describe('Config', () => {
 
   it('normalises rule targets', () => {
     expect(Config.parse(config([rule({ target: '10.1.2.3/8' })])).rules[0]?.target).toBe('10.0.0.0/8');
+  });
+
+  it('never stores a *: a wildcard rule is saved as its subnet', () => {
+    const parsed = Config.parse(
+      config([rule({ kind: 'ip', target: '10.*.*.*' }), rule({ id: uuid(2), target: '192.168.5.*', iface: 'wifi' })]),
+    );
+    expect(parsed.rules.map(({ kind, target }) => ({ kind, target }))).toEqual([
+      { kind: 'subnet', target: '10.0.0.0/8' },
+      { kind: 'subnet', target: '192.168.5.0/24' },
+    ]);
+    expect(JSON.stringify(parsed)).not.toContain('*');
   });
 
   it('reports an invalid rule with its index', () => {
@@ -471,6 +584,15 @@ describe('Config', () => {
       expect(issuesOf(result)).toEqual(['rules.1.target: custom']);
     });
 
+    it('treats a wildcard and its subnet as the same target', () => {
+      const result = Config.safeParse(
+        config([rule({ kind: 'ip', target: '10.*.*.*' }), rule({ id: uuid(2), target: '10.0.0.0/8', iface: 'wifi' })]),
+      );
+      expect(result.success ? [] : result.error.issues).toMatchObject([
+        { path: ['rules', 1, 'target'], params: { code: 'iface-conflict', first: 0, second: 1 } },
+      ]);
+    });
+
     it('rejects the same domain bound to two interfaces', () => {
       const result = Config.safeParse(
         config([
@@ -520,6 +642,12 @@ describe('destinationKey', () => {
   it('returns null for an invalid IP target', () => {
     expect(destinationKey({ kind: 'ip', target: 'not-an-ip' })).toBeNull();
   });
+
+  it('keys a wildcard draft by the subnet it stands for', () => {
+    expect(destinationKey({ kind: 'ip', target: '10.*.*.*' })).toBe('net:10.0.0.0/8');
+    expect(destinationKey({ kind: 'subnet', target: '192.168.5.*' })).toBe('net:192.168.5.0/24');
+    expect(destinationKey({ kind: 'subnet', target: '192.*.1.*' })).toBeNull();
+  });
 });
 
 describe('findDuplicateIds', () => {
@@ -545,6 +673,15 @@ describe('findIfaceConflicts', () => {
         { kind: 'subnet', target: '192.168.0.0/16', iface: 'wifi' },
       ]),
     ).toEqual([]);
+  });
+
+  it('compares a wildcard draft with the subnet it stands for', () => {
+    expect(
+      findIfaceConflicts([
+        { kind: 'subnet', target: '10.0.0.0/8', iface: 'ethernet' },
+        { kind: 'ip', target: '10.*.*.*', iface: 'wifi' },
+      ]),
+    ).toEqual([{ first: 0, second: 1 }]);
   });
 
   it('skips rules with an invalid target', () => {
@@ -592,6 +729,13 @@ describe('findOverlaps', () => {
       { wider: a, narrower: c },
       { wider: b, narrower: c },
     ]);
+  });
+
+  it('compares a wildcard draft as the subnet it stands for', () => {
+    const wide = net('10.*.*.*', 'ip');
+    const narrow = net('10.20.0.0/16');
+    expect(findOverlaps([narrow, wide])).toEqual([{ wider: wide, narrower: narrow }]);
+    expect(findOverlaps([net('192.*.1.*'), net('192.0.1.0/24')])).toEqual([]);
   });
 
   it('skips domain rules and invalid targets', () => {

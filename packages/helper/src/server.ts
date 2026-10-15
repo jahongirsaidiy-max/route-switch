@@ -2,6 +2,7 @@ import * as nodeFs from 'node:fs/promises';
 import { createConnection, createServer, type Server, type Socket } from 'node:net';
 
 import {
+  DiagnoseResult,
   PROTOCOL_LIMITS,
   PROTOCOL_VERSION,
   TestResult,
@@ -22,10 +23,11 @@ import {
   type ResultMap,
 } from '@routeswitch/shared';
 
-import type { ClearTimer, SetTimer } from './dns';
+import { DIAGNOSE_LIMITS, createDiagnoseLimiter, runDiagnose, type DiagnoseLimits } from './diagnose';
+import type { CachedDomain, ClearTimer, ProbeResult, SetTimer } from './dns';
 import type { Engine, ReconcileOutcome } from './engine';
 import type { LogEntry, LogSink, Logger } from './logger';
-import type { RouteGetResult } from './route';
+import type { RouteGetOptions, RouteGetResult } from './route';
 
 /**
  * The helper's side of the IPC socket.
@@ -37,10 +39,11 @@ import type { RouteGetResult } from './route';
  *   is answered with an error, logged and dropped, and never takes the helper
  *   down. Events (`state`, `log`) go to every connection that has made at
  *   least one valid request.
- * - `createRequestHandler` — the seven methods, on top of the engine. There
+ * - `createRequestHandler` — the eight methods, on top of the engine. There
  *   is no method that runs a command, takes a path or evaluates anything.
  *   Requests that change something (`setConfig`, `setEnabled`, `apply`,
- *   `uninstall`) are serialised; reads are answered at once.
+ *   `uninstall`) are serialised; reads are answered at once. `diagnose`
+ *   (`diagnose.ts`) is read-only and limited per connection and in total.
  * - `createLogForwarder` — the logger sink that turns user-relevant log
  *   entries into `log` events, with repeats rate-limited.
  */
@@ -87,7 +90,7 @@ export const SERVER_LIMITS: ServerLimits = {
 export const MUTATION_REPLY_DEADLINE_MS = 25_000;
 /** The same for `uninstall`, whose cleanup is sized for 60 s (`SHUTDOWN_EXIT_TIMEOUT_SEC`); the app waits 60 s. */
 export const UNINSTALL_REPLY_DEADLINE_MS = 55_000;
-/** `route -n get` lookups of `test` running at the same time; more wait their turn. */
+/** `route -n get` lookups of `test` and `diagnose` running at the same time; more wait their turn. */
 export const MAX_CONCURRENT_TESTS = 4;
 
 const errorCodeOf = (error: unknown): string => {
@@ -125,7 +128,12 @@ export interface HandlerOutcome {
   readonly afterWrite?: (() => void) | undefined;
 }
 
-export type RequestDispatcher = (request: Request) => Promise<HandlerOutcome>;
+/** Where a request came from: the transport's id of the connection, for the per-connection limits. */
+export interface RequestOrigin {
+  readonly connection: number;
+}
+
+export type RequestDispatcher = (request: Request, origin?: RequestOrigin) => Promise<HandlerOutcome>;
 
 export interface SocketServerDeps {
   /** `PATHS.socket` in the daemon; a path in a temporary directory in tests. */
@@ -328,7 +336,7 @@ export const createSocketServer = (deps: SocketServerDeps): SocketServer => {
     void (async (): Promise<void> => {
       let outcome: HandlerOutcome;
       try {
-        outcome = await deps.dispatch(request);
+        outcome = await deps.dispatch(request, { connection: connection.id });
       } catch (error) {
         logger.error('request handler failed', { method: request.method, error: describeThrown(error) });
         outcome = { response: errorResponse(request.id, 'internal', 'Internal error') };
@@ -550,7 +558,7 @@ export interface RequestHandlerDeps {
   readonly helperVersion: string;
   readonly logger: Logger;
   /** `route -n get -host <ip>`; the target has passed the request schema (a routable IPv4 address). */
-  readonly routeGet: (target: string) => Promise<RouteGetResult>;
+  readonly routeGet: (target: string, options?: RouteGetOptions) => Promise<RouteGetResult>;
   /** Writes `config.json` atomically. */
   readonly saveConfig: (config: Config) => Promise<{ readonly ok: true } | { readonly ok: false; readonly code: string }>;
   /** Resolves when the startup (cleanup of leftovers, first reconcile) is done; changes wait for it. */
@@ -567,9 +575,17 @@ export interface RequestHandlerDeps {
   readonly uninstall: () => Promise<{ readonly failed: number; readonly resolverFilesFailed: number }>;
   /** Runs once the `uninstall` answer has been written: the daemon closes the socket. */
   readonly afterUninstall: () => void;
+  /** `diagnose`: the DNS module's cache of a rule, read-only (`DomainResolverService.peek`). */
+  readonly peekDomain: (ruleId: string) => CachedDomain | null;
+  /** `diagnose`: one A query to one server (`probeDns`). */
+  readonly probeDns: (server: string, name: string) => Promise<ProbeResult>;
+  /** Monotonic milliseconds, for the `diagnose` rate limit; defaults to `performance.now`. */
+  readonly monotonicNow?: (() => number) | undefined;
   readonly setTimer: SetTimer;
   readonly clearTimer: ClearTimer;
-  readonly limits?: { readonly mutationReplyMs?: number; readonly uninstallReplyMs?: number } | undefined;
+  readonly limits?:
+    | { readonly mutationReplyMs?: number; readonly uninstallReplyMs?: number; readonly diagnose?: Partial<DiagnoseLimits> }
+    | undefined;
 }
 
 type HandlerResult<M extends keyof ResultMap> = { readonly ok: true; readonly result: ResultMap[M] } | { readonly ok: false; readonly code: ErrorCode; readonly message: string };
@@ -609,6 +625,8 @@ export const createRequestHandler = (deps: RequestHandlerDeps): RequestHandler =
   let uninstalled = false;
   let testsRunning = 0;
   const testWaiters: (() => void)[] = [];
+  const diagnoseLimits: DiagnoseLimits = { ...DIAGNOSE_LIMITS, ...deps.limits?.diagnose };
+  const diagnoseLimiter = createDiagnoseLimiter(diagnoseLimits, deps.monotonicNow ?? (() => performance.now()));
 
   /** Resolves with the value, or with `null` once `ms` have passed. */
   const withDeadline = <T>(work: Promise<T>, ms: number): Promise<T | null> =>
@@ -716,14 +734,18 @@ export const createRequestHandler = (deps: RequestHandlerDeps): RequestHandler =
     testWaiters.shift()?.();
   };
 
-  const test = async (target: string): Promise<HandlerResult<'test'>> => {
+  /** `route -n get` behind one semaphore for `test` and `diagnose`: never more than `MAX_CONCURRENT_TESTS` lookups at once. */
+  const sharedRouteGet = async (address: string, options?: RouteGetOptions): Promise<RouteGetResult> => {
     await acquireTestSlot();
-    let found: RouteGetResult;
     try {
-      found = await deps.routeGet(target);
+      return await (options === undefined ? deps.routeGet(address) : deps.routeGet(address, options));
     } finally {
       releaseTestSlot();
     }
+  };
+
+  const test = async (target: string): Promise<HandlerResult<'test'>> => {
+    const found = await sharedRouteGet(target);
     if (found.outcome === 'not-found') return failed('operation-failed', 'No route to the target');
     if (!found.ok) return failed('operation-failed', 'The route lookup failed');
     const { route } = found;
@@ -754,7 +776,48 @@ export const createRequestHandler = (deps: RequestHandlerDeps): RequestHandler =
     return { ok: true, result: checked.data };
   };
 
-  const run = async (request: Request): Promise<HandlerResult<keyof ResultMap>> => {
+  const DIAGNOSE_REFUSALS = {
+    'connection-busy': 'A diagnosis is already running on this connection',
+    'connection-rate': 'Too many diagnoses on this connection; try again in a minute',
+    busy: 'Too many diagnoses are running; try again shortly',
+  } as const;
+
+  const diagnose = async (target: string, origin: RequestOrigin | undefined): Promise<HandlerResult<'diagnose'>> => {
+    // A caller without an origin (none in the daemon) shares one budget instead of escaping the limit.
+    const slot = diagnoseLimiter.tryAcquire(origin?.connection ?? 0);
+    if (!slot.ok) {
+      logger.debug('diagnose refused', { reason: slot.reason });
+      return failed('operation-failed', DIAGNOSE_REFUSALS[slot.reason]);
+    }
+    // The slot is held until the work is really over, also when the answer went out at the deadline.
+    const work = runDiagnose(target, {
+      getConfig: () => engine.getConfig(),
+      getState: () => engine.getState(),
+      getApplied: () => engine.getApplied(),
+      peekDomain: deps.peekDomain,
+      // The addresses a user diagnoses are theirs: logged at debug only, here and in the command log.
+      routeGet: (address) => sharedRouteGet(address, { private: true }),
+      probe: deps.probeDns,
+      logger: deps.logger,
+    });
+    void work.then(slot.release, (error: unknown) => {
+      slot.release();
+      logger.error('diagnose failed', { error: describeThrown(error) });
+    });
+    const outcome = await withDeadline(
+      work.catch(() => null),
+      diagnoseLimits.deadlineMs,
+    );
+    if (outcome === null) return failed('operation-failed', 'The diagnosis did not finish in time or failed');
+    const checked = DiagnoseResult.safeParse(outcome);
+    if (!checked.success) {
+      logger.warn('a diagnosis does not fit the protocol; not sent');
+      return failed('operation-failed', 'The diagnosis gave an answer that cannot be reported');
+    }
+    return { ok: true, result: checked.data };
+  };
+
+  const run = async (request: Request, origin: RequestOrigin | undefined): Promise<HandlerResult<keyof ResultMap>> => {
     if (uninstalled) return uninstalledFailure;
     switch (request.method) {
       case 'status':
@@ -773,13 +836,15 @@ export const createRequestHandler = (deps: RequestHandlerDeps): RequestHandler =
         return test(request.target);
       case 'uninstall':
         return uninstall();
+      case 'diagnose':
+        return diagnose(request.target, origin);
     }
   };
 
-  const dispatch: RequestDispatcher = async (request) => {
+  const dispatch: RequestDispatcher = async (request, origin) => {
     let result: HandlerResult<keyof ResultMap>;
     try {
-      result = await run(request);
+      result = await run(request, origin);
     } catch (error) {
       logger.error('request failed unexpectedly', { method: request.method, error: describeThrown(error) });
       result = failed('internal', 'Internal error');

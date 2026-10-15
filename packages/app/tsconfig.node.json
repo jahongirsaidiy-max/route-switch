@@ -3,5 +3,5 @@
   "compilerOptions": {
     "types": ["node", "electron-vite/node"]
   },
-  "include": ["electron.vite.config.ts", "src/main", "src/preload"]
+  "include": ["electron.vite.config.ts", "src/main", "src/preload", "src/i18n"]
 }
