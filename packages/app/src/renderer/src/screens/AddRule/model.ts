@@ -17,6 +17,7 @@ import {
   normalizeHostAddress,
   normalizeRuleTarget,
   parseIpv4Destination,
+  wildcardBase,
   type EngineState,
   type IfaceRole,
   type RuleKind,
@@ -105,12 +106,13 @@ export const TARGET_FIELD: Readonly<Record<RuleKind, { readonly label: string; r
 // Words for the shared validation codes
 // ---------------------------------------------------------------------------
 
-/** Wildcard domains need a DNS proxy: out of the MVP (RouteSwitch.md §Maqsad va doira). Uzbek. */
-export const WILDCARD_TEXT = UZ.t.addRule.errors.wildcardDomain;
-
-/** The words for a refused domain: the shared code says "invalid", the input says which way. */
+/**
+ * The words for a refused domain: the shared code says "invalid", the input
+ * says which way. A `*` makes it a wildcard domain (`*.corp.local`, ADR-002),
+ * refused with that code's words whatever else is wrong with it.
+ */
 function domainText(input: string, i18n: I18n): string {
-  if (input.includes('*')) return i18n.t.addRule.errors.wildcardDomain;
+  if (isWildcardDomain(input)) return i18n.t.validation['invalid-wildcard-domain'];
   if (/[A-Z]/.test(input) && !/[^A-Za-z0-9.-]/.test(input)) return i18n.t.addRule.errors.upperCase;
   return i18n.t.validation['invalid-domain'];
 }
@@ -131,6 +133,8 @@ export interface FormCheck {
   readonly normalisedTarget: string | null;
   /** The subnet an accepted IP wildcard is saved as (`10.*.*.*` → `10.0.0.0/8`, kind `subnet`), from the shared normaliser. */
   readonly wildcardCidr: string | null;
+  /** The base of an accepted wildcard domain (`*.corp.local` → `corp.local`): the rule covers its subdomains, not the base. */
+  readonly wildcardBase: string | null;
   /** Another rule already routes the same destination through the same interface (allowed; a hint only). */
   readonly sameAs: string | null;
 }
@@ -211,6 +215,7 @@ export function checkForm(form: RuleForm, id: string, config: Config | null, i18
   // The shared normaliser turns an `ip` / `subnet` wildcard into a subnet: say which, not "saved as".
   const wildcardCidr = target.ok && form.kind !== 'domain' && isIpWildcard(typedTarget) ? target.value.target : null;
   const normalisedTarget = target.ok && wildcardCidr === null && target.value.target !== typedTarget ? target.value.target : null;
+  const base = target.ok && form.kind === 'domain' ? wildcardBase(target.value.target) : null;
   const parsed = Rule.safeParse(input);
   const errors: FieldErrors = {};
   if (!parsed.success) {
@@ -225,19 +230,12 @@ export function checkForm(form: RuleForm, id: string, config: Config | null, i18
     if (errors.target === undefined && !target.ok && typedTarget !== '') {
       errors.target = fieldText('target', { code: 'custom', path: ['target'], params: { code: target.error.code } }, typedTarget, i18n);
     }
-    // A wildcard domain passes the shared check but the form still refuses it (see below).
-    if (errors.target === undefined && form.kind === 'domain' && isWildcardDomain(typedTarget)) errors.target = words.wildcardDomain;
     // A refusal on a field the form does not show (the id) still blocks the save.
     const blocked = Object.keys(errors).length === 0;
-    return { rule: null, errors, formError: blocked ? words.invalidRule : null, normalisedTarget, wildcardCidr, sameAs: null };
+    return { rule: null, errors, formError: blocked ? words.invalidRule : null, normalisedTarget, wildcardCidr, wildcardBase: base, sameAs: null };
   }
 
   const rule = parsed.data;
-  // The shared schema accepts `*.corp.local` since protocol 4 (ADR-002); the form offers it only
-  // once the helper routes it (TASK-DELTA-29), so until then it is refused here as before.
-  if (rule.kind === 'domain' && isWildcardDomain(rule.target)) {
-    return { rule: null, errors: { target: words.wildcardDomain }, formError: null, normalisedTarget: null, wildcardCidr, sameAs: null };
-  }
   let formError: string | null = null;
   let sameAs: string | null = null;
 
@@ -267,7 +265,7 @@ export function checkForm(form: RuleForm, id: string, config: Config | null, i18
   }
 
   const refused = Object.keys(errors).length > 0 || formError !== null;
-  return { rule: refused ? null : rule, errors, formError, normalisedTarget, wildcardCidr, sameAs };
+  return { rule: refused ? null : rule, errors, formError, normalisedTarget, wildcardCidr, wildcardBase: base, sameAs };
 }
 
 /**
@@ -330,6 +328,13 @@ export function commandPreview(
   }
   const gateway = role.gateway;
   const shown = target ?? PLACEHOLDER[kind];
+  // A wildcard domain has no route before a subdomain is looked up (ADR-002 §4): a note, and the DNS server's route.
+  if (kind === 'domain' && target !== null && isWildcardDomain(target)) {
+    return {
+      lines: dns === null ? [] : [`$ route -n add -host ${dns} ${gateway}`],
+      note: dns === null ? words.previewWildcard : words.previewWildcardDns,
+    };
+  }
   if (kind === 'domain') {
     const lines = [`$ route -n add -host <resolve(${shown})> ${gateway}`];
     if (dns !== null) lines.push(`$ route -n add -host ${dns} ${gateway}`);

@@ -111,6 +111,8 @@ describe('the dictionary', () => {
         ...(locale === 'en' ? ['addRule.targetField.subnet.label'] : []),
         'diagnostics.dnsTitle',
         ...(locale === 'en' ? ['dnsWarnings.ruleNote'] : []),
+        'rules.kinds.wildcard',
+        'rules.kinds.wildcardDns',
       ]);
       expect(same.map(([path]) => path).filter((path) => !allowed.has(path))).toEqual([]);
     }

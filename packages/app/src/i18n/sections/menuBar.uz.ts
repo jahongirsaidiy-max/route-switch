@@ -23,6 +23,8 @@ export const menuBarUz = {
   dnsServer: (server: string): string => `DNS: ${server}`,
   /** … or how many addresses it resolved to, and when (`ago` is "2 daq oldin"). */
   resolved: (count: number, ago: string): string => `${String(count)} IP · ${ago}`,
+  /** A wildcard domain rule: how many addresses the DNS proxy learned, and when the last one came (`ago` may be ''). */
+  learned: (count: number, ago: string): string => `${String(count)} ta o'rganilgan IP${ago === '' ? '' : ` · ${ago}`}`,
   routingOff: "Routing o'chirilgan — qoidalar qo'llanmaydi",
   notAppliedYet: "Hali qo'llanmagan",
   /** "Oxirgi qo'llash: 10:58"; the trigger follows as " · tarmoq o'zgarganda". */

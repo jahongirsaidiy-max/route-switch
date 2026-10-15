@@ -185,11 +185,16 @@ function FormBody(props: AddRulePanelProps & { readonly i18n: I18n }): ReactElem
   const targetHint =
     check.wildcardCidr !== null
       ? t.wildcardResult(check.wildcardCidr)
-      : check.normalisedTarget !== null
-        ? t.normalised(check.normalisedTarget)
-        : check.sameAs !== null
-          ? t.sameAs(check.sameAs)
-          : field.hint;
+      : check.wildcardBase !== null
+        ? t.wildcardHint(check.wildcardBase)
+        : check.normalisedTarget !== null
+          ? t.normalised(check.normalisedTarget)
+          : check.sameAs !== null
+            ? t.sameAs(check.sameAs)
+            : field.hint;
+  // A wildcard domain (ADR-002) is not refreshed: its routes are learned when a subdomain is looked up.
+  // The interval field stays while it holds a refused value (a save would focus it).
+  const wildcard = check.wildcardBase !== null && check.errors.refreshSec === undefined;
 
   return (
     <>
@@ -255,30 +260,40 @@ function FormBody(props: AddRulePanelProps & { readonly i18n: I18n }): ReactElem
                 <Message field="dns" error={errors.dns} hint={null} />
               </label>
             ) : null}
-            <label className={styles['refreshField']}>
-              <span>{t.refreshLabel}</span>
-              <input
-                type="text"
-                inputMode="numeric"
-                className={styles['input']}
-                data-size="sm"
-                data-mono
-                data-width="short"
-                value={form.refreshSec}
-                spellCheck={false}
-                autoComplete="off"
-                aria-describedby={errors.refreshSec === undefined ? undefined : MESSAGE_ID.refreshSec}
-                {...inputProps('refreshSec', errors.refreshSec, props)}
-                onChange={(event) => {
-                  props.onField('refreshSec', event.target.value);
-                }}
-              />
-            </label>
-            <Message field="refreshSec" error={errors.refreshSec} hint={null} />
-            <div className={styles['hint']}>
-              {form.useDns && target !== null ? t.resolverFile(target) : ''}
-              {errors.refreshSec === undefined && check.errors.refreshSec === undefined ? refreshText(refresh, i18n) : ''}
-            </div>
+            {wildcard ? null : (
+              <label className={styles['refreshField']}>
+                <span>{t.refreshLabel}</span>
+                <input
+                  type="text"
+                  inputMode="numeric"
+                  className={styles['input']}
+                  data-size="sm"
+                  data-mono
+                  data-width="short"
+                  value={form.refreshSec}
+                  spellCheck={false}
+                  autoComplete="off"
+                  aria-describedby={errors.refreshSec === undefined ? undefined : MESSAGE_ID.refreshSec}
+                  {...inputProps('refreshSec', errors.refreshSec, props)}
+                  onChange={(event) => {
+                    props.onField('refreshSec', event.target.value);
+                  }}
+                />
+              </label>
+            )}
+            {wildcard ? null : <Message field="refreshSec" error={errors.refreshSec} hint={null} />}
+            {check.wildcardBase !== null ? (
+              // The proxy's resolver file is the base's; what a wildcard rule cannot do (ADR-002 §6).
+              <div className={styles['hint']}>
+                {t.resolverFile(check.wildcardBase)}
+                {t.wildcardLimits}
+              </div>
+            ) : (
+              <div className={styles['hint']}>
+                {form.useDns && target !== null ? t.resolverFile(target) : ''}
+                {errors.refreshSec === undefined && check.errors.refreshSec === undefined ? refreshText(refresh, i18n) : ''}
+              </div>
+            )}
           </div>
         ) : null}
 

@@ -3,7 +3,7 @@
 // shows these instead. The tables live in the dictionary (`t.ruleReason`,
 // `t.reconcileReason`); the constants here are their Uzbek copies.
 
-import type { ReconcileReason, RuleReasonCode, RuleState } from '@routeswitch/shared';
+import { isWildcardDomain, type ReconcileReason, type RuleReasonCode, type RuleState } from '@routeswitch/shared';
 
 import type { I18n } from '../../../i18n';
 import { UZ } from './errors';
@@ -13,7 +13,8 @@ export const RULE_REASON_TEXT: Readonly<Record<RuleReasonCode, string>> = UZ.t.r
 
 /**
  * The rule works, with a warning: `active` and a reason code
- * (`addresses-truncated`, `overridden-by-rule`, `dns-server-excluded`).
+ * (`addresses-truncated`, `overridden-by-rule`, `dns-server-excluded`,
+ * `shared-address`).
  * Not an error — it is not counted as one.
  */
 export function isActiveWarning(state: Pick<RuleState, 'status' | 'reasonCode'>): boolean {
@@ -27,3 +28,21 @@ export function ruleReasonText(state: Pick<RuleState, 'reasonCode'>, i18n: I18n)
 
 /** What triggered the last reconcile, as the end of "Oxirgi qo'llash: 10:58 · …" (Uzbek; `t.reconcileReason` per language). */
 export const RECONCILE_REASON_TEXT: Readonly<Record<ReconcileReason, string>> = UZ.t.reconcileReason;
+
+/** A wildcard domain rule (`*.corp.local`, ADR-002): its routes are learned from DNS answers, not resolved ahead. */
+export function isWildcardRule(rule: { readonly kind: string; readonly target: string }): boolean {
+  return rule.kind === 'domain' && isWildcardDomain(rule.target);
+}
+
+/**
+ * How many addresses the DNS proxy learned for a wildcard rule and routes
+ * now: its applied destinations less its own DNS server. Null for any other
+ * rule, and while there is no state for it.
+ */
+export function learnedCount(
+  rule: { readonly kind: string; readonly target: string; readonly dns?: string | undefined },
+  state: Pick<RuleState, 'appliedDestinations'> | null,
+): number | null {
+  if (!isWildcardRule(rule) || state === null) return null;
+  return state.appliedDestinations.filter((destination) => destination !== rule.dns).length;
+}

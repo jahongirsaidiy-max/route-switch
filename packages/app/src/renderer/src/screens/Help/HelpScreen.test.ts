@@ -59,7 +59,7 @@ describe('HelpPanel', () => {
     const onOpenTopic = vi.fn();
     const buttons = elementsOf(expand(panel(HELP_DOCS.uz, onOpenSection, onOpenTopic))).filter((element) => element.type === 'button');
     const toc = buttons.slice(0, HELP_TOPICS.length);
-    toc[4]?.props.onClick?.();
+    toc[5]?.props.onClick?.();
     expect(onOpenTopic).toHaveBeenCalledWith('backup');
     const links = buttons.slice(HELP_TOPICS.length);
     expect(links.length).toBeGreaterThan(0);

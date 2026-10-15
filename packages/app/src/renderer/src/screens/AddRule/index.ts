@@ -30,7 +30,6 @@ export {
   TARGET_FIELD,
   targetField,
   testAddressOf,
-  WILDCARD_TEXT,
   type CommandPreview,
   type DnsRuleOffer,
   type DnsWarningView,

@@ -92,7 +92,7 @@ describe('createAddRuleController — save', () => {
   it('a refused form is not sent: every error shows and the focus goes to the first', async () => {
     const { api, controller, onSaved, state } = harness();
     controller.setKind('domain');
-    controller.setField('target', '*.corp.local');
+    controller.setField('target', '*.com');
     controller.setField('useDns', true);
     controller.setField('dns', 'x');
     await controller.save(CONFIG);

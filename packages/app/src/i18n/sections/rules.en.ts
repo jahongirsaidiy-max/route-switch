@@ -30,10 +30,11 @@ export const rulesEn: Shape<typeof rulesUz> = {
   exportOff: (reason) => `Export config — ${reason}`,
 
   columns: { status: 'Status', target: 'Address', kind: 'Type', iface: 'Interface', note: 'Note' },
-  kinds: { ip: 'IP', subnet: 'Subnet', domain: 'Domain', domainDns: 'Domain + DNS' },
+  kinds: { ip: 'IP', subnet: 'Subnet', domain: 'Domain', domainDns: 'Domain + DNS', wildcard: 'Wildcard', wildcardDns: 'Wildcard + DNS' },
   detailDns: (dns) => `DNS: ${dns}`,
   detailEvery: (minutes) => `every ${String(minutes)} min`,
   detailCount: (count, every) => `${String(count)} ${plural('en', count, { one: 'IP', other: 'IPs' })} · ${every}`,
+  detailLearned: (count) => `${String(count)} learned ${plural('en', count, { one: 'IP', other: 'IPs' })}`,
   warningMark: 'Warning',
   toggleLabel: (target) => `Rule ${target}`,
   editLabel: (target) => `Edit rule ${target}`,

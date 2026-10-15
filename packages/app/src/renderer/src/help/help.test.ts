@@ -39,11 +39,14 @@ describe('the Help documents', () => {
   });
 
   it('cover the topics the task names', () => {
-    expect(HELP_TOPICS).toEqual(['start', 'rule-types', 'precedence', 'default-route', 'backup', 'diagnostics', 'problems', 'uninstall']);
+    expect(HELP_TOPICS).toEqual(['start', 'rule-types', 'wildcard-domains', 'precedence', 'default-route', 'backup', 'diagnostics', 'problems', 'uninstall']);
     for (const locale of LOCALES) {
       const text = allText(HELP_DOCS[locale]);
       // Rule types and their examples, the IP wildcard, the DNS server field.
       for (const sample of ['10.20.30.40', '10.0.0.0/8', '10.*.*.*', 'corp.local', '10.0.0.53', '/etc/resolver/corp.local']) expect(text).toContain(sample);
+      // Wildcard domains (TASK-DELTA-29): subdomains only, Secure DNS bypasses it, IPv6 is not routed.
+      for (const sample of ['*.corp.local', 'app.corp.local', 'Secure DNS', 'IPv6', '954']) expect(text).toContain(sample);
+      expect(text).toContain(MESSAGES[locale].ruleReason['shared-address']);
       // "Default" and the command that puts Wi‑Fi first.
       expect(text).toContain('networksetup -ordernetworkservices');
       expect(text).toContain('route -n get default');

@@ -1,6 +1,7 @@
 import type { Config, EngineState } from '@routeswitch/shared';
 import { describe, expect, it } from 'vitest';
 
+import { i18nFor } from '../../../../i18n';
 import { RULE_REASON_TEXT } from '../../text';
 import { CONFIG, ID, NOW, STATE, ruleState } from '../MenuBar/fixtures';
 import {
@@ -182,5 +183,65 @@ describe('activeCount', () => {
   it('counts active rules, warnings included', () => {
     expect(activeCount(STATE)).toBe(5);
     expect(activeCount(withRules([ruleState(ID.domain, { reasonCode: 'dns-server-excluded' }), ruleState(ID.host, { status: 'error', reasonCode: 'route-failed' })]))).toBe(1);
+  });
+});
+
+describe('a wildcard domain rule (TASK-DELTA-29)', () => {
+  const WILD = '99999999-9999-4999-8999-999999999999';
+  const wildcard = { id: WILD, kind: 'domain', target: '*.corp.local', iface: 'ethernet', enabled: true, refreshSec: 600 } as const;
+  const withDns = { ...wildcard, dns: '10.20.0.10' } as const;
+  const learned = ruleState(WILD, { appliedDestinations: ['10.20.0.10', '10.20.1.5', '10.20.1.6'], lastResolvedAt: new Date(NOW - 120_000).toISOString() });
+
+  it('is labelled a wildcard, with or without a DNS server', () => {
+    expect(kindLabel(wildcard)).toBe('Wildcard');
+    expect(kindLabel(withDns)).toBe('Wildcard + DNS');
+    expect(kindLabel(withDns, i18nFor('ru'))).toBe('Wildcard + DNS');
+    expect(kindLabel({ kind: 'domain', target: 'corp.local' })).toBe('Domen');
+  });
+
+  it('says how many addresses it learned (its own DNS server is not one), and when', () => {
+    expect(rowDetail(withDns, learned, undefined, NOW)).toBe("DNS: 10.20.0.10 · 2 ta o'rganilgan IP · 2 daq oldin");
+    expect(rowDetail(wildcard, learned)).toBe("3 ta o'rganilgan IP");
+    expect(rowDetail(wildcard, null)).toBe("0 ta o'rganilgan IP");
+    expect(rowDetail({ ...wildcard, note: 'Ichki' }, learned)).toBe('Ichki');
+  });
+
+  it.each([
+    [1, 'en', '1 learned IP'],
+    [2, 'en', '2 learned IPs'],
+    [1, 'ru', '1 найденный IP'],
+    [3, 'ru', '3 найденных IP'],
+    [5, 'ru', '5 найденных IP'],
+    [21, 'ru', '21 найденный IP'],
+  ] as const)('%i in %s: %s', (count, locale, expected) => {
+    const state = ruleState(WILD, { appliedDestinations: Array.from({ length: count }, (_, i) => `10.20.2.${String(i + 1)}`) });
+    expect(rowDetail(wildcard, state, i18nFor(locale))).toBe(expected);
+  });
+
+  it('carries the limits note (Secure DNS, IPv6) in every language; other rules do not', () => {
+    const config: Config = { ...CONFIG, rules: [...CONFIG.rules, wildcard] };
+    const state = withRules([...STATE.rules, learned]);
+    for (const locale of ['uz', 'ru', 'en'] as const) {
+      const rows = ruleRows(config, state, NOW, i18nFor(locale));
+      const row = rows.find((entry) => entry.id === WILD);
+      expect(row?.wildcard).toBe(true);
+      expect(row?.limits).toContain('Secure DNS');
+      expect(row?.limits).toContain('IPv6');
+      expect(rows.filter((entry) => entry.id !== WILD).every((entry) => !entry.wildcard && entry.limits === null)).toBe(true);
+    }
+  });
+
+  it('the new warning and error codes are words, not codes, in every language', () => {
+    const shared = rowStatus(ruleState(WILD, { reasonCode: 'shared-address', reason: 'x' }), i18nFor('en'));
+    expect(shared).toEqual({ kind: 'warning', text: i18nFor('en').t.ruleReason['shared-address'] });
+    const proxy = rowStatus(ruleState(WILD, { status: 'error', reasonCode: 'dns-proxy-unavailable', reason: 'x' }), i18nFor('ru'));
+    expect(proxy).toEqual({ kind: 'error', text: i18nFor('ru').t.ruleReason['dns-proxy-unavailable'] });
+    for (const code of ['shared-address', 'dns-proxy-unavailable'] as const) {
+      const words = (['uz', 'ru', 'en'] as const).map((locale) => i18nFor(locale).t.ruleReason[code]);
+      expect(new Set(words).size).toBe(3);
+      for (const text of words) expect(text).not.toContain(code);
+    }
+    const learnedWords = (['uz', 'ru', 'en'] as const).map((locale) => i18nFor(locale).t.reconcileReason['dns-learned']);
+    expect(new Set(learnedWords).size).toBe(3);
   });
 });

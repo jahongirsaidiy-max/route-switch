@@ -18,7 +18,8 @@ import {
   type FormStatus,
 } from './AddRuleScreen';
 import { initialAddRuleUi, type AddRuleUiState } from './controller';
-import { formOfRule, NEW_RULE_FORM, WILDCARD_TEXT, type RuleForm } from './model';
+import { formOfRule, NEW_RULE_FORM, type RuleForm } from './model';
+import { i18nFor } from '../../../../i18n';
 import { VALIDATION_TEXT as UZ_VALIDATION } from '../../text';
 
 const NEW_ID = '77777777-7777-4777-8777-777777777777';
@@ -203,8 +204,8 @@ describe('AddRulePanel — errors next to the field', () => {
     expect(left).toContain('aria-invalid="true"');
     expect(text(left)).toContain("Prefiks 8 dan 32 gacha bo'lishi kerak.");
     expect(left).toMatch(/id="add-rule-target-message"[^>]*data-tone="danger"/);
-    const submitted = render({ ui: ui({ kind: 'domain', target: '*.corp.local', useDns: true, dns: 'x', refreshSec: '10' }, { submitted: true }) });
-    expect(text(submitted)).toContain(WILDCARD_TEXT);
+    const submitted = render({ ui: ui({ kind: 'domain', target: '*.com', useDns: true, dns: 'x', refreshSec: '10' }, { submitted: true }) });
+    expect(text(submitted)).toContain(UZ_VALIDATION['invalid-wildcard-domain']);
     expect(submitted.match(/aria-invalid="true"/g)).toHaveLength(3);
     expect(text(submitted)).toContain('60 dan 86400 gacha butun son');
     expect(text(submitted)).not.toContain('yangilanadi');
@@ -407,5 +408,30 @@ describe('handleDialogEscape (TASK-300)', () => {
     expect(handleDialogEscape(escape, true, onCancel)).toBe(false);
     expect(escape.preventDefault).toHaveBeenCalledTimes(1);
     expect(onCancel).not.toHaveBeenCalled();
+  });
+});
+
+describe('AddRulePanel — a wildcard domain (TASK-DELTA-29)', () => {
+  it('names the subdomains-only rule, the resolver file of the base and the limits; no refresh interval, no route line', () => {
+    const html = text(render({ ui: ui({ kind: 'domain', target: '*.corp.local' }) }));
+    expect(html).toContain("Faqat subdomenlar (masalan app.corp.local) — corp.local ning o'zi uchun alohida qoida qo'shing.");
+    expect(html).toContain('/etc/resolver/corp.local fayli yaratiladi.');
+    expect(html).toContain('Secure DNS');
+    expect(html).toContain('IPv6');
+    expect(html).not.toContain("IP'larni yangilash oralig'i");
+    expect(html).not.toContain('$ route');
+    expect(html).toContain("Route'lar oldindan qo'yilmaydi");
+  });
+
+  it('keeps the refresh field while it holds a refused value', () => {
+    const html = text(render({ ui: ui({ kind: 'domain', target: '*.corp.local', refreshSec: '5' }, { submitted: true }) }));
+    expect(html).toContain("IP'larni yangilash oralig'i");
+    expect(html).toContain('60 dan 86400 gacha butun son');
+  });
+
+  it('in English', () => {
+    const html = text(render({ ui: ui({ kind: 'domain', target: '*.corp.local' }), i18n: i18nFor('en') }));
+    expect(html).toContain('Subdomains only (e.g. app.corp.local) — add a separate rule for corp.local itself.');
+    expect(html).toContain('Secure DNS');
   });
 });

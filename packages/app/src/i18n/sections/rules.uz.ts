@@ -33,11 +33,13 @@ export const rulesUz = {
 
   columns: { status: 'Holat', target: 'Manzil', kind: 'Turi', iface: 'Interfeys', note: 'Izoh' },
   /** The "Turi" column. */
-  kinds: { ip: 'IP', subnet: 'Subnet', domain: 'Domen', domainDns: 'Domen + DNS' },
+  kinds: { ip: 'IP', subnet: 'Subnet', domain: 'Domen', domainDns: 'Domen + DNS', wildcard: 'Wildcard', wildcardDns: 'Wildcard + DNS' },
   /** The "Izoh" column of a domain rule without a note. */
   detailDns: (dns: string): string => `DNS: ${dns}`,
   detailEvery: (minutes: number): string => `har ${String(minutes)} daq`,
   detailCount: (count: number, every: string): string => `${String(count)} IP · ${every}`,
+  /** A wildcard domain rule: the addresses the DNS proxy learned (ADR-002 §4). */
+  detailLearned: (count: number): string => `${String(count)} ta o'rganilgan IP`,
   warningMark: 'Ogohlantirish',
   toggleLabel: (target: string): string => `${target} qoidasi`,
   editLabel: (target: string): string => `${target} qoidasini tahrirlash`,

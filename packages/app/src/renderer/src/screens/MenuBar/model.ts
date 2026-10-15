@@ -6,7 +6,7 @@ import type { Config, EngineState, IfaceRole, RuleState, RuleStatus } from '@rou
 
 import type { I18n } from '../../../../i18n';
 import type { RsServiceOrder } from '../../rs';
-import { isActiveWarning, lastKnownShort, lastKnownText, ruleReasonText, UZ } from '../../text';
+import { isActiveWarning, lastKnownShort, lastKnownText, learnedCount, ruleReasonText, UZ } from '../../text';
 
 /** How many rules the window lists; the rest are counted (RouteSwitch.md §Renderer ekranlari). */
 export const MENU_RULE_LIMIT = 4;
@@ -43,8 +43,8 @@ type ConfigRule = Config['rules'][number];
 /**
  * The row text: for a domain rule in `error` that still routes its last known
  * addresses, those (they outrank the note: they say what still works); else
- * the note when there is one; for a domain, its DNS server or how many
- * addresses it resolved to.
+ * the note when there is one; for a wildcard domain, how many addresses it
+ * learned; for a domain, its DNS server or how many addresses it resolved to.
  */
 export function ruleDetail(rule: ConfigRule, state: RuleState | null, now: number, i18n: I18n = UZ): string {
   const lastKnown = state === null ? null : lastKnownShort(rule, state);
@@ -52,6 +52,12 @@ export function ruleDetail(rule: ConfigRule, state: RuleState | null, now: numbe
   const note = rule.note?.trim() ?? '';
   if (note !== '') return note;
   if (rule.kind !== 'domain') return '';
+  // A wildcard rule: how many addresses the DNS proxy learned (its DNS server is not one of them).
+  const learned = learnedCount(rule, state);
+  if (learned !== null) {
+    const ago = state === null || state.lastResolvedAt === null ? '' : i18n.formatAgo(state.lastResolvedAt, now);
+    return i18n.t.menuBar.learned(learned, ago);
+  }
   if (rule.dns !== undefined) return i18n.t.menuBar.dnsServer(rule.dns);
   if (state === null || state.lastResolvedAt === null) return '';
   return i18n.t.menuBar.resolved(state.appliedDestinations.length, i18n.formatAgo(state.lastResolvedAt, now));
