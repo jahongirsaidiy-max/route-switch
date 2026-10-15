@@ -41,20 +41,25 @@ import {
   type RuleRow,
 } from './model';
 import {
+  backupKey,
+  backupOffer,
   createRecoveryController,
+  dismissBackupOffer,
   focusResetButton,
   INITIAL_RECOVERY_UI,
   recoveryHandlers,
+  useBackup,
+  type BackupApi,
   type RecoveryApi,
   type RecoveryUiState,
 } from './recovery';
 import styles from './RulesScreen.module.css';
 import {
   createTransferController,
-  importQuestion,
-  importSummary,
   INITIAL_TRANSFER_UI,
+  previewQuestion,
   returnImportFocus,
+  startRestore,
   transferPanelProps,
   type TransferApi,
   type TransferUiState,
@@ -106,6 +111,14 @@ export interface RulesPanelProps {
   readonly onConfirmReset: () => void;
   /** The "Bo'sh config bilan boshlash" button, so the focus can return to it after a cancelled question. */
   readonly resetRef?: Ref<HTMLButtonElement> | undefined;
+  /** The rules backup's restore offer (TASK-DELTA-16): shown while the helper holds no rules and the backup has some. */
+  readonly backupOffer?: { readonly count: number; readonly savedAt: string } | null | undefined;
+  /** "Ko'rib chiqish": the backup into the import preview. */
+  readonly onReviewBackup?: (() => void) | undefined;
+  /** "Kerak emas": this backup is not offered again. */
+  readonly onDismissBackup?: (() => void) | undefined;
+  /** A failed dismissal. */
+  readonly backupFeedback?: Feedback | null | undefined;
   /** The UI language (`useI18n()`); Uzbek when not given. */
   readonly i18n?: I18n | undefined;
 }
@@ -304,6 +317,7 @@ export function RulesPanel(props: RulesPanelProps): ReactElement {
   const overlaps = loaded === null ? [] : overlapWarnings(loaded.config);
   const confirming = rows.find((row) => row.id === props.confirmingDelete) ?? null;
   const importing = props.transfer.preview;
+  const offer = props.backupOffer ?? null;
   const notice = state === null ? helperNotice(engine, i18n) : null;
   const configBroken = engine.helper === 'config-unreadable';
   const addRuleOff = props.onAddRule === undefined ? t.addRuleUnavailable : configBroken ? t.configUnreadableReason : null;
@@ -416,7 +430,7 @@ export function RulesPanel(props: RulesPanelProps): ReactElement {
           }}
         >
           <p id="rules-import-question" className={styles['confirmText']}>
-            {importQuestion(importSummary(config.config, importing.config), i18n)}
+            {previewQuestion(importing, config.config, props.now, i18n)}
           </p>
           <Button
             variant="primary"
@@ -431,6 +445,35 @@ export function RulesPanel(props: RulesPanelProps): ReactElement {
           <Button autoFocus onClick={props.onCancelImport}>
             {t.cancel}
           </Button>
+        </div>
+      )}
+
+      {props.backupFeedback === null || props.backupFeedback === undefined ? null : (
+        <p className={styles['feedback']} data-tone={props.backupFeedback.tone} role="alert">
+          {props.backupFeedback.text}
+        </p>
+      )}
+
+      {offer === null || importing !== null ? null : (
+        <div className={styles['warnings']}>
+          <Banner tone="warning" title={i18n.t.backup.offerTitle(offer.count)} text={i18n.t.backup.offerText(i18n.formatTime(offer.savedAt, props.now))}>
+            <Button
+              variant="primary"
+              busy={props.transfer.phase !== 'idle'}
+              onClick={() => {
+                props.onReviewBackup?.();
+              }}
+            >
+              {i18n.t.backup.review}
+            </Button>
+            <Button
+              onClick={() => {
+                props.onDismissBackup?.();
+              }}
+            >
+              {i18n.t.backup.dismiss}
+            </Button>
+          </Banner>
         </div>
       )}
 
@@ -543,7 +586,7 @@ export function RulesPanel(props: RulesPanelProps): ReactElement {
 
 export interface RulesScreenProps {
   /** The preload API; `window.rs` in the app. */
-  readonly rs?: RulesApi & TransferApi & RecoveryApi & Pick<RsApi, 'getState' | 'onState' | 'getConfig'>;
+  readonly rs?: RulesApi & TransferApi & RecoveryApi & BackupApi & Pick<RsApi, 'getState' | 'onState' | 'getConfig' | 'restoreBackup' | 'dismissBackup'>;
   /** Opens the add-rule form (TASK-213). */
   readonly onAddRule?: () => void;
   readonly onEditRule?: (id: string) => void;
@@ -646,9 +689,38 @@ export function RulesScreen({ rs: given, onAddRule, onEditRule }: RulesScreenPro
     recoveryController.focusDone();
   }, [recovery.focusReset, recoveryController]);
 
+  // The rules backup (TASK-DELTA-16): read on every connection and config revision, and when the window is shown.
+  const backup = useBackup(rs, backupKey(engine));
+  const offer = backupOffer(engine, config.config, backup.view);
+  const [backupFeedback, setBackupFeedback] = useState<Feedback | null>(null);
+
   return (
     <RulesPanel
       engine={engine}
+      backupOffer={offer}
+      backupFeedback={backupFeedback}
+      onReviewBackup={() => {
+        if (offer === null) return;
+        controller.dismissDelete();
+        setBackupFeedback(null);
+        void startRestore(
+          rs,
+          offer.savedAt,
+          (change) => {
+            latestTransfer.current = change(latestTransfer.current);
+            setTransfer(latestTransfer.current);
+          },
+          () => latestTransfer.current,
+          () => language.current,
+        );
+      }}
+      onDismissBackup={() => {
+        setBackupFeedback(null);
+        void dismissBackupOffer(rs, language.current).then((line) => {
+          setBackupFeedback(line);
+          backup.reload();
+        });
+      }}
       config={config}
       now={now}
       query={query}

@@ -11,6 +11,7 @@ import type { Messages } from './types';
 import { componentsEn } from './sections/components.en';
 import { logEn } from './sections/log.en';
 import { settingsEn } from './sections/settings.en';
+import { backupEn } from './sections/backup.en';
 
 const unexpected = (code: string): string => `Unexpected error (${code}).`;
 
@@ -41,6 +42,7 @@ export const en: Messages = {
     'file-not-json': 'The file is not JSON or is damaged.',
     'import-expired': 'The selected file has expired — choose it again.',
     'write-failed': 'The file could not be written — choose another location.',
+    'no-backup': 'The app holds no rules backup.',
     'install-unavailable':
       'The helper package inside the app is missing or untrusted (a symbolic link, or writable by another user) — reinstall the app.',
     'install-cancelled': 'The password dialog was closed — nothing changed. You can try again.',
@@ -209,6 +211,8 @@ export const en: Messages = {
   /** The journal, settings and shared components (TASK-DELTA-14): `sections/*.ts`. */
   log: logEn,
   settings: settingsEn,
+  /** The rules backup and its restore offer (TASK-DELTA-16): `sections/backup.*`. */
+  backup: backupEn,
   components: componentsEn,
 
   /** The rules window and the add-rule dialog (TASK-DELTA-13): `sections/rules.*`, `sections/addRule.*`. */

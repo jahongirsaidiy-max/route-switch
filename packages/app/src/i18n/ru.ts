@@ -11,6 +11,7 @@ import type { Messages } from './types';
 import { componentsRu } from './sections/components.ru';
 import { logRu } from './sections/log.ru';
 import { settingsRu } from './sections/settings.ru';
+import { backupRu } from './sections/backup.ru';
 
 const unexpected = (code: string): string => `Непредвиденная ошибка (${code}).`;
 
@@ -44,6 +45,7 @@ export const ru: Messages = {
     'file-not-json': 'Файл не в формате JSON или повреждён.',
     'import-expired': 'Срок выбора файла истёк — выберите файл ещё раз.',
     'write-failed': 'Не удалось записать файл — выберите другое место.',
+    'no-backup': 'В приложении нет резервной копии правил.',
     'install-unavailable':
       'Пакет helper в приложении не найден или ненадёжен (символическая ссылка или его может изменить другой пользователь) — переустановите приложение.',
     'install-cancelled': 'Окно ввода пароля закрыто — ничего не изменилось. Можно попробовать ещё раз.',
@@ -213,6 +215,8 @@ export const ru: Messages = {
   /** The journal, settings and shared components (TASK-DELTA-14): `sections/*.ts`. */
   log: logRu,
   settings: settingsRu,
+  /** The rules backup and its restore offer (TASK-DELTA-16): `sections/backup.*`. */
+  backup: backupRu,
   components: componentsRu,
 
   /** The rules window and the add-rule dialog (TASK-DELTA-13): `sections/rules.*`, `sections/addRule.*`. */

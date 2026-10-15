@@ -77,6 +77,10 @@ const api: RsApi = {
   },
   getLanguage: () => invoke('rs:getLanguage'),
   setLanguage: (language) => invoke('rs:setLanguage', language),
+  getBackup: () => invoke('rs:getBackup'),
+  restoreBackup: () => invoke('rs:restoreBackup'),
+  deleteBackup: () => invoke('rs:deleteBackup'),
+  dismissBackup: () => invoke('rs:dismissBackup'),
   onLanguage: (listener) => {
     const forward = (_event: IpcRendererEvent, language: RsLanguage): void => {
       listener(language);

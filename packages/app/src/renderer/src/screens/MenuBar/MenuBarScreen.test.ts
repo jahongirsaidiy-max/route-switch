@@ -391,6 +391,7 @@ describe('MenuBarScreen', () => {
       openRulesWindow: vi.fn(),
       reconnectHelper: vi.fn(),
       installHelper: vi.fn(),
+      getBackup: vi.fn(),
     } satisfies Partial<RsApi>;
     const html = renderMarkup(createElement(MenuBarScreen, { rs }));
     expect(text(html)).toContain("Holat o'qilmoqda…");
@@ -485,6 +486,7 @@ describe('MenuBarPanel — in every language (TASK-DELTA-12)', () => {
       openRulesWindow: vi.fn(),
       reconnectHelper: vi.fn(),
       installHelper: vi.fn(),
+      getBackup: vi.fn(),
     } satisfies Partial<RsApi>;
     const html = renderMarkup(createElement(I18nProvider, { language: 'ru' }, createElement(MenuBarScreen, { rs })));
     expect(text(html)).toContain(i18nFor('ru').t.notice.loadingTitle);
@@ -584,5 +586,31 @@ describe('followServiceOrder (TASK-DELTA-08)', () => {
     expect(view.shows.size).toBe(1);
     view.reader.stop();
     expect(view.shows.size).toBe(0);
+  });
+});
+
+describe('MenuBarPanel: the rules backup offer (TASK-DELTA-16)', () => {
+  const SAVED_AT = '2026-10-15T08:30:00.000Z';
+  const EMPTY: ConfigView = { phase: 'ready', config: { ...CONFIG, rules: [] }, revision: 3, error: null };
+
+  it('shows the offer; its button opens the rules window, where the preview is', () => {
+    const offer = { count: 3, savedAt: SAVED_AT };
+    expect(text(render({ config: EMPTY, backupOffer: offer }))).toContain('Oldingi qoidalarni tiklash (3)');
+    const { all, elements } = treeOf({ config: EMPTY, backupOffer: offer });
+    button(elements, i18nFor('uz').t.backup.openRules).props.onClick?.();
+    expect(all.onOpenRules).toHaveBeenCalledTimes(1);
+  });
+
+  it('no offer without one', () => {
+    expect(text(render({ config: EMPTY }))).not.toContain('Oldingi qoidalarni tiklash');
+  });
+
+  it.each<[Locale, string]>([
+    ['ru', 'Восстановить прежние правила (3)'],
+    ['en', 'Restore previous rules (3)'],
+  ])('in %s', (locale, title) => {
+    const html = text(render({ config: EMPTY, backupOffer: { count: 3, savedAt: SAVED_AT }, i18n: i18nFor(locale) }));
+    expect(html).toContain(title);
+    expect(html).not.toContain('tiklash');
   });
 });

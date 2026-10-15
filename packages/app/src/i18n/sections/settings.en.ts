@@ -39,9 +39,9 @@ export const settingsEn: Messages['settings'] = {
   },
   helper: {
     title: 'Helper',
-    hint: 'Removing asks for the administrator password: every route and resolver file the helper added is removed, the root daemon stops, and its files — the config (your rules) and the log — are deleted too. Export your rules first if you need them.',
+    hint: "Removing asks for the administrator password: every route and resolver file the helper added is removed, the root daemon stops, and its files — the config (your rules) and the log — are deleted too. A copy of your rules stays in the app's backup, and after a reinstall the app offers to restore it; export to move them to another Mac.",
     uninstall: 'Remove the helper',
-    question: 'Remove the helper?',
+    question: "Remove the helper? Your rules stay in the app's backup — you can restore them after reinstalling.",
     confirm: 'Yes, remove',
     cancel: 'Cancel',
   },

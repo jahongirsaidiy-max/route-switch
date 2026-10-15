@@ -272,6 +272,10 @@ describe('SettingsScreen', () => {
       uninstallHelper: vi.fn(),
       removeHelper: vi.fn(),
       setLanguage: vi.fn(),
+      getBackup: vi.fn(),
+      restoreBackup: vi.fn(),
+      applyImport: vi.fn(),
+      deleteBackup: vi.fn(),
     };
     const html = renderMarkup(createElement(SettingsScreen, { rs }));
     expect(html).toContain('Sozlamalar');
@@ -283,6 +287,9 @@ describe('SettingsScreen', () => {
     expect(rs.uninstallHelper).not.toHaveBeenCalled();
     expect(rs.removeHelper).not.toHaveBeenCalled();
     expect(rs.setLanguage).not.toHaveBeenCalled();
+    expect(rs.restoreBackup).not.toHaveBeenCalled();
+    expect(rs.applyImport).not.toHaveBeenCalled();
+    expect(rs.deleteBackup).not.toHaveBeenCalled();
   });
 });
 
@@ -517,5 +524,65 @@ describe('SettingsPanel: every language (TASK-DELTA-14)', () => {
     await Promise.resolve();
     expect(view.feedback?.text).toBe(i18nFor('en').t.errors['not-connected']);
     reader.stop();
+  });
+});
+
+describe('SettingsPanel: the rules backup (TASK-DELTA-16)', () => {
+  const SAVED_AT = '2026-10-15T08:30:00.000Z';
+  const NOW = Date.parse('2026-10-15T09:00:00.000Z');
+  const info = { savedAt: SAVED_AT, ruleCount: 4, dismissed: false };
+  const clean = (html: string) => html.replace(/<[^>]+>/g, ' ').replace(/&#x27;/g, "'").replace(/\s+/g, ' ');
+
+  it('says what the backup holds and offers restore and removal', () => {
+    const html = clean(render({ backup: { phase: 'ready', info }, now: NOW }));
+    expect(html).toContain('Qoidalar zaxirasi');
+    expect(html).toMatch(/Zaxira: 4 ta qoida, \d\d:\d\d/);
+    expect(html).toContain('Zaxiradan tiklash');
+    expect(html).toContain("Zaxirani o'chirish");
+  });
+
+  it('without a backup there is nothing to restore or remove', () => {
+    const html = render({ backup: { phase: 'ready', info: null } });
+    expect(clean(html)).toContain("Zaxira hali yo'q");
+    expect(html).toContain('disabled=""');
+  });
+
+  it('without the helper a restore cannot be applied: the reason is shown', () => {
+    expect(clean(render({ engine: NOT_INSTALLED, backup: { phase: 'ready', info } }))).toContain("Tiklash uchun helper ulangan bo'lishi kerak.");
+  });
+
+  it('the restore preview asks before anything is replaced', () => {
+    const preview = { token: '99999999-9999-4999-8999-999999999999', config: { version: 1 as const, enabled: true, rules: [] }, source: { kind: 'backup' as const, savedAt: SAVED_AT } };
+    const html = clean(render({ backup: { phase: 'ready', info }, now: NOW, restore: { phase: 'idle', preview, feedback: null, focusImport: false } }));
+    expect(html).toContain('Zaxira (');
+    expect(html).toContain('Almashtirish');
+    expect(html).toContain('Bekor qilish');
+  });
+
+  it('removal asks first', () => {
+    const html = clean(render({ backup: { phase: 'ready', info }, confirmingBackupRemoval: true }));
+    expect(html).toContain("Zaxira rostdan ham o'chirilsinmi?");
+    expect(html).toContain("Ha, o'chirish");
+  });
+
+  it('the uninstall question says the rules stay in the backup, in every language', () => {
+    for (const locale of ['uz', 'ru', 'en'] as const) {
+      const words = i18nFor(locale);
+      const html = clean(render({ confirmingUninstall: true, i18n: words }));
+      expect(html).toContain(words.t.settings.helper.question.replace(/'/g, "'"));
+    }
+    expect(i18nFor('uz').t.settings.helper.question).toContain('zaxira');
+    expect(i18nFor('ru').t.settings.helper.question).toContain('резервной копии');
+    expect(i18nFor('en').t.settings.helper.question).toContain('backup');
+  });
+
+  it.each([
+    ['ru', 'Резервная копия правил', 'Копия: 4 правила'],
+    ['en', 'Rules backup', 'Backup: 4 rules'],
+  ] as const)('in %s', (locale, title, summary) => {
+    const html = clean(render({ backup: { phase: 'ready', info }, now: NOW, i18n: i18nFor(locale), language: locale }));
+    expect(html).toContain(title);
+    expect(html).toContain(summary);
+    expect(html).not.toContain('Zaxira');
   });
 });

@@ -1,5 +1,6 @@
 export const PRODUCT_NAME = 'RouteSwitch';
 
+export * from './backup';
 export * from './cidr';
 export * from './jsonl';
 export * from './paths';

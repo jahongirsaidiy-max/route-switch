@@ -1,6 +1,6 @@
 // "Sozlamalar": the UI language (TASK-DELTA-11), login item, Ethernet adapter override, Wi‑Fi as the default
 // channel (a command shown for the user to run — the app never runs it,
-// decision GAP-04) and removing the helper. The design has no settings screen
+// decision GAP-04), the rules backup (TASK-DELTA-16) and removing the helper. The design has no settings screen
 // (GAP-01): it follows the rules window — page header, bordered cards. The
 // words are in the UI language (`t.settings`, TASK-DELTA-14); the command
 // itself is shown as `networksetup` takes it.
@@ -24,9 +24,25 @@ import {
   type SettingsApi,
 } from './actions';
 import { errorText, helperStatusText, UZ } from '../../text';
+import {
+  backupKey,
+  INITIAL_BACKUP_VIEW,
+  removeBackup,
+  useBackup,
+  type BackupApi,
+  type BackupView,
+} from '../Rules/recovery';
+import {
+  cancelPreview,
+  confirmPreview,
+  INITIAL_TRANSFER_UI,
+  previewQuestion,
+  startRestore,
+  type TransferUiState,
+} from '../Rules/transfer';
 import styles from './SettingsScreen.module.css';
 
-export type SettingsSection = 'language' | 'login' | 'ethernet' | 'wifi' | 'helper';
+export type SettingsSection = 'language' | 'login' | 'ethernet' | 'wifi' | 'backup' | 'helper';
 
 export interface ServiceOrderView {
   readonly phase: 'loading' | 'ready' | 'failed';
@@ -58,6 +74,21 @@ export interface SettingsPanelProps {
   readonly onConfirmUninstall: () => void;
   /** The "Helper'ni o'chirish" button, so the focus can return to it after the question closes. */
   readonly uninstallRef?: Ref<HTMLButtonElement> | undefined;
+  /** The rules backup (TASK-DELTA-16); `loading` when not given. */
+  readonly backup?: BackupView | undefined;
+  /** The helper's config now, for the restore preview's counts; null when not read. */
+  readonly config?: Config | null | undefined;
+  /** Milliseconds since the epoch, for the backup's time. */
+  readonly now?: number | undefined;
+  /** The restore's preview and its outcome (the import flow of the rules window). */
+  readonly restore?: TransferUiState | undefined;
+  readonly confirmingBackupRemoval?: boolean | undefined;
+  readonly onRestoreBackup?: (() => void) | undefined;
+  readonly onConfirmRestore?: ((token: string) => void) | undefined;
+  readonly onCancelRestore?: (() => void) | undefined;
+  readonly onAskRemoveBackup?: (() => void) | undefined;
+  readonly onCancelRemoveBackup?: (() => void) | undefined;
+  readonly onConfirmRemoveBackup?: (() => void) | undefined;
   /** The UI language (`useI18n()`); Uzbek when not given. */
   readonly i18n?: I18n | undefined;
 }
@@ -70,6 +101,110 @@ function FeedbackLine({ feedback }: { readonly feedback: Feedback | null | undef
     <p className={styles['feedback']} data-tone={feedback.tone} role={feedback.tone === 'danger' ? 'alert' : 'status'}>
       {feedback.text}
     </p>
+  );
+}
+
+/**
+ * "Qoidalar zaxirasi": what the app's backup holds, "Zaxiradan tiklash" (the
+ * import preview, then "Almashtirish") and "Zaxirani o'chirish" (after a question).
+ */
+function BackupCard(props: SettingsPanelProps & { readonly i18n: I18n; readonly connected: boolean }): ReactElement {
+  const { i18n, busy } = props;
+  const words = i18n.t.backup.settings;
+  const backup = props.backup ?? INITIAL_BACKUP_VIEW;
+  const restore = props.restore ?? INITIAL_TRANSFER_UI;
+  const info = backup.info;
+  const now = props.now ?? Date.now();
+  const preview = restore.preview;
+  const removing = busy.has('backup');
+  return (
+    <section className={styles['card']} aria-labelledby="settings-backup">
+      <h2 id="settings-backup" className={styles['cardTitle']}>
+        {words.title}
+      </h2>
+      <p className={styles['hint']}>{words.hint}</p>
+      <p className={styles['status']} role="status">
+        {backup.phase === 'loading' ? words.loading : info === null ? words.none : words.summary(info.ruleCount, i18n.formatTime(info.savedAt, now))}
+      </p>
+      {info !== null && !props.connected ? <p className={styles['hint']}>{words.needsHelper}</p> : null}
+      {preview !== null ? (
+        <div
+          key={preview.token}
+          className={styles['confirm']}
+          role="alertdialog"
+          aria-labelledby="settings-restore-question"
+          onKeyDown={(event) => {
+            if (event.key === 'Escape') props.onCancelRestore?.();
+          }}
+        >
+          <p id="settings-restore-question" className={styles['confirmText']}>
+            {previewQuestion(preview, props.config ?? null, now, i18n)}
+          </p>
+          <div className={styles['actions']}>
+            <Button
+              variant="primary"
+              busy={restore.phase === 'applying'}
+              onClick={() => {
+                props.onConfirmRestore?.(preview.token);
+              }}
+            >
+              {i18n.t.rules.replace}
+            </Button>
+            {/* The safe choice takes the focus (WAI-ARIA alertdialog). */}
+            <Button autoFocus onClick={() => {
+              props.onCancelRestore?.();
+            }} busy={restore.phase === 'applying'}>
+              {words.cancel}
+            </Button>
+          </div>
+        </div>
+      ) : props.confirmingBackupRemoval === true ? (
+        <div
+          className={styles['confirm']}
+          role="alertdialog"
+          aria-labelledby="settings-backup-question"
+          onKeyDown={(event) => {
+            if (event.key === 'Escape' && !removing) props.onCancelRemoveBackup?.();
+          }}
+        >
+          <p id="settings-backup-question" className={styles['confirmText']}>
+            {words.removeQuestion}
+          </p>
+          <div className={styles['actions']}>
+            <Button variant="primary" onClick={() => {
+              props.onConfirmRemoveBackup?.();
+            }} busy={removing}>
+              {words.removeConfirm}
+            </Button>
+            <Button autoFocus onClick={() => {
+              props.onCancelRemoveBackup?.();
+            }} busy={removing}>
+              {words.cancel}
+            </Button>
+          </div>
+        </div>
+      ) : (
+        <div className={styles['actions']}>
+          <Button
+            variant="primary"
+            onClick={() => {
+              props.onRestoreBackup?.();
+            }}
+            disabled={info === null || info.ruleCount === 0 || !props.connected}
+            busy={restore.phase !== 'idle'}
+          >
+            {words.restore}
+          </Button>
+          <Button onClick={() => {
+              props.onAskRemoveBackup?.();
+            }} disabled={info === null}>
+            {words.remove}
+          </Button>
+        </div>
+      )}
+      <FeedbackLine feedback={restore.feedback} />
+      <FeedbackLine feedback={props.feedback.backup} />
+    </section>
   );
 }
 
@@ -230,6 +365,8 @@ export function SettingsPanel(props: SettingsPanelProps): ReactElement {
           <FeedbackLine feedback={serviceOrder.feedback} />
         </section>
 
+        <BackupCard {...props} i18n={i18n} connected={connected} />
+
         <section className={styles['card']} aria-labelledby="settings-helper">
           <h2 id="settings-helper" className={styles['cardTitle']}>
             {words.helper.title}
@@ -280,7 +417,7 @@ export function SettingsPanel(props: SettingsPanelProps): ReactElement {
 
 export interface SettingsScreenProps {
   /** The preload API; `window.rs` in the app. */
-  readonly rs?: SettingsApi & Pick<RsApi, 'getState' | 'onState' | 'setLanguage'>;
+  readonly rs?: SettingsApi & BackupApi & Pick<RsApi, 'getState' | 'onState' | 'setLanguage' | 'restoreBackup' | 'applyImport' | 'deleteBackup'>;
 }
 
 /**
@@ -305,6 +442,7 @@ export function SettingsScreen({ rs: given }: SettingsScreenProps): ReactElement
   const engine = useEngineState(rs);
   const [openAtLogin, setOpenAtLoginValue] = useState<boolean | null>(null);
   const [overrides, setOverrides] = useState<Config['ifaceOverrides'] | null | undefined>(undefined);
+  const [currentConfig, setCurrentConfig] = useState<Config | null>(null);
   const [serviceOrder, setServiceOrder] = useState<ServiceOrderView>({ phase: 'loading', order: null, feedback: null });
   const [busy, setBusy] = useState<ReadonlySet<SettingsSection>>(new Set());
   const [confirmingUninstall, setConfirmingUninstall] = useState(false);
@@ -348,12 +486,14 @@ export function SettingsScreen({ rs: given }: SettingsScreenProps): ReactElement
   useEffect(() => {
     if (configRevision === null) {
       setOverrides(undefined);
+      setCurrentConfig(null);
       return undefined;
     }
     let live = true;
     void rs.getConfig().then((result) => {
       if (!live) return;
       setOverrides(result.ok ? (result.value.ifaceOverrides ?? null) : undefined);
+      setCurrentConfig(result.ok ? result.value : null);
     });
     return () => {
       live = false;
@@ -374,9 +514,57 @@ export function SettingsScreen({ rs: given }: SettingsScreenProps): ReactElement
     orderReader.current?.refresh();
   }, []);
 
+  // The rules backup (TASK-DELTA-16): read on every connection and config revision, and when the window is shown.
+  const backup = useBackup(rs, backupKey(engine));
+  const [confirmingBackupRemoval, setConfirmingBackupRemoval] = useState(false);
+  const [restore, setRestore] = useState<TransferUiState>(INITIAL_TRANSFER_UI);
+  const latestRestore = useRef(restore);
+  latestRestore.current = restore;
+  const updateRestore = useCallback((change: (state: TransferUiState) => TransferUiState) => {
+    latestRestore.current = change(latestRestore.current);
+    setRestore(latestRestore.current);
+  }, []);
+  const [now, setNow] = useState(() => Date.now());
+  useEffect(() => {
+    setNow(Date.now());
+  }, [backup.view]);
+
   return (
     <SettingsPanel
       engine={engine}
+      backup={backup.view}
+      config={currentConfig}
+      now={now}
+      restore={restore}
+      confirmingBackupRemoval={confirmingBackupRemoval}
+      onRestoreBackup={() => {
+        const info = backup.view.info;
+        if (info === null) return;
+        setConfirmingBackupRemoval(false);
+        void startRestore(rs, info.savedAt, updateRestore, () => latestRestore.current, () => i18nRef.current);
+      }}
+      onConfirmRestore={(token) => {
+        void confirmPreview(rs, token, updateRestore, () => latestRestore.current, () => i18nRef.current);
+      }}
+      onCancelRestore={() => {
+        cancelPreview(updateRestore);
+      }}
+      onAskRemoveBackup={() => {
+        updateRestore((state) => (state.preview === null || state.phase === 'applying' ? state : { ...state, preview: null }));
+        setConfirmingBackupRemoval(true);
+      }}
+      onCancelRemoveBackup={() => {
+        setConfirmingBackupRemoval(false);
+      }}
+      onConfirmRemoveBackup={() => {
+        mark('backup', true);
+        void removeBackup(rs, i18n).then((line) => {
+          say('backup', line);
+          setConfirmingBackupRemoval(false);
+          mark('backup', false);
+          backup.reload();
+        });
+      }}
       i18n={i18n}
       language={i18n.locale}
       languageHint={i18n.t.settingsLanguage.hint}

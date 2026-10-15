@@ -42,9 +42,9 @@ export const settingsUz = {
   },
   helper: {
     title: 'Helper',
-    hint: "O'chirish administrator parolini so'raydi: helper qo'shgan barcha route'lar va resolver fayllari olib tashlanadi, root daemon to'xtaydi va uning fayllari — config (qoidalar) va log ham — o'chadi. Qoidalar kerak bo'lsa, avval Export qiling.",
+    hint: "O'chirish administrator parolini so'raydi: helper qo'shgan barcha route'lar va resolver fayllari olib tashlanadi, root daemon to'xtaydi va uning fayllari — config (qoidalar) va log ham — o'chadi. Qoidalaringiz nusxasi ilovaning zaxirasida qoladi va helper qayta o'rnatilgach tiklashni taklif qiladi; boshqa kompyuterga o'tkazish uchun Export qiling.",
     uninstall: "Helper'ni o'chirish",
-    question: "Helper rostdan ham o'chirilsinmi?",
+    question: "Helper rostdan ham o'chirilsinmi? Qoidalar ilova zaxirasida qoladi — qayta o'rnatgandan keyin tiklashingiz mumkin.",
     confirm: "Ha, o'chirish",
     cancel: 'Bekor qilish',
   },

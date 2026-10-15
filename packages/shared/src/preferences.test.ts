@@ -18,6 +18,15 @@ describe('Preferences', () => {
     expect(Preferences.parse({ language: 'ru', notifications: true })).toEqual({ language: 'ru' });
   });
 
+  it('keeps the dismissed backup time, and reads a broken one as none', () => {
+    expect(Preferences.parse({ language: 'en', dismissedBackupAt: '2026-10-15T08:30:00.000Z' })).toEqual({
+      language: 'en',
+      dismissedBackupAt: '2026-10-15T08:30:00.000Z',
+    });
+    expect(Preferences.parse({ language: 'en', dismissedBackupAt: 'soon' })).toEqual({ language: 'en' });
+    expect(Preferences.parse({ language: 'en', dismissedBackupAt: 7 })).toEqual({ language: 'en' });
+  });
+
   it.each([[{}], [{ language: 'de' }], [null], [['ru']], ['ru']])('refuses %j', (value) => {
     expect(Preferences.safeParse(value).success).toBe(false);
   });

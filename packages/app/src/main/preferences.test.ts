@@ -200,3 +200,45 @@ describe('writing: atomic, private, last choice wins', () => {
     await expect(stat(target)).rejects.toThrow();
   });
 });
+
+describe('the dismissed rules backup (TASK-DELTA-16)', () => {
+  const SAVED_AT = '2026-10-15T08:30:00.000Z';
+
+  it('is none without a file, and read back from one', async () => {
+    expect(await store().preferences.dismissedBackupAt()).toBeNull();
+    await writeFile(file, JSON.stringify({ language: 'en', dismissedBackupAt: SAVED_AT }));
+    const { preferences } = store();
+    expect(await preferences.dismissedBackupAt()).toBe(SAVED_AT);
+    expect(await preferences.language()).toBe('en');
+  });
+
+  it('a broken value reads as none and does not cost the language', async () => {
+    await writeFile(file, JSON.stringify({ language: 'en', dismissedBackupAt: 'later' }));
+    const { preferences } = store();
+    expect(await preferences.dismissedBackupAt()).toBeNull();
+    expect(await preferences.language()).toBe('en');
+  });
+
+  it('is stored next to the language; a later language change keeps it', async () => {
+    await writeFile(file, JSON.stringify({ language: 'en' }));
+    const { preferences, entries } = store();
+    await preferences.setDismissedBackupAt(SAVED_AT);
+    expect(JSON.parse(await readFile(file, 'utf8'))).toEqual({ language: 'en', dismissedBackupAt: SAVED_AT });
+    await preferences.setLanguage('ru');
+    expect(JSON.parse(await readFile(file, 'utf8'))).toEqual({ language: 'ru', dismissedBackupAt: SAVED_AT });
+    expect((await stat(file)).mode & 0o777).toBe(PREFERENCES_FILE_MODE);
+    expect(entries.some((entry) => entry.msg === 'Rules backup offer dismissed')).toBe(true);
+    expect(await store().preferences.dismissedBackupAt()).toBe(SAVED_AT);
+  });
+
+  it('a file that cannot be written: the value holds for this run, the failure is logged', async () => {
+    const failing: PreferencesFileSystem = {
+      ...nodePreferencesFileSystem,
+      rename: () => Promise.reject(Object.assign(new Error('no'), { code: 'EACCES' })),
+    };
+    const { preferences, entries } = store({ fs: failing });
+    await preferences.setDismissedBackupAt(SAVED_AT);
+    expect(await preferences.dismissedBackupAt()).toBe(SAVED_AT);
+    expect(entries.some((entry) => entry.level === 'error')).toBe(true);
+  });
+});

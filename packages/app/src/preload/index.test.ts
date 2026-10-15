@@ -54,6 +54,10 @@ const INVOKES = [
   ['removeHelper', [], 'rs:removeHelper'],
   ['getLanguage', [], 'rs:getLanguage'],
   ['setLanguage', ['ru'], 'rs:setLanguage'],
+  ['getBackup', [], 'rs:getBackup'],
+  ['restoreBackup', [], 'rs:restoreBackup'],
+  ['deleteBackup', [], 'rs:deleteBackup'],
+  ['dismissBackup', [], 'rs:dismissBackup'],
 ] as const;
 
 describe('preload', () => {

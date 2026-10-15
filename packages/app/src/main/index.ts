@@ -18,6 +18,7 @@ import { createHelperClient } from './helperClient';
 import { createInstaller, HELPER_RESOURCES_DIR, runWithExecFile } from './installer';
 import { createJsonLinesSink, createLogger } from './logger';
 import { createPreferences } from './preferences';
+import { createRulesBackup } from './rulesBackup';
 import { createSettings, listServiceOrderWithNetworksetup } from './settings';
 import { loadTrayImage, startShell } from './tray';
 
@@ -57,6 +58,14 @@ startApp({
       preferredLanguages: () => app.getPreferredSystemLanguages(),
       logger,
     });
+    // The last config the helper reported, per user (0600): offered back after a
+    // reinstall with an empty config, only through the import preview (TASK-DELTA-16).
+    const rulesBackup = createRulesBackup({
+      dir: app.getPath('userData'),
+      uid: process.getuid?.() ?? -1,
+      helperClient,
+      logger,
+    });
     /** The words of the main process in the current UI language. */
     const words = async (): Promise<Messages> => i18nFor(await preferences.language()).t;
     return startShell(
@@ -78,6 +87,7 @@ startApp({
           app.quit();
         },
         preferences,
+        rulesBackup,
         settings: createSettings({
           loginItem: {
             get: () => app.getLoginItemSettings().openAtLogin,

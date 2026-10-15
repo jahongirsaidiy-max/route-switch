@@ -408,11 +408,14 @@ function shellHarness(options: { language?: Promise<Locale> } = {}) {
       preferences: {
         language: () => options.language ?? Promise.resolve('uz'),
         setLanguage: (language) => Promise.resolve(language),
+        dismissedBackupAt: () => Promise.resolve(null),
+        setDismissedBackupAt: () => Promise.resolve(),
         onLanguage: (listener) => {
           languageListeners.add(listener);
           return () => languageListeners.delete(listener);
         },
       },
+      rulesBackup: { read: () => Promise.resolve(null), remove: () => Promise.resolve(true) },
       configDialogs: { chooseImportFile: () => Promise.resolve(null), chooseExportFile: () => Promise.resolve(null) },
       installer: {
         install: () => Promise.reject(new Error('not used')),

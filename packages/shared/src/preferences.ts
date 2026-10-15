@@ -21,5 +21,11 @@ export const MAX_PREFERENCES_FILE_BYTES = 64 * 1024;
  */
 export const Preferences = z.object({
   language: Language,
+  /**
+   * The `savedAt` of the rules backup whose restore offer the user turned
+   * down (TASK-DELTA-16): that backup is not offered again; a newer one is.
+   * A broken value reads as none, so it never costs the language.
+   */
+  dismissedBackupAt: z.iso.datetime({ precision: 3 }).optional().catch(undefined),
 });
 export type Preferences = z.infer<typeof Preferences>;

@@ -44,6 +44,7 @@ import type { Installer } from './installer';
 import { createLogBuffer, type LogBuffer } from './logBuffer';
 import type { Logger } from './logger';
 import type { PreferencesStore } from './preferences';
+import type { RulesBackupStore } from './rulesBackup';
 import { isAllowedNavigation } from './security';
 import type { Settings } from './settings';
 
@@ -82,6 +83,10 @@ export const INVOKE_CHANNELS = [
   'rs:removeHelper',
   'rs:getLanguage',
   'rs:setLanguage',
+  'rs:getBackup',
+  'rs:restoreBackup',
+  'rs:deleteBackup',
+  'rs:dismissBackup',
 ] as const satisfies readonly RsInvokeChannel[];
 
 /** What "Bo'sh config bilan boshlash" stores in place of a config the helper cannot load. */
@@ -124,7 +129,9 @@ export interface IpcDeps {
   /** The login item and the network service order (settings screen). */
   readonly settings: Settings;
   /** The UI language, kept in `userData/preferences.json`; every change is pushed to the windows as `rs:language`. */
-  readonly preferences: Pick<PreferencesStore, 'language' | 'setLanguage' | 'onLanguage'>;
+  readonly preferences: Pick<PreferencesStore, 'language' | 'setLanguage' | 'onLanguage' | 'dismissedBackupAt' | 'setDismissedBackupAt'>;
+  /** The app's copy of the last config it saw (`userData/rules-backup.json`, TASK-DELTA-16). */
+  readonly backup: Pick<RulesBackupStore, 'read' | 'remove'>;
   /** Runs the app's own install / uninstall script as root after the system password dialog (`installer.ts`). */
   readonly installer: Installer;
   /** Opens the rules window or brings it to the front (`WindowManager.openRules`). Main process only, no helper call. */
@@ -233,6 +240,10 @@ const ARGUMENTS = {
   'rs:removeHelper': argumentsOf(),
   'rs:getLanguage': argumentsOf(),
   'rs:setLanguage': argumentsOf(LanguageArgument),
+  'rs:getBackup': argumentsOf(),
+  'rs:restoreBackup': argumentsOf(),
+  'rs:deleteBackup': argumentsOf(),
+  'rs:dismissBackup': argumentsOf(),
 } as const satisfies Readonly<Record<RsInvokeChannel, ArgsParser<readonly unknown[]>>>;
 
 type ParsedArgs<C extends RsInvokeChannel> = (typeof ARGUMENTS)[C] extends ArgsParser<infer A> ? A : never;
@@ -334,6 +345,29 @@ export function registerIpcHandlers(deps: IpcDeps): IpcRegistration {
       if (saved.ok) changeLog.info('Config imported', { channel: 'rs:applyImport', rules: waiting.config.rules.length });
       return saved;
     });
+
+  // -- the rules backup (TASK-DELTA-16) ---------------------------------------
+  // A restore is an import whose file is the app's own backup: the same
+  // preview, the same one-use token, the same `applyImport`. Nothing reaches
+  // the helper before the user's "Almashtirish".
+  const backupLog = logger.limited('ipc-rules-backup');
+
+  const restoreBackup = async (): Promise<RsResult<RsInvokeChannels['rs:restoreBackup']['value']>> => {
+    const backup = await deps.backup.read();
+    if (backup === null) return failure('no-backup', 'The app holds no rules backup');
+    // Checked when it was read; checked again here, as for a file, before it can be sent.
+    const violation = findStructureViolation(backup.config);
+    const parsed = violation === null ? ConfigSchema.safeParse(backup.config) : null;
+    if (parsed === null || !parsed.success) {
+      pendingImport = null;
+      backupLog.warn('Refused the rules backup', { channel: 'rs:restoreBackup' });
+      return failure('invalid-config', 'The rules backup does not hold a valid config');
+    }
+    const token = newToken();
+    pendingImport = { token, config: parsed.data, at: now() };
+    backupLog.info('Rules backup read for restore', { channel: 'rs:restoreBackup', rules: parsed.data.rules.length, savedAt: backup.savedAt });
+    return { ok: true, value: { token, config: parsed.data } };
+  };
 
   const exportConfig = () =>
     withDialog(async (): Promise<RsResult<RsInvokeChannels['rs:export']['value']>> => {
@@ -468,6 +502,25 @@ export function registerIpcHandlers(deps: IpcDeps): IpcRegistration {
     // The app's own preference: no helper round trip, and it works while the helper is away.
     'rs:getLanguage': async () => ({ ok: true, value: await preferences.language() }),
     'rs:setLanguage': async ([language]) => ({ ok: true, value: await preferences.setLanguage(language) }),
+    // The app's own file: answered without the helper. The page learns how many rules, not which.
+    'rs:getBackup': async () => {
+      const backup = await deps.backup.read();
+      if (backup === null) return { ok: true, value: null };
+      const dismissed = (await preferences.dismissedBackupAt()) === backup.savedAt;
+      return { ok: true, value: { savedAt: backup.savedAt, ruleCount: backup.config.rules.length, dismissed } };
+    },
+    'rs:restoreBackup': () => restoreBackup(),
+    'rs:deleteBackup': async () => {
+      const removed = await deps.backup.remove();
+      backupLog.info('Rules backup removal requested', { channel: 'rs:deleteBackup', ok: removed });
+      return removed ? { ok: true, value: null } : failure('write-failed', 'The rules backup could not be removed');
+    },
+    // Only the backup on disk now can be turned down: the page names none.
+    'rs:dismissBackup': async () => {
+      const backup = await deps.backup.read();
+      if (backup !== null) await preferences.setDismissedBackupAt(backup.savedAt);
+      return { ok: true, value: null };
+    },
   };
 
   const register = (channel: RsInvokeChannel): void => {

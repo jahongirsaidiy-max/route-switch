@@ -19,6 +19,7 @@ import { shellUz } from './sections/shell.uz';
 import { componentsUz } from './sections/components.uz';
 import { logUz } from './sections/log.uz';
 import { settingsUz } from './sections/settings.uz';
+import { backupUz } from './sections/backup.uz';
 
 /** What the UI shows about the helper: the connection kinds plus the renderer's own two. */
 export type HelperStatusKey = RsConnection['kind'] | 'loading' | 'unavailable';
@@ -72,6 +73,7 @@ export const uz = {
     'file-not-json': 'Fayl JSON emas yoki buzilgan.',
     'import-expired': "Tanlangan fayl muddati o'tdi — faylni qayta tanlang.",
     'write-failed': "Faylni yozib bo'lmadi — boshqa joyni tanlang.",
+    'no-backup': "Ilovada qoidalar zaxirasi yo'q.",
     'install-unavailable':
       "Ilova ichida helper paketi topilmadi yoki u ishonchsiz (symlink yoki boshqa foydalanuvchi o'zgartira oladi) — ilovani qayta o'rnating.",
     'install-cancelled': "Parol oynasi yopildi — hech narsa o'zgarmadi. Qayta urinib ko'rishingiz mumkin.",
@@ -253,6 +255,8 @@ export const uz = {
   /** The journal, settings and shared components (TASK-DELTA-14): `sections/*.ts`. */
   log: logUz,
   settings: settingsUz,
+  /** The rules backup and its restore offer (TASK-DELTA-16): `sections/backup.*`. */
+  backup: backupUz,
   components: componentsUz,
 
   /** The rules window and the add-rule dialog (TASK-DELTA-13): `sections/rules.*`, `sections/addRule.*`. */

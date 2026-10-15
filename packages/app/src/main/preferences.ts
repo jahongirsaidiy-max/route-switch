@@ -1,5 +1,5 @@
-// The app's own per-user preferences (TASK-DELTA-11): for now the UI
-// language. They live in `userData/preferences.json`, never in the helper's
+// The app's own per-user preferences (TASK-DELTA-11): the UI language, and
+// the rules backup whose restore offer was turned down (TASK-DELTA-16). They live in `userData/preferences.json`, never in the helper's
 // config (the helper runs as root for every user of the Mac).
 //
 // Reading never fails: a missing, unreadable, oversized or malformed file —
@@ -65,10 +65,14 @@ export interface PreferencesStore {
   readonly setLanguage: (language: Language) => Promise<Language>;
   /** Called with every new language. Returns the unsubscribe. */
   readonly onLanguage: (listener: (language: Language) => void) => () => void;
+  /** The `savedAt` of the rules backup whose restore offer was turned down (TASK-DELTA-16); null when none. Never rejects. */
+  readonly dismissedBackupAt: () => Promise<string | null>;
+  /** Stores it (the language is kept). A failed write is logged; the value holds for this run. Never rejects. */
+  readonly setDismissedBackupAt: (savedAt: string) => Promise<void>;
 }
 
 type ReadOutcome =
-  | { readonly kind: 'ok'; readonly language: Language }
+  | { readonly kind: 'ok'; readonly language: Language; readonly dismissedBackupAt: string | null }
   | { readonly kind: 'missing' }
   | { readonly kind: 'refused'; readonly why: string };
 
@@ -113,7 +117,7 @@ export async function readPreferencesFile(file: string, fs: PreferencesFileSyste
   }
   const parsed = Preferences.safeParse(value);
   if (!parsed.success) return { kind: 'refused', why: 'not in the expected shape' };
-  return { kind: 'ok', language: parsed.data.language };
+  return { kind: 'ok', language: parsed.data.language, dismissedBackupAt: parsed.data.dismissedBackupAt ?? null };
 }
 
 /** Writes the preferences atomically with mode 0600. Never throws. */
@@ -164,10 +168,14 @@ export function createPreferences(deps: PreferencesDeps): PreferencesStore {
   };
 
   let current: Language | null = null;
+  // Read with the language; a value set before the read finished wins.
+  let dismissed: string | null = null;
+  let dismissedSet = false;
   let loading: Promise<Language> | null = null;
   const load = (): Promise<Language> => {
     loading ??= readPreferencesFile(file, fs).then(
       (outcome) => {
+        if (outcome.kind === 'ok' && !dismissedSet) dismissed = outcome.dismissedBackupAt;
         // A `setLanguage` that finished first wins over what the file said.
         if (current !== null) return current;
         if (outcome.kind === 'ok') {
@@ -191,6 +199,16 @@ export function createPreferences(deps: PreferencesDeps): PreferencesStore {
 
   // Writes run one at a time, in order: the last choice is the one on disk.
   let writes: Promise<unknown> = Promise.resolve();
+  /** Writes what holds now (every field), after the writes before it. */
+  const save = async (): Promise<boolean> => {
+    const language = current ?? (await load());
+    const preferences: Preferences = dismissed === null ? { language } : { language, dismissedBackupAt: dismissed };
+    const write = writes.then(() => writePreferencesFile(file, preferences, fs, newId));
+    writes = write.catch(() => undefined);
+    const written = await write;
+    if (!written.ok) logger.error('Could not save the preferences; the change holds until the app quits', { detail: written.error });
+    return written.ok;
+  };
 
   return {
     // The read happens once; afterwards the answer is whatever was set last.
@@ -212,10 +230,7 @@ export function createPreferences(deps: PreferencesDeps): PreferencesStore {
           }
         }
       }
-      const write = writes.then(() => writePreferencesFile(file, { language }, fs, newId));
-      writes = write.catch(() => undefined);
-      const written = await write;
-      if (!written.ok) logger.error('Could not save the preferences; the language holds until the app quits', { detail: written.error });
+      await save();
       return language;
     },
     onLanguage: (listener) => {
@@ -223,6 +238,17 @@ export function createPreferences(deps: PreferencesDeps): PreferencesStore {
       return () => {
         listeners.delete(listener);
       };
+    },
+    dismissedBackupAt: async () => {
+      await load();
+      return dismissed;
+    },
+    setDismissedBackupAt: async (savedAt) => {
+      dismissed = savedAt;
+      dismissedSet = true;
+      await load();
+      logger.info('Rules backup offer dismissed', { savedAt });
+      await save();
     },
   };
 }

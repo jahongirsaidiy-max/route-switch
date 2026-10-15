@@ -1,4 +1,4 @@
-import { LIMITS, type Config, type EngineState, type Language, type RuleInput } from '@routeswitch/shared';
+import { LIMITS, type Config, type EngineState, type Language, type RuleInput, type RulesBackupFile } from '@routeswitch/shared';
 import { mkdtemp, readdir, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
@@ -35,6 +35,7 @@ import {
 import type { HelperSetupResult, Installer } from './installer';
 import { createLogBuffer, type LogBuffer } from './logBuffer';
 import type { PreferencesStore } from './preferences';
+import type { RulesBackupStore } from './rulesBackup';
 import { APP_ENTRY_URL } from './runtime';
 import { createSettings, type Settings } from './settings';
 
@@ -189,6 +190,7 @@ const unusedSettings = (logger: Parameters<typeof createSettings>[0]['logger']):
 /** An in-memory language store, like `createPreferences` without the file. */
 function memoryPreferences(initial: Language = 'uz') {
   let current = initial;
+  let dismissed: string | null = null;
   const listeners = new Set<(language: Language) => void>();
   const store = {
     language: vi.fn(() => Promise.resolve(current)),
@@ -204,6 +206,11 @@ function memoryPreferences(initial: Language = 'uz') {
         listeners.delete(listener);
       };
     },
+    dismissedBackupAt: vi.fn(() => Promise.resolve(dismissed)),
+    setDismissedBackupAt: vi.fn((savedAt: string) => {
+      dismissed = savedAt;
+      return Promise.resolve();
+    }),
   } satisfies PreferencesStore;
   return { store, listeners };
 }
@@ -223,6 +230,20 @@ interface SetupOptions {
   readonly brokenConfig?: boolean;
   readonly installer?: Installer;
   readonly preferences?: PreferencesStore;
+  readonly backup?: Pick<RulesBackupStore, 'read' | 'remove'>;
+}
+
+/** A backup store in memory (TASK-DELTA-16). */
+function memoryBackup(initial: RulesBackupFile | null = null, removable = true) {
+  let current = initial;
+  const store = {
+    read: vi.fn(() => Promise.resolve(current)),
+    remove: vi.fn(() => {
+      if (removable) current = null;
+      return Promise.resolve(removable);
+    }),
+  } satisfies Pick<RulesBackupStore, 'read' | 'remove'>;
+  return store;
 }
 
 /** An installer that must not be reached. */
@@ -269,6 +290,7 @@ async function setup(options: SetupOptions = {}) {
     ...(options.logBuffer === undefined ? {} : { logBuffer: options.logBuffer }),
     settings: options.settings ?? unusedSettings(logger),
     preferences: options.preferences ?? memoryPreferences().store,
+    backup: options.backup ?? memoryBackup(),
     openRulesWindow: options.openRulesWindow ?? (() => undefined),
     configDialogs: options.configDialogs ?? CANCELLED_DIALOGS,
     installer: options.installer ?? UNUSED_INSTALLER,
@@ -322,10 +344,10 @@ const newRule = (extra: Partial<RuleInput> = {}): RuleInput => ({
 // ---------------------------------------------------------------------------
 
 describe('registration', () => {
-  it('handles exactly the twenty-five invoke channels of the renderer API', async () => {
+  it('handles exactly the twenty-nine invoke channels of the renderer API', async () => {
     const h = await setup({ connect: false });
     expect([...h.ipcMain.handlers.keys()].sort()).toEqual([...INVOKE_CHANNELS].sort());
-    expect(INVOKE_CHANNELS).toHaveLength(25);
+    expect(INVOKE_CHANNELS).toHaveLength(29);
   });
 
   it('dispose removes every handler and stops the state pushes; a second dispose does nothing', async () => {
@@ -336,7 +358,7 @@ describe('registration', () => {
     h.registration.dispose();
     h.registration.dispose();
     expect(h.ipcMain.handlers.size).toBe(0);
-    expect(h.ipcMain.removeHandler).toHaveBeenCalledTimes(25);
+    expect(h.ipcMain.removeHandler).toHaveBeenCalledTimes(29);
     h.sockets[0]?.emit('connect');
     for (let i = 0; i < 6; i += 1) await flush();
     expect(sent).toEqual([]);
@@ -940,6 +962,7 @@ describe('rs:state', () => {
       logger,
       settings: unusedSettings(logger),
       preferences: memoryPreferences().store,
+      backup: memoryBackup(),
       openRulesWindow: () => undefined,
       configDialogs: CANCELLED_DIALOGS,
       listRecipients: () => {
@@ -1426,7 +1449,7 @@ describe('rs:openRulesWindow (main process only)', () => {
 });
 
 describe('the preload against the main process (window.rs)', () => {
-  it('exposes exactly the twenty-eight methods of the renderer API (twenty-five calls, three subscriptions), each wired to a handled channel', async () => {
+  it('exposes exactly the thirty-two methods of the renderer API (twenty-nine calls, three subscriptions), each wired to a handled channel', async () => {
     const openRulesWindow = vi.fn();
     const h = await setup({ settings: fakeSettings().settings, openRulesWindow });
     bridge.setInvokeTarget((channel, ...args) => {
@@ -1441,8 +1464,11 @@ describe('the preload against the main process (window.rs)', () => {
         'apply',
         'applyImport',
         'copyServiceOrderCommand',
+        'deleteBackup',
         'deleteRule',
+        'dismissBackup',
         'exportConfig',
+        'getBackup',
         'getConfig',
         'getLanguage',
         'getLog',
@@ -1458,6 +1484,7 @@ describe('the preload against the main process (window.rs)', () => {
         'reconnectHelper',
         'removeHelper',
         'resetConfig',
+        'restoreBackup',
         'saveRule',
         'setEnabled',
         'setIfaceOverrides',
@@ -1688,5 +1715,81 @@ describe('language: rs:getLanguage, rs:setLanguage and the rs:language push', ()
     expect(listeners.size).toBe(1);
     h.registration.dispose();
     expect(listeners.size).toBe(0);
+  });
+});
+
+describe('rules backup: rs:getBackup, rs:restoreBackup, rs:deleteBackup, rs:dismissBackup (TASK-DELTA-16)', () => {
+  const EMPTY: Config = { version: 1, enabled: true, rules: [] };
+  const SAVED_AT = '2026-10-15T08:30:00.000Z';
+  const backupOf = (config: Config = oneRuleConfig()): RulesBackupFile => ({ version: 1, savedAt: SAVED_AT, configRevision: 3, config });
+
+  it('getBackup tells when and how many rules — not which — and works without the helper', async () => {
+    const h = await setup({ connect: false, backup: memoryBackup(backupOf()) });
+    expect(valueOf(await h.call('rs:getBackup'))).toEqual({ savedAt: SAVED_AT, ruleCount: 1, dismissed: false });
+    const none = await setup({ connect: false });
+    expect(valueOf(await none.call('rs:getBackup'))).toBeNull();
+  });
+
+  it('restore returns the backup as an import preview; nothing reaches the helper until applyImport (no setConfig without consent)', async () => {
+    const h = await setup({ config: EMPTY, backup: memoryBackup(backupOf()) });
+    const preview = valueOf(await h.call('rs:restoreBackup')) as { token: string; config: Config };
+    expect(preview.config).toEqual(oneRuleConfig());
+    // Asked, read and shown: still no setConfig.
+    await h.call('rs:getBackup');
+    expect(h.sentAfterHandshake()).toEqual([]);
+    expect(h.helper.config).toEqual(EMPTY);
+
+    expect(valueOf(await h.call('rs:applyImport', preview.token))).toMatchObject({ config: oneRuleConfig() });
+    expect(h.sentAfterHandshake()).toEqual(['setConfig']);
+    expect(h.helper.config).toEqual(oneRuleConfig());
+    // One use, like an import.
+    expect(await h.call('rs:applyImport', preview.token)).toMatchObject({ ok: false, code: 'import-expired' });
+    expect(h.sentAfterHandshake()).toEqual(['setConfig']);
+  });
+
+  it('a restore token expires after 10 minutes like an import', async () => {
+    let clock = 1_000_000;
+    const h = await setup({ config: EMPTY, backup: memoryBackup(backupOf()), now: () => clock });
+    const preview = valueOf(await h.call('rs:restoreBackup')) as { token: string };
+    clock += IMPORT_TTL_MS + 1;
+    expect(await h.call('rs:applyImport', preview.token)).toMatchObject({ ok: false, code: 'import-expired' });
+    expect(h.sentAfterHandshake()).toEqual([]);
+  });
+
+  it('without a backup the restore is refused no-backup; a backup that fails the schema is refused invalid-config', async () => {
+    const none = await setup({ config: EMPTY });
+    expect(await none.call('rs:restoreBackup')).toMatchObject({ ok: false, code: 'no-backup' });
+    const broken = { ...backupOf(), config: { version: 1, enabled: true, rules: [{ ...oneRuleConfig().rules[0], target: '0.0.0.0/0' }] } } as unknown as RulesBackupFile;
+    const h = await setup({ config: EMPTY, backup: memoryBackup(broken) });
+    expect(await h.call('rs:restoreBackup')).toMatchObject({ ok: false, code: 'invalid-config' });
+    expect(h.sentAfterHandshake()).toEqual([]);
+  });
+
+  it('dismissBackup turns down exactly the backup on disk; deleteBackup removes it', async () => {
+    const preferences = memoryPreferences();
+    const backup = memoryBackup(backupOf());
+    const h = await setup({ connect: false, preferences: preferences.store, backup });
+    expect(valueOf(await h.call('rs:dismissBackup'))).toBeNull();
+    expect(preferences.store.setDismissedBackupAt).toHaveBeenCalledWith(SAVED_AT);
+    expect(valueOf(await h.call('rs:getBackup'))).toEqual({ savedAt: SAVED_AT, ruleCount: 1, dismissed: true });
+    expect(valueOf(await h.call('rs:deleteBackup'))).toBeNull();
+    expect(valueOf(await h.call('rs:getBackup'))).toBeNull();
+    // Nothing on disk: nothing to turn down.
+    expect(valueOf(await h.call('rs:dismissBackup'))).toBeNull();
+    expect(preferences.store.setDismissedBackupAt).toHaveBeenCalledTimes(1);
+  });
+
+  it('a backup that cannot be removed is answered write-failed', async () => {
+    const h = await setup({ connect: false, backup: memoryBackup(backupOf(), false) });
+    expect(await h.call('rs:deleteBackup')).toMatchObject({ ok: false, code: 'write-failed' });
+  });
+
+  it.each(['rs:getBackup', 'rs:restoreBackup', 'rs:deleteBackup', 'rs:dismissBackup'])('%s takes no arguments and answers only the app page', async (channel) => {
+    const backup = memoryBackup(backupOf());
+    const h = await setup({ connect: false, backup });
+    expect(await h.call(channel, '../etc/passwd')).toMatchObject({ ok: false, code: 'invalid-input' });
+    expect(await h.callAs({ senderFrame: { url: 'https://example.com/', parent: null } }, channel)).toMatchObject({ ok: false, code: 'forbidden' });
+    expect(backup.read).not.toHaveBeenCalled();
+    expect(backup.remove).not.toHaveBeenCalled();
   });
 });

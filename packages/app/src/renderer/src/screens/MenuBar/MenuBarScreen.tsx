@@ -29,6 +29,7 @@ import { browserShowSignal, readOnShow, type ShowSignal, type ShownReader } from
 import type { RsApi, RsServiceOrder } from '../../rs';
 import { errorText, helperNotice, loadingNotice, networkWarnings, UZ, type Feedback } from '../../text';
 import { installHelper } from '../Install';
+import { backupKey, backupOffer, useBackup, type BackupApi } from '../Rules/recovery';
 import { openRules, reapply, setRouting, type MenuBarApi } from './actions';
 import styles from './MenuBarScreen.module.css';
 import { defaultRole, interfacesKey, menuRules, statusLine, type MenuRule, type StatusLine } from './model';
@@ -52,6 +53,12 @@ export interface MenuBarPanelProps {
   readonly onReconnect: () => void;
   /** "Helper'ni (qayta) o'rnatish" of the helper notice (TASK-214). */
   readonly onInstall: () => void;
+  /**
+   * The rules backup's restore offer (TASK-DELTA-16): the helper holds no
+   * rules, the app's backup does. Its button opens the rules window, where
+   * the preview and the confirmation are.
+   */
+  readonly backupOffer?: { readonly count: number; readonly savedAt: string } | null;
   /** The language of the window (`useI18n()`); Uzbek without it. */
   readonly i18n?: I18n;
 }
@@ -236,6 +243,20 @@ export function MenuBarPanel(props: MenuBarPanelProps): ReactElement {
               <InterfaceCard role="wifi" iface={state.interfaces.wifi} isDefault={preferred === 'wifi'} i18n={i18n} />
               <InterfaceCard role="ethernet" iface={state.interfaces.ethernet} isDefault={preferred === 'ethernet'} i18n={i18n} />
             </section>
+            {props.backupOffer === null || props.backupOffer === undefined ? null : (
+              <div className={styles['warnings']}>
+                <Banner
+                  tone="warning"
+                  size="compact"
+                  title={i18n.t.backup.offerTitle(props.backupOffer.count)}
+                  text={i18n.t.backup.offerText(i18n.formatTime(props.backupOffer.savedAt, props.now))}
+                >
+                  <Button variant="primary" onClick={props.onOpenRules} busy={busy.has('rules')}>
+                    {i18n.t.backup.openRules}
+                  </Button>
+                </Banner>
+              </div>
+            )}
             <Warnings engine={engine} config={props.config} i18n={i18n} />
             <RulesSection config={props.config} engine={engine} now={props.now} onReloadConfig={props.onReloadConfig} i18n={i18n} />
             <StatusRow line={statusLine(state, props.now, i18n)} />
@@ -279,7 +300,7 @@ export function followServiceOrder(
 
 export interface MenuBarScreenProps {
   /** The preload API; `window.rs` in the app. */
-  readonly rs?: MenuBarApi & Pick<RsApi, 'getState' | 'onState' | 'getConfig' | 'getServiceOrder' | 'reconnectHelper' | 'installHelper'>;
+  readonly rs?: MenuBarApi & BackupApi & Pick<RsApi, 'getState' | 'onState' | 'getConfig' | 'getServiceOrder' | 'reconnectHelper' | 'installHelper'>;
 }
 
 /** The screen of the menu bar window (`?view=popover`). */
@@ -288,6 +309,8 @@ export function MenuBarScreen({ rs: given }: MenuBarScreenProps): ReactElement {
   const i18n = useI18n();
   const engine = useEngineState(rs);
   const config = useConfig(rs);
+  // The rules backup (TASK-DELTA-16): read on every connection and config revision, and when the popover is shown.
+  const backup = useBackup(rs, backupKey(engine));
   // Ticks, and refreshes when the popover is shown again (it is hidden, not closed).
   const now = useNow();
   const [serviceOrder, setServiceOrder] = useState<RsServiceOrder | null>(null);
@@ -339,6 +362,7 @@ export function MenuBarScreen({ rs: given }: MenuBarScreenProps): ReactElement {
       busy={busy}
       feedback={feedback}
       i18n={i18n}
+      backupOffer={backupOffer(engine, config.config, backup.view)}
       onToggle={(next) => {
         run('enabled', () => setRouting(rs, next, i18n));
       }}

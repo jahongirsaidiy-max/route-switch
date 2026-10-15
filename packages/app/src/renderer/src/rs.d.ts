@@ -125,7 +125,8 @@ export type RsIfaceOverrides = Partial<Record<IfaceRole, string>>;
  * - `import-expired` — `applyImport`: the token is unknown, used or older than
  *   10 minutes (choose the file again); nothing was sent;
  * - `write-failed`   — `exportConfig`: the file could not be written; the chosen
- *   path is left as it was;
+ *   path is left as it was; `deleteBackup`: the backup could not be removed;
+ * - `no-backup`      — `restoreBackup`: the app holds no rules backup; nothing was sent;
  * - `install-unavailable` — `installHelper` / `removeHelper`: the app holds no
  *   usable helper package (not packaged, a file missing, a symbolic link, or
  *   writable by another user); nothing was run;
@@ -156,6 +157,7 @@ export type RsErrorCode =
   | 'file-not-json'
   | 'import-expired'
   | 'write-failed'
+  | 'no-backup'
   | 'install-unavailable'
   | 'install-cancelled'
   | 'install-denied'
@@ -178,6 +180,18 @@ export interface RsImportPreview {
   readonly token: string;
   /** The config as the shared schema parsed it (normalised). It replaces the stored one as a whole. */
   readonly config: Config;
+}
+
+/**
+ * The app's copy of the last config it saw (`userData/rules-backup.json`,
+ * TASK-DELTA-16), as the page may know it: no rule, only how many.
+ */
+export interface RsBackupInfo {
+  /** When the app wrote it (ISO, UTC). */
+  readonly savedAt: string;
+  readonly ruleCount: number;
+  /** The user turned down the restore offer for exactly this backup (a newer backup is offered again). */
+  readonly dismissed: boolean;
 }
 
 /** A config written by `exportConfig`. */
@@ -329,6 +343,19 @@ export interface RsApi {
    * first, then call `getLanguage`.
    */
   onLanguage(listener: (language: RsLanguage) => void): RsUnsubscribe;
+  /** The rules backup the app keeps (TASK-DELTA-16); null when there is none. Works without the helper. */
+  getBackup(): Promise<RsResult<RsBackupInfo | null>>;
+  /**
+   * Reads the backup for a restore: like `importConfig` without the dialog —
+   * the config (checked again with the shared schema) and a one-use token for
+   * `applyImport`, 10 minutes. Nothing reaches the helper before
+   * `applyImport`. `no-backup` when there is none.
+   */
+  restoreBackup(): Promise<RsResult<RsImportPreview>>;
+  /** Removes the backup. `write-failed` when the file could not be removed. */
+  deleteBackup(): Promise<RsResult<null>>;
+  /** Turns down the restore offer for the current backup (kept in the preferences). Nothing is removed. */
+  dismissBackup(): Promise<RsResult<null>>;
 }
 
 /** Channel -> arguments and value of the call behind it. Main and preload are typed against this table. */
@@ -358,6 +385,10 @@ export interface RsInvokeChannels {
   'rs:removeHelper': { readonly args: readonly []; readonly value: RsHelperSetupResult };
   'rs:getLanguage': { readonly args: readonly []; readonly value: RsLanguage };
   'rs:setLanguage': { readonly args: readonly [language: RsLanguage]; readonly value: RsLanguage };
+  'rs:getBackup': { readonly args: readonly []; readonly value: RsBackupInfo | null };
+  'rs:restoreBackup': { readonly args: readonly []; readonly value: RsImportPreview };
+  'rs:deleteBackup': { readonly args: readonly []; readonly value: null };
+  'rs:dismissBackup': { readonly args: readonly []; readonly value: null };
 }
 
 export type RsInvokeChannel = keyof RsInvokeChannels;

@@ -427,9 +427,51 @@ describe('RulesScreen', () => {
       applyImport: vi.fn(),
       exportConfig: vi.fn(),
       resetConfig: vi.fn(),
+      getBackup: vi.fn(),
+      restoreBackup: vi.fn(),
+      dismissBackup: vi.fn(),
     };
     const html = renderMarkup(createElement(RulesScreen, { rs }));
     expect(text(html)).toContain("Holat o'qilmoqda…");
     expect(rs.getConfig).not.toHaveBeenCalled();
+    expect(rs.getBackup).not.toHaveBeenCalled();
+    expect(rs.restoreBackup).not.toHaveBeenCalled();
+  });
+});
+
+describe('RulesPanel: the rules backup offer (TASK-DELTA-16)', () => {
+  const SAVED_AT = '2026-10-15T08:30:00.000Z';
+  const empty: Config = { ...CONFIG, rules: [] };
+
+  it('offers "Oldingi qoidalarni tiklash (N)" with review and dismiss', () => {
+    const html = text(render({ config: ready(empty), backupOffer: { count: 4, savedAt: SAVED_AT } }));
+    expect(html).toContain('Oldingi qoidalarni tiklash (4)');
+    expect(html).toContain("Ko'rib chiqish");
+    expect(html).toContain('Kerak emas');
+  });
+
+  it('no offer without one, and none while a preview is open (the preview names the backup)', () => {
+    expect(text(render({ config: ready(empty) }))).not.toContain('Oldingi qoidalarni tiklash');
+    const html = text(
+      render({
+        config: ready(empty),
+        backupOffer: { count: 4, savedAt: SAVED_AT },
+        transfer: { ...INITIAL_TRANSFER_UI, preview: { token: '99999999-9999-4999-8999-999999999999', config: CONFIG, source: { kind: 'backup', savedAt: SAVED_AT } } },
+      }),
+    );
+    expect(html).not.toContain('Oldingi qoidalarni tiklash');
+    expect(html).toContain('Zaxira (');
+    expect(html).toContain('Almashtirish');
+  });
+
+  it.each([
+    ['ru', 'Восстановить прежние правила (4)', 'Просмотреть'],
+    ['en', 'Restore previous rules (4)', 'Review'],
+  ] as const)('in %s', async (locale, title, review) => {
+    const { i18nFor } = await import('../../../../i18n');
+    const html = text(render({ config: ready(empty), backupOffer: { count: 4, savedAt: SAVED_AT }, i18n: i18nFor(locale) }));
+    expect(html).toContain(title);
+    expect(html).toContain(review);
+    expect(html).not.toContain("Ko'rib chiqish");
   });
 });
