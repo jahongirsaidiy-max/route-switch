@@ -12,11 +12,13 @@ export const addRuleUz = {
   kinds: { ip: 'IP', subnet: 'Subnet', domain: 'Domen' } satisfies Readonly<Record<RuleKind, string>>,
   /** Label and hint of the address field, per kind (the design's words). */
   targetField: {
-    ip: { label: 'IP manzil', hint: "Bitta host uchun route qo'shiladi." },
-    subnet: { label: 'Subnet (CIDR)', hint: 'Butun ichki tarmoq uchun eng ishonchli variant.' },
+    ip: { label: 'IP manzil', hint: "Bitta host uchun route qo'shiladi. Wildcard ham bo'ladi: 10.*.*.* → 10.0.0.0/8 (subnet)." },
+    subnet: { label: 'Subnet (CIDR)', hint: "Butun ichki tarmoq uchun eng ishonchli variant. Wildcard ham bo'ladi: 10.*.*.* → 10.0.0.0/8." },
     domain: { label: 'Domen', hint: "Domen IP'ga resolve qilinib, har bir IP uchun route qo'shiladi." },
   } satisfies Readonly<Record<RuleKind, { readonly label: string; readonly hint: string }>>,
   normalised: (target: string): string => `${target} sifatida saqlanadi.`,
+  /** An IP wildcard (`10.*.*.*`) and the subnet it is saved as (the shared normaliser's CIDR). */
+  wildcardResult: (cidr: string): string => `→ ${cidr} (subnet)`,
   sameAs: (target: string): string => `Bu manzil «${target}» qoidasida ham bor (shu interfeys) — ikkinchi qoida ortiqcha.`,
   useDns: 'Ichki DNS server orqali resolve qilish',
   dnsAddress: 'DNS server manzili',

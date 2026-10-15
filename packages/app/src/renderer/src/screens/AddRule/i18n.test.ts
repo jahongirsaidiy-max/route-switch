@@ -52,6 +52,19 @@ describe('field errors in every language', () => {
     expect(EN.t.addRule.normalised('10.0.0.0/8')).toBe('Will be saved as 10.0.0.0/8.');
     expect(RU.t.addRule.sameAs('10.0.0.0/8')).toContain('«10.0.0.0/8»');
   });
+
+  it('IP wildcard (TASK-DELTA-15): the resulting CIDR, invalid-wildcard and ADR-001 words in every language', () => {
+    expect(UZ.t.addRule.wildcardResult('10.0.0.0/8')).toBe('→ 10.0.0.0/8 (subnet)');
+    expect(EN.t.addRule.wildcardResult('10.0.0.0/8')).toBe('→ 10.0.0.0/8 (subnet)');
+    expect(RU.t.addRule.wildcardResult('10.0.0.0/8')).toBe('→ 10.0.0.0/8 (подсеть)');
+    for (const i18n of [UZ, RU, EN]) {
+      expect(checkForm(form({ kind: 'ip', target: '10.*.*.*' }), NEW_ID, null, i18n).wildcardCidr).toBe('10.0.0.0/8');
+      expect(checkForm(form({ kind: 'ip', target: '10.*.1.*' }), NEW_ID, null, i18n).errors.target).toBe(i18n.t.validation['invalid-wildcard']);
+      expect(checkForm(form({ kind: 'subnet', target: '224.*.*.*' }), NEW_ID, null, i18n).errors.target).toBe(i18n.t.validation.multicast);
+      expect(targetField('ip', i18n).hint).toContain('10.*.*.*');
+      expect(targetField('subnet', i18n).hint).toContain('10.*.*.*');
+    }
+  });
 });
 
 describe('command preview: argv is never translated', () => {

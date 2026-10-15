@@ -12,8 +12,9 @@ import {
   LIMITS,
   Rule,
   destinationKey,
+  isIpWildcard,
   normalizeHostAddress,
-  normalizeTarget,
+  normalizeRuleTarget,
   parseIpv4Destination,
   type EngineState,
   type IfaceRole,
@@ -125,8 +126,10 @@ export interface FormCheck {
   readonly errors: FieldErrors;
   /** A refusal that belongs to no field (the 500-rule limit). */
   readonly formError: string | null;
-  /** The target as it will be stored, when that differs from what was typed (`10.1.2.3/8` → `10.0.0.0/8`). */
+  /** The target as it will be stored, when that differs from what was typed (`10.1.2.3/8` → `10.0.0.0/8`); null for a wildcard. */
   readonly normalisedTarget: string | null;
+  /** The subnet an accepted IP wildcard is saved as (`10.*.*.*` → `10.0.0.0/8`, kind `subnet`), from the shared normaliser. */
+  readonly wildcardCidr: string | null;
   /** Another rule already routes the same destination through the same interface (allowed; a hint only). */
   readonly sameAs: string | null;
 }
@@ -203,8 +206,10 @@ export function checkForm(form: RuleForm, id: string, config: Config | null, i18
   const words = i18n.t.addRule.errors;
   const input = ruleInputOf(form, id);
   const typedTarget = form.target.trim();
-  const target = normalizeTarget(form.kind, typedTarget);
-  const normalisedTarget = target.ok && target.value !== typedTarget ? target.value : null;
+  const target = normalizeRuleTarget(form.kind, typedTarget);
+  // The shared normaliser turns an `ip` / `subnet` wildcard into a subnet: say which, not "saved as".
+  const wildcardCidr = target.ok && form.kind !== 'domain' && isIpWildcard(typedTarget) ? target.value.target : null;
+  const normalisedTarget = target.ok && wildcardCidr === null && target.value.target !== typedTarget ? target.value.target : null;
   const parsed = Rule.safeParse(input);
   const errors: FieldErrors = {};
   if (!parsed.success) {
@@ -221,7 +226,7 @@ export function checkForm(form: RuleForm, id: string, config: Config | null, i18
     }
     // A refusal on a field the form does not show (the id) still blocks the save.
     const blocked = Object.keys(errors).length === 0;
-    return { rule: null, errors, formError: blocked ? words.invalidRule : null, normalisedTarget, sameAs: null };
+    return { rule: null, errors, formError: blocked ? words.invalidRule : null, normalisedTarget, wildcardCidr, sameAs: null };
   }
 
   const rule = parsed.data;
@@ -254,15 +259,24 @@ export function checkForm(form: RuleForm, id: string, config: Config | null, i18
   }
 
   const refused = Object.keys(errors).length > 0 || formError !== null;
-  return { rule: refused ? null : rule, errors, formError, normalisedTarget, sameAs };
+  return { rule: refused ? null : rule, errors, formError, normalisedTarget, wildcardCidr, sameAs };
 }
 
-/** The target and DNS server as the shared normalisers accept them (null while refused or empty), for the preview and the test. */
-export function acceptedValues(form: RuleForm): { readonly target: string | null; readonly dns: string | null } {
-  const target = normalizeTarget(form.kind, form.target.trim());
+/**
+ * The kind, target and DNS server as the shared normalisers accept them, for
+ * the preview and the test. The kind is the one the rule is saved with: an IP
+ * wildcard typed under `ip` is a `subnet` (`10.*.*.*` → `10.0.0.0/8`); while
+ * the target is refused or empty it stays the form's kind and `target` is null.
+ */
+export function acceptedValues(form: RuleForm): { readonly kind: RuleKind; readonly target: string | null; readonly dns: string | null } {
+  const target = normalizeRuleTarget(form.kind, form.target.trim());
   const dnsTyped = form.dns.trim();
   const dns = form.kind === 'domain' && form.useDns && dnsTyped !== '' ? normalizeHostAddress(dnsTyped) : null;
-  return { target: target.ok ? target.value : null, dns: dns?.ok === true ? dns.value : null };
+  return {
+    kind: target.ok ? target.value.kind : form.kind,
+    target: target.ok ? target.value.target : null,
+    dns: dns?.ok === true ? dns.value : null,
+  };
 }
 
 /** The first field with an error, in form order. */

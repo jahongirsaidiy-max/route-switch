@@ -178,9 +178,58 @@ describe('formOfRule', () => {
   });
 });
 
+describe('IP wildcard (TASK-DELTA-15) — the shared normaliser decides, the form only shows it', () => {
+  it.each(['ip', 'subnet'] as const)('%s 10.*.*.* is saved as the subnet 10.0.0.0/8 and says so', (kind) => {
+    const result = check({ kind, target: '10.*.*.*', iface: 'wifi' });
+    expect(result.errors).toEqual({});
+    expect(result.rule).toMatchObject({ kind: 'subnet', target: '10.0.0.0/8', iface: 'wifi' });
+    expect(result.wildcardCidr).toBe('10.0.0.0/8');
+    expect(result.normalisedTarget).toBeNull();
+  });
+
+  it('192.168.5.* and 172.16.*.* are /24 and /16; white space around is dropped', () => {
+    expect(check({ kind: 'ip', target: ' 192.168.5.* ' }).rule).toMatchObject({ kind: 'subnet', target: '192.168.5.0/24' });
+    expect(check({ kind: 'subnet', target: '172.16.*.*' }).wildcardCidr).toBe('172.16.0.0/16');
+  });
+
+  it.each([
+    ['ip', '10.*.1.*', VALIDATION_TEXT['invalid-wildcard']],
+    ['subnet', '*.*.*.*', VALIDATION_TEXT['invalid-wildcard']],
+    ['ip', '10.*', VALIDATION_TEXT['invalid-wildcard']],
+    ['subnet', '10.*.*.*/8', VALIDATION_TEXT['invalid-wildcard']],
+    ['ip', '224.*.*.*', VALIDATION_TEXT.multicast],
+    ['subnet', '127.*.*.*', VALIDATION_TEXT.loopback],
+    ['ip', '169.254.*.*', VALIDATION_TEXT['link-local']],
+  ] as const)('%s %s is refused with the shared code', (kind, target, text) => {
+    const result = check({ kind, target });
+    expect(result.rule).toBeNull();
+    expect(result.errors.target).toBe(text);
+    expect(result.wildcardCidr).toBeNull();
+  });
+
+  it('the wildcard is checked against the config as the subnet it is (one target, two interfaces)', () => {
+    // CONFIG routes 10.0.0.0/8 through Ethernet.
+    expect(check({ kind: 'ip', target: '10.*.*.*', iface: 'wifi' }, CONFIG).errors.target).toContain('«10.0.0.0/8»');
+    expect(check({ kind: 'ip', target: '10.*.*.*', iface: 'ethernet' }, CONFIG).sameAs).toBe('10.0.0.0/8');
+  });
+
+  it('acceptedValues gives the saved kind: the preview is -net <cidr>, the test the first host', () => {
+    const accepted = acceptedValues(form({ kind: 'ip', target: '10.*.*.*' }));
+    expect(accepted).toEqual({ kind: 'subnet', target: '10.0.0.0/8', dns: null });
+    expect(commandPreview(accepted.kind, accepted.target, null, 'ethernet', STATE.interfaces).lines).toEqual(['$ route -n add -net 10.0.0.0/8 10.20.4.1']);
+    expect(testAddressOf(accepted.kind, accepted.target, null)).toEqual({ address: '10.0.0.1' });
+    expect(acceptedValues(form({ kind: 'ip', target: '10.*.1.*' }))).toEqual({ kind: 'ip', target: null, dns: null });
+  });
+
+  it('a domain with a * is still the wildcard-domain refusal, not an IP wildcard', () => {
+    expect(check({ kind: 'domain', target: '*.corp.local' }).errors.target).toBe(WILDCARD_TEXT);
+    expect(acceptedValues(form({ kind: 'domain', target: '*.corp.local' })).kind).toBe('domain');
+  });
+});
+
 describe('acceptedValues', () => {
   it('the target and DNS server once the shared normalisers accept them', () => {
-    expect(acceptedValues(form({ kind: 'subnet', target: '10.1.2.3/8' }))).toEqual({ target: '10.0.0.0/8', dns: null });
+    expect(acceptedValues(form({ kind: 'subnet', target: '10.1.2.3/8' }))).toEqual({ kind: 'subnet', target: '10.0.0.0/8', dns: null });
     expect(acceptedValues(form({ kind: 'subnet', target: '10.0.0.0/33' })).target).toBeNull();
     expect(acceptedValues(form({ kind: 'domain', target: 'corp.local', useDns: true, dns: '10.20.0.10' })).dns).toBe('10.20.0.10');
     expect(acceptedValues(form({ kind: 'domain', target: 'corp.local', useDns: false, dns: '10.20.0.10' })).dns).toBeNull();

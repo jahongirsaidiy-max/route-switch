@@ -107,14 +107,15 @@ const inputProps = (field: FormField, error: string | undefined, props: AddRuleP
   },
 });
 
-function TestRow(props: AddRulePanelProps & { readonly target: string | null; readonly i18n: I18n }): ReactElement {
+/** `kind` / `target` as the rule is saved (an IP wildcard is the subnet it stands for, see `acceptedValues`). */
+function TestRow(props: AddRulePanelProps & { readonly kind: RuleKind; readonly target: string | null; readonly i18n: I18n }): ReactElement {
   const { ui, config, engine, ruleId, i18n } = props;
   const t = i18n.t.addRule;
   const stored = config?.rules.find((rule) => rule.id === ruleId) ?? null;
   const ruleState = engine.state?.rules.find((state) => state.ruleId === ruleId) ?? null;
   const saved = stored === null ? null : { target: stored.target, kind: stored.kind, dns: stored.dns ?? null, state: ruleState };
   const connected = engine.helper === 'connected';
-  const subject = connected ? testAddressOf(ui.form.kind, props.target, saved, i18n) : { reason: t.testNoHelper };
+  const subject = connected ? testAddressOf(props.kind, props.target, saved, i18n) : { reason: t.testNoHelper };
   const address = 'address' in subject ? subject.address : null;
   const test = ui.test;
   const current = address !== null && test.phase !== 'idle' && test.address === address ? test : null;
@@ -170,11 +171,18 @@ function FormBody(props: AddRulePanelProps & { readonly i18n: I18n }): ReactElem
   const field = targetField(form.kind, i18n);
   const interfaces = engine.helper === 'connected' ? (engine.state?.interfaces ?? null) : null;
   // The preview and the test use the target only once the shared normaliser accepts it.
-  const { target, dns } = acceptedValues(form);
-  const preview = commandPreview(form.kind, target, dns, form.iface, interfaces, i18n);
+  // An IP wildcard is previewed as the subnet it is saved as (`-net 10.0.0.0/8`).
+  const { kind, target, dns } = acceptedValues(form);
+  const preview = commandPreview(kind, target, dns, form.iface, interfaces, i18n);
   const refresh = Number(form.refreshSec.trim());
   const targetHint =
-    check.normalisedTarget !== null ? t.normalised(check.normalisedTarget) : check.sameAs !== null ? t.sameAs(check.sameAs) : field.hint;
+    check.wildcardCidr !== null
+      ? t.wildcardResult(check.wildcardCidr)
+      : check.normalisedTarget !== null
+        ? t.normalised(check.normalisedTarget)
+        : check.sameAs !== null
+          ? t.sameAs(check.sameAs)
+          : field.hint;
 
   return (
     <>
@@ -313,7 +321,7 @@ function FormBody(props: AddRulePanelProps & { readonly i18n: I18n }): ReactElem
           </code>
         ))}
         {preview.note === null ? null : <span className={styles['previewNote']}>{preview.note}</span>}
-        <TestRow {...props} target={target} i18n={i18n} />
+        <TestRow {...props} kind={kind} target={target} i18n={i18n} />
       </div>
     </>
   );
