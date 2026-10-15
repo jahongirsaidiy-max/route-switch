@@ -6,10 +6,10 @@ import { Button, Toggle } from '../../components';
 import { renderMarkup } from '../../components/test-utils';
 import { IDLE_CONFIG, type ConfigView } from '../../hooks/useConfig';
 import { LOADING_VIEW, type EngineStateView } from '../../hooks/useEngineState';
-import type { RsApi, RsSnapshot } from '../../rs';
+import type { RsApi, RsServiceOrder, RsSnapshot } from '../../rs';
 import { CONFIG, ID, NOW, ORDER_WIFI_FIRST, STATE, ruleState } from './fixtures';
 import { helperNotice, INSTALL_TEXT } from '../../text';
-import { MenuBarPanel, MenuBarScreen, type MenuBarPanelProps } from './MenuBarScreen';
+import { followServiceOrder, MenuBarPanel, MenuBarScreen, type MenuBarPanelProps } from './MenuBarScreen';
 
 const connected = (state: EngineState = STATE): EngineStateView => ({
   helper: 'connected',
@@ -395,5 +395,99 @@ describe('MenuBarScreen', () => {
     // Static rendering runs no effects: nothing was asked of the helper or the main process.
     expect(rs.getConfig).not.toHaveBeenCalled();
     expect(rs.getServiceOrder).not.toHaveBeenCalled();
+  });
+});
+
+describe('followServiceOrder (TASK-DELTA-08)', () => {
+  type OrderResult = Awaited<ReturnType<RsApi['getServiceOrder']>>;
+  const ETHERNET_FIRST: RsServiceOrder = { ...ORDER_WIFI_FIRST, services: [...ORDER_WIFI_FIRST.services].reverse(), wifiFirst: false };
+  function page(answers: OrderResult[]) {
+    const shows = new Set<() => void>();
+    const resolvers: ((result: OrderResult) => void)[] = [];
+    const rs = {
+      getServiceOrder: vi.fn(
+        () =>
+          new Promise<OrderResult>((resolve) => {
+            resolvers.push(resolve);
+          }),
+      ),
+    };
+    let order: RsServiceOrder | null = null;
+    const reader = followServiceOrder(
+      rs,
+      (next) => {
+        order = next;
+      },
+      (tick) => {
+        shows.add(tick);
+        return () => shows.delete(tick);
+      },
+    );
+    return {
+      rs,
+      reader,
+      shows,
+      order: () => order,
+      show: () => {
+        for (const tick of [...shows]) tick();
+      },
+      answer: async (index: number) => {
+        const result = answers[index];
+        if (result !== undefined) resolvers[index]?.(result);
+        await Promise.resolve();
+      },
+    };
+  }
+  const defaultCard = (order: RsServiceOrder | null) => {
+    const html = render({ serviceOrder: order });
+    if (!html.includes('DEFAULT')) return null;
+    return html.indexOf('DEFAULT') < html.indexOf('Ethernet') ? 'wifi' : 'ethernet';
+  };
+
+  it('the order changed, the interfaces did not: the next show moves DEFAULT to the other card', async () => {
+    const view = page([
+      { ok: true, value: ORDER_WIFI_FIRST },
+      { ok: true, value: ETHERNET_FIRST },
+      { ok: true, value: ORDER_WIFI_FIRST },
+    ]);
+    await view.answer(0);
+    expect(defaultCard(view.order())).toBe('wifi');
+    view.show();
+    await view.answer(1);
+    expect(defaultCard(view.order())).toBe('ethernet');
+    view.show();
+    await view.answer(2);
+    expect(defaultCard(view.order())).toBe('wifi');
+    expect(view.rs.getServiceOrder).toHaveBeenCalledTimes(3);
+  });
+
+  it('a read that fails leaves no DEFAULT tag', async () => {
+    const view = page([
+      { ok: true, value: ORDER_WIFI_FIRST },
+      { ok: false, code: 'timeout', error: 'timed out' },
+    ]);
+    await view.answer(0);
+    view.show();
+    await view.answer(1);
+    expect(view.order()).toBeNull();
+    expect(defaultCard(view.order())).toBeNull();
+  });
+
+  it('two reads racing: the stale answer arriving last does not bring the old DEFAULT back', async () => {
+    const view = page([
+      { ok: true, value: ORDER_WIFI_FIRST },
+      { ok: true, value: ETHERNET_FIRST },
+    ]);
+    view.show();
+    await view.answer(1);
+    await view.answer(0);
+    expect(defaultCard(view.order())).toBe('ethernet');
+  });
+
+  it('stop (disconnected, interfaces changed, unmounted) stops listening for shows', () => {
+    const view = page([]);
+    expect(view.shows.size).toBe(1);
+    view.reader.stop();
+    expect(view.shows.size).toBe(0);
   });
 });

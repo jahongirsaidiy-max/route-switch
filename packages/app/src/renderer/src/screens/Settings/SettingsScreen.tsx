@@ -8,6 +8,7 @@ import { useCallback, useEffect, useRef, useState, type ReactElement, type Ref }
 
 import { Button, ROLE_LABELS, StatusDot, Toggle } from '../../components';
 import { useEngineState, type EngineStateView } from '../../hooks/useEngineState';
+import { browserShowSignal, readOnShow, type ShowSignal, type ShownReader } from '../../hooks/windowShown';
 import type { RsApi, RsServiceOrder } from '../../rs';
 import {
   copyServiceOrderCommand,
@@ -313,17 +314,19 @@ export function SettingsScreen({ rs: given }: SettingsScreenProps): ReactElement
     };
   }, [rs, configRevision]);
 
-  const refreshOrder = useCallback(() => {
-    setServiceOrder((current) => ({ ...current, phase: 'loading' }));
-    void rs.getServiceOrder().then((result) => {
-      setServiceOrder(
-        result.ok
-          ? { phase: 'ready', order: result.value, feedback: null }
-          : { phase: 'failed', order: null, feedback: { tone: 'danger', text: errorText(result.code) } },
-      );
-    });
+  // The service order: on open, on "Yangilash" and whenever the window is shown again (the command was run in Terminal).
+  const orderReader = useRef<ShownReader | null>(null);
+  useEffect(() => {
+    const reader = followServiceOrderView(rs, setServiceOrder, browserShowSignal(window, document));
+    orderReader.current = reader;
+    return () => {
+      reader.stop();
+      orderReader.current = null;
+    };
   }, [rs]);
-  useEffect(refreshOrder, [refreshOrder]);
+  const refreshOrder = useCallback(() => {
+    orderReader.current?.refresh();
+  }, []);
 
   return (
     <SettingsPanel
@@ -379,6 +382,32 @@ export function SettingsScreen({ rs: given }: SettingsScreenProps): ReactElement
         });
       }}
     />
+  );
+}
+
+/**
+ * Reads the service order now and on every show of the window. The first read
+ * and "Yangilash" show `loading`; a read on show is quiet — the card keeps what
+ * it shows (no status line pushing the buttons down under a click) until the answer.
+ */
+export function followServiceOrderView(
+  rs: Pick<RsApi, 'getServiceOrder'>,
+  update: (next: (current: ServiceOrderView) => ServiceOrderView) => void,
+  onShow: ShowSignal,
+): ShownReader {
+  return readOnShow(
+    (cause) => {
+      if (cause !== 'show') update((current) => ({ ...current, phase: 'loading' }));
+      return rs.getServiceOrder();
+    },
+    (result) => {
+      update(() =>
+        result.ok
+          ? { phase: 'ready', order: result.value, feedback: null }
+          : { phase: 'failed', order: null, feedback: { tone: 'danger', text: errorText(result.code) } },
+      );
+    },
+    onShow,
   );
 }
 

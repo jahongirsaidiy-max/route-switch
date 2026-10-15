@@ -6,6 +6,8 @@
 
 import { useSyncExternalStore } from 'react';
 
+import { browserShowSignal, type ShowDocument, type ShowSignal, type ShowWindow } from './windowShown';
+
 /** How often the clock moves while the window stays open. */
 export const NOW_TICK_MS = 30_000;
 
@@ -15,7 +17,7 @@ export interface ClockDeps {
   /** Calls `tick` every `ms`; returns the function that stops it. */
   readonly every: (ms: number, tick: () => void) => () => void;
   /** Calls `tick` whenever the window is shown or focused; returns the function that stops it. */
-  readonly onShow: (tick: () => void) => () => void;
+  readonly onShow: ShowSignal;
 }
 
 export interface NowStore {
@@ -55,21 +57,15 @@ export function createNowStore(deps: ClockDeps, tickMs = NOW_TICK_MS): NowStore 
 }
 
 /** The parts of `window` the clock uses. */
-export interface ClockWindow {
+export interface ClockWindow extends ShowWindow {
   readonly setInterval: (handler: () => void, ms: number) => number;
   readonly clearInterval: (id: number) => void;
-  readonly addEventListener: (type: 'focus', listener: () => void) => void;
-  readonly removeEventListener: (type: 'focus', listener: () => void) => void;
 }
 
 /** The parts of `document` the clock uses. */
-export interface ClockDocument {
-  readonly visibilityState: DocumentVisibilityState;
-  readonly addEventListener: (type: 'visibilitychange', listener: () => void) => void;
-  readonly removeEventListener: (type: 'visibilitychange', listener: () => void) => void;
-}
+export type ClockDocument = ShowDocument;
 
-/** The clock's wiring to a page: an interval, the window's focus and the document becoming visible. */
+/** The clock's wiring to a page: an interval, and the window shown again (`browserShowSignal`). */
 export function browserClockDeps(win: ClockWindow, doc: ClockDocument, now: () => number = Date.now): ClockDeps {
   return {
     now,
@@ -79,18 +75,7 @@ export function browserClockDeps(win: ClockWindow, doc: ClockDocument, now: () =
         win.clearInterval(id);
       };
     },
-    onShow: (tick) => {
-      // Hidden → visible ticks; becoming hidden does not.
-      const onVisibility = () => {
-        if (doc.visibilityState === 'visible') tick();
-      };
-      win.addEventListener('focus', tick);
-      doc.addEventListener('visibilitychange', onVisibility);
-      return () => {
-        win.removeEventListener('focus', tick);
-        doc.removeEventListener('visibilitychange', onVisibility);
-      };
-    },
+    onShow: browserShowSignal(win, doc),
   };
 }
 

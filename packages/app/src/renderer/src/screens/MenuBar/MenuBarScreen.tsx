@@ -23,6 +23,7 @@ import {
 import { configStoreFor, useConfig, type ConfigView } from '../../hooks/useConfig';
 import { useEngineState, type EngineStateView } from '../../hooks/useEngineState';
 import { useNow } from '../../hooks/useNow';
+import { browserShowSignal, readOnShow, type ShowSignal, type ShownReader } from '../../hooks/windowShown';
 import type { RsApi, RsServiceOrder } from '../../rs';
 import { errorText, helperNotice, LOADING_NOTICE, networkWarnings, type Feedback } from '../../text';
 import { installHelper } from '../Install';
@@ -240,6 +241,22 @@ export function MenuBarPanel(props: MenuBarPanelProps): ReactElement {
   );
 }
 
+/** Reads the service order now and on every show of the window; an order that cannot be read is `null` (no DEFAULT tag). */
+export function followServiceOrder(
+  rs: Pick<RsApi, 'getServiceOrder'>,
+  deliver: (order: RsServiceOrder | null) => void,
+  onShow: ShowSignal,
+): ShownReader {
+  return readOnShow(
+    () => rs.getServiceOrder(),
+    (result) => {
+      // Unknown order: no DEFAULT tag, nothing else depends on it.
+      deliver(result.ok ? result.value : null);
+    },
+    onShow,
+  );
+}
+
 export interface MenuBarScreenProps {
   /** The preload API; `window.rs` in the app. */
   readonly rs?: MenuBarApi & Pick<RsApi, 'getState' | 'onState' | 'getConfig' | 'getServiceOrder' | 'reconnectHelper' | 'installHelper'>;
@@ -269,7 +286,8 @@ export function MenuBarScreen({ rs: given }: MenuBarScreenProps): ReactElement {
     });
   }, []);
 
-  // The service order decides the DEFAULT tag; it is read again when the interfaces change.
+  // The service order decides the DEFAULT tag; it is read again when the interfaces change and
+  // whenever the popover is shown again (a new order changes no interface).
   const interfaces = engine.helper === 'connected' ? (engine.state?.interfaces ?? null) : null;
   const key = interfaces === null ? null : interfacesKey(interfaces);
   useEffect(() => {
@@ -277,14 +295,7 @@ export function MenuBarScreen({ rs: given }: MenuBarScreenProps): ReactElement {
       setServiceOrder(null);
       return undefined;
     }
-    let live = true;
-    void rs.getServiceOrder().then((result) => {
-      // Unknown order: no DEFAULT tag, nothing else depends on it.
-      if (live) setServiceOrder(result.ok ? result.value : null);
-    });
-    return () => {
-      live = false;
-    };
+    return followServiceOrder(rs, setServiceOrder, browserShowSignal(window, document)).stop;
   }, [rs, key]);
 
   // The popover hides when it loses focus; a message from before should not greet the next opening.

@@ -5,8 +5,15 @@ import { describe, expect, it, vi } from 'vitest';
 import { Button } from '../../components';
 import { renderMarkup } from '../../components/test-utils';
 import type { EngineStateView } from '../../hooks/useEngineState';
-import type { RsServiceOrder } from '../../rs';
-import { focusUninstallButton, SettingsPanel, SettingsScreen, type SettingsPanelProps } from './SettingsScreen';
+import type { RsApi, RsServiceOrder } from '../../rs';
+import {
+  focusUninstallButton,
+  followServiceOrderView,
+  SettingsPanel,
+  SettingsScreen,
+  type ServiceOrderView,
+  type SettingsPanelProps,
+} from './SettingsScreen';
 
 const STATE: EngineState = {
   helperVersion: '0.1.0',
@@ -277,5 +284,111 @@ describe('focusUninstallButton (TASK-300)', () => {
     expect(focusUninstallButton({ isConnected: false, disabled: false, focus })).toBe(false);
     expect(focusUninstallButton(null)).toBe(false);
     expect(focus).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('followServiceOrderView (TASK-DELTA-08)', () => {
+  type OrderResult = Awaited<ReturnType<RsApi['getServiceOrder']>>;
+  const WIFI_FIRST: RsServiceOrder = { ...ORDER, services: [...ORDER.services].reverse(), wifiFirst: true };
+  function page(answers: OrderResult[]) {
+    const shows = new Set<() => void>();
+    const resolvers: ((result: OrderResult) => void)[] = [];
+    const rs = {
+      getServiceOrder: vi.fn(
+        () =>
+          new Promise<OrderResult>((resolve) => {
+            resolvers.push(resolve);
+          }),
+      ),
+    };
+    let view: ServiceOrderView = { phase: 'loading', order: null, feedback: null };
+    const reader = followServiceOrderView(
+      rs,
+      (next) => {
+        view = next(view);
+      },
+      (tick) => {
+        shows.add(tick);
+        return () => shows.delete(tick);
+      },
+    );
+    return {
+      rs,
+      reader,
+      shows,
+      view: () => view,
+      set: (next: ServiceOrderView) => {
+        view = next;
+      },
+      show: () => {
+        for (const tick of [...shows]) tick();
+      },
+      answer: async (index: number) => {
+        const result = answers[index];
+        if (result !== undefined) resolvers[index]?.(result);
+        await Promise.resolve();
+      },
+    };
+  }
+
+  it('the window shown again after the command was run: "allaqachon birinchi" without a restart', async () => {
+    const view = page([
+      { ok: true, value: ORDER },
+      { ok: true, value: WIFI_FIRST },
+    ]);
+    await view.answer(0);
+    expect(render({ serviceOrder: view.view() })).toContain('Hozir birinchi: USB 10/100/1000 LAN.');
+    view.show();
+    expect(view.view()).toEqual({ phase: 'ready', order: ORDER, feedback: null });
+    await view.answer(1);
+    expect(view.view()).toEqual({ phase: 'ready', order: WIFI_FIRST, feedback: null });
+    expect(render({ serviceOrder: view.view() })).toContain('Wi-Fi allaqachon birinchi');
+  });
+
+  it('a read on show is quiet: no loading, the old order stays until the answer; the first read and "Yangilash" show loading', async () => {
+    const view = page([
+      { ok: true, value: ORDER },
+      { ok: true, value: WIFI_FIRST },
+      { ok: true, value: ORDER },
+      { ok: false, code: 'timeout', error: 'timed out' },
+    ]);
+    expect(view.view().phase).toBe('loading');
+    await view.answer(0);
+    const copied = { tone: 'success', text: 'Nusxalandi.' } as const;
+    const before: ServiceOrderView = { phase: 'ready', order: ORDER, feedback: copied };
+    view.set(before);
+    view.show();
+    expect(view.view()).toBe(before);
+    expect(render({ serviceOrder: view.view() })).not.toContain('o&#x27;qilmoqda');
+    await view.answer(1);
+    expect(view.view()).toEqual({ phase: 'ready', order: WIFI_FIRST, feedback: null });
+    view.reader.refresh();
+    expect(view.view()).toMatchObject({ phase: 'loading', order: WIFI_FIRST });
+    await view.answer(2);
+    expect(view.view()).toEqual({ phase: 'ready', order: ORDER, feedback: null });
+    // A quiet read that fails still says so.
+    view.show();
+    expect(view.view().phase).toBe('ready');
+    await view.answer(3);
+    expect(view.view()).toMatchObject({ phase: 'failed', order: null, feedback: { tone: 'danger' } });
+  });
+
+  it('two reads racing (a show and "Yangilash"): the latest answer wins', async () => {
+    const view = page([
+      { ok: true, value: WIFI_FIRST },
+      { ok: true, value: ORDER },
+    ]);
+    view.reader.refresh();
+    await view.answer(1);
+    await view.answer(0);
+    expect(view.view()).toEqual({ phase: 'ready', order: ORDER, feedback: null });
+  });
+
+  it('a failed read shows the error; stop stops listening for shows', async () => {
+    const view = page([{ ok: false, code: 'timeout', error: 'timed out' }]);
+    await view.answer(0);
+    expect(view.view()).toMatchObject({ phase: 'failed', order: null, feedback: { tone: 'danger' } });
+    view.reader.stop();
+    expect(view.shows.size).toBe(0);
   });
 });
