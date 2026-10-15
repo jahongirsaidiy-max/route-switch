@@ -23,7 +23,7 @@ const isIssueKey = (code: string): code is ConfigIssueKey => Object.hasOwn(UZ.t.
  * `RsConfigIssue` (indexes and field names only): e.g. "3-qoida, manzil:
  * Default route (0.0.0.0/0) hech qachon o'zgartirilmaydi."
  */
-export function configIssueText(issue: RsConfigIssue | undefined, i18n: I18n = UZ): string {
+export function configIssueText(issue: RsConfigIssue | undefined, i18n: I18n): string {
   const words = i18n.t.configFile;
   if (issue === undefined) return words.notAConfig;
   const [first, index, field] = issue.path;

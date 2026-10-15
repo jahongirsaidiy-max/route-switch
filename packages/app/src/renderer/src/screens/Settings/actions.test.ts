@@ -3,7 +3,7 @@ import { describe, expect, it, vi } from 'vitest';
 
 import type { RsResult, RsServiceOrder } from '../../rs';
 import { i18nFor } from '../../../../i18n';
-import { errorText } from '../../text';
+import { errorText, UZ } from '../../text';
 import {
   copyServiceOrderCommand,
   ethernetChoices,
@@ -134,14 +134,14 @@ describe('uninstallHelper', () => {
     expect(await uninstallHelper(rs)).toMatchObject({ tone: 'success', text: expect.stringContaining('butunlay') as unknown });
     expect(rs.uninstallHelper).not.toHaveBeenCalled();
     const cancelled = fakeApi({ removeHelper: () => refused('install-cancelled') });
-    expect(await uninstallHelper(cancelled)).toMatchObject({ tone: 'danger', text: errorText('install-cancelled') });
+    expect(await uninstallHelper(cancelled)).toMatchObject({ tone: 'danger', text: errorText('install-cancelled', UZ) });
     expect(cancelled.uninstallHelper).not.toHaveBeenCalled();
   });
 
   it('a helper that cannot uninstall yet, or an unknown outcome, is a normal error', async () => {
     expect(await uninstallHelper(fakeApi({ uninstallHelper: () => refused('not-implemented') }))).toEqual({
       tone: 'danger',
-      text: errorText('not-implemented'),
+      text: errorText('not-implemented', UZ),
     });
     expect(await uninstallHelper(fakeApi({ uninstallHelper: () => refused('timeout') }))).toMatchObject({
       text: expect.stringContaining("noma'lum") as unknown,

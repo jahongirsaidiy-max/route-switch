@@ -181,6 +181,11 @@ export interface ConfigDialogs {
 export const IMPORT_TTL_MS = 10 * 60 * 1000;
 
 export interface IpcRegistration {
+  /**
+   * The main process's own way into `rs:openRulesWindow`: the same intent
+   * slot and signal (the tray menu's "Yordam" opens the Help section).
+   */
+  readonly openRulesWindow: (intent?: RsRulesIntent) => void;
   /** Removes the handlers and the helper-client subscriptions. Idempotent. */
   readonly dispose: () => void;
 }
@@ -366,6 +371,22 @@ export function registerIpcHandlers(deps: IpcDeps): IpcRegistration {
         intentLog.error('Could not tell the rules window of a waiting intent', { detail: error });
       }
     }
+  };
+  /**
+   * Opens (or brings forward) the rules window, keeping `intent` for it first:
+   * a new window takes it once it has loaded. `source` is the IPC channel or
+   * `tray` (the tray menu's "Yordam", TASK-DELTA-22).
+   */
+  const openRulesWindow = (intent: RsRulesIntent | undefined, source: string): void => {
+    if (intent !== undefined) rulesIntent = { intent, at: now() };
+    deps.openRulesWindow();
+    if (intent !== undefined) pushToRulesWindow();
+    // The kind (and a section's name) only: a DNS offer's server is the user's network, not for the log above debug.
+    windowLog.info('Rules window requested', {
+      channel: source,
+      intent: intent?.kind ?? null,
+      ...(intent?.kind === 'section' ? { section: intent.section } : {}),
+    });
   };
 
   // At most one system file dialog at a time; a second click is answered `busy`.
@@ -565,12 +586,7 @@ export function registerIpcHandlers(deps: IpcDeps): IpcRegistration {
       }),
     // A window of this process; the helper is not involved. A throw is answered `internal` below.
     'rs:openRulesWindow': ([intent]) => {
-      // Kept before the window opens: a new window takes it once it has loaded.
-      if (intent !== undefined) rulesIntent = { intent, at: now() };
-      deps.openRulesWindow();
-      if (intent !== undefined) pushToRulesWindow();
-      // The kind only: a DNS offer's server is the user's network, not for the log above debug.
-      windowLog.info('Rules window requested', { channel: 'rs:openRulesWindow', intent: intent?.kind ?? null });
+      openRulesWindow(intent, 'rs:openRulesWindow');
       return Promise.resolve({ ok: true, value: null });
     },
     'rs:takeRulesIntent': () => {
@@ -721,6 +737,10 @@ export function registerIpcHandlers(deps: IpcDeps): IpcRegistration {
 
   let disposed = false;
   return {
+    openRulesWindow: (intent) => {
+      if (disposed) return;
+      openRulesWindow(intent, 'tray');
+    },
     dispose: () => {
       if (disposed) return;
       disposed = true;

@@ -11,11 +11,11 @@ export interface Feedback {
   readonly text: string;
 }
 
-/** Uzbek: what a screen that does not pass its language yet speaks. */
+/** Uzbek, the default language: the Uzbek constants below and the components' fallback. The `text/*` functions take `i18n` as a required argument. */
 export const UZ: I18n = i18nFor(DEFAULT_LOCALE);
 
 /** The words for a failed call. */
-export function errorText(code: RsErrorCode, i18n: I18n = UZ): string {
+export function errorText(code: RsErrorCode, i18n: I18n): string {
   // A code from outside the closed set (a newer main process) still gets words.
   return Object.hasOwn(i18n.t.errors, code) ? i18n.t.errors[code] : i18n.t.unexpectedError(code);
 }

@@ -183,18 +183,21 @@ describe('trayMenuTemplate', () => {
     }
   });
 
-  it.each<[Locale, string, string]>([
-    ['uz', 'Qoidalarni boshqarish', 'RouteSwitch ilovasidan chiqish'],
-    ['ru', 'Открыть правила', 'Выйти из RouteSwitch'],
-    ['en', 'Manage Rules', 'Quit RouteSwitch'],
-  ])('%s: the two items and a separator', (locale, rules, quitLabel) => {
+  it.each<[Locale, string, string, string]>([
+    ['uz', 'Qoidalarni boshqarish', 'Yordam', 'RouteSwitch ilovasidan chiqish'],
+    ['ru', 'Открыть правила', 'Справка', 'Выйти из RouteSwitch'],
+    ['en', 'Manage Rules', 'RouteSwitch Help', 'Quit RouteSwitch'],
+  ])('%s: the three items and a separator', (locale, rules, help, quitLabel) => {
     const openRules = vi.fn();
+    const openHelp = vi.fn();
     const quit = vi.fn();
-    const template = trayMenuTemplate(i18nFor(locale), { openRules, quit });
-    expect(template.map((item) => item.label ?? item.type)).toEqual([rules, 'separator', quitLabel]);
+    const template = trayMenuTemplate(i18nFor(locale), { openRules, openHelp, quit });
+    expect(template.map((item) => item.label ?? item.type)).toEqual([rules, help, 'separator', quitLabel]);
     (template[0]?.click as () => void)();
-    (template[2]?.click as () => void)();
+    (template[1]?.click as () => void)();
+    (template[3]?.click as () => void)();
     expect(openRules).toHaveBeenCalledTimes(1);
+    expect(openHelp).toHaveBeenCalledTimes(1);
     expect(quit).toHaveBeenCalledTimes(1);
   });
 });
@@ -508,7 +511,7 @@ describe('startShell — the language (TASK-DELTA-12)', () => {
     await settle();
     expect(h.tray().tooltip).toBe('RouteSwitch — подключение…');
     expect(h.templates).toHaveLength(2);
-    expect(labels(h.templates.at(-1))).toEqual(['Открыть правила', 'separator', 'Выйти из RouteSwitch']);
+    expect(labels(h.templates.at(-1))).toEqual(['Открыть правила', 'Справка', 'separator', 'Выйти из RouteSwitch']);
     // The menu shown on a right-click is the new one.
     h.tray().listeners.get('right-click')?.({}, h.tray().getBounds());
     expect(h.tray().menus.at(-1)).toEqual({ template: h.templates.at(-1) });
@@ -525,7 +528,7 @@ describe('startShell — the language (TASK-DELTA-12)', () => {
     h.setLanguage('en');
     expect(h.tray().tooltip).toBe('RouteSwitch — helper not installed');
     expect(h.tray().image).toBe(h.images.error);
-    expect(labels(h.templates.at(-1))).toEqual(['Manage Rules', 'separator', 'Quit RouteSwitch']);
+    expect(labels(h.templates.at(-1))).toEqual(['Manage Rules', 'RouteSwitch Help', 'separator', 'Quit RouteSwitch']);
     h.setHelper({ kind: 'connected', helperVersion: '1.2.3' }, engineState(1));
     expect(h.tray().tooltip).toBe('RouteSwitch — active');
     // The same language again: nothing is rebuilt.
@@ -533,7 +536,7 @@ describe('startShell — the language (TASK-DELTA-12)', () => {
     h.setLanguage('en');
     expect(h.templates).toHaveLength(built);
     // The new menu still works.
-    const item = h.templates.at(-1)?.[2];
+    const item = h.templates.at(-1)?.[3];
     if (item !== undefined) clickItem(item);
     expect(h.quit).toHaveBeenCalledTimes(1);
     expect(h.entries.some((entry) => entry.msg === 'Tray language changed' && entry['language'] === 'en')).toBe(true);
@@ -622,6 +625,18 @@ describe('startShell', () => {
     expect(h.windows[0]?.layout).toMatchObject({ width: 1040, height: 680 });
     clickItem(h.menuItem('RouteSwitch ilovasidan chiqish'));
     expect(h.quit).toHaveBeenCalledTimes(1);
+  });
+
+  it('"Yordam" opens the single rules window with a Help intent, which only the rules window can take', async () => {
+    const h = shellHarness();
+    clickItem(h.menuItem('Yordam'));
+    clickItem(h.menuItem('Yordam'));
+    expect(h.windows.map((window) => window.view)).toEqual(['rules']);
+    const take = h.handlers.get('rs:takeRulesIntent') as (event: unknown) => Promise<unknown>;
+    const fromRules = { senderFrame: { url: `${APP_ENTRY_URL}?view=rules`, parent: null } };
+    expect(await take(fromRules)).toEqual({ ok: true, value: { kind: 'section', section: 'help' } });
+    expect(await take(fromRules)).toEqual({ ok: true, value: null });
+    expect(h.entries.some((entry) => entry.msg === 'Rules window requested' && entry['channel'] === 'tray' && entry['section'] === 'help')).toBe(true);
   });
 
   it('"Qoidalarni boshqarish" of the menu bar window (rs:openRulesWindow) opens the same single rules window', async () => {

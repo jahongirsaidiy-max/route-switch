@@ -8,7 +8,7 @@ import type { rulesUz } from './rules.uz';
 const rules = (count: number): string => `${String(count)} ${plural('ru', count, ruForms('правило', 'правила', 'правил'))}`;
 
 export const rulesRu: Shape<typeof rulesUz> = {
-  sections: { rules: 'Правила', log: 'Журнал', diagnostics: 'Диагностика', settings: 'Настройки' },
+  sections: { rules: 'Правила', log: 'Журнал', diagnostics: 'Диагностика', settings: 'Настройки', help: 'Справка' },
   sectionsNav: 'Разделы',
   helperDaemon: (version) => `root daemon · v${version}`,
 

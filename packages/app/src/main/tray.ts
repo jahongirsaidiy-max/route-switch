@@ -102,6 +102,8 @@ export function trayAppearance(
 /** What the tray menu does; the labels come from the language. */
 export interface TrayMenuActions {
   readonly openRules: () => void;
+  /** The rules window at its Help section (TASK-DELTA-22). */
+  readonly openHelp: () => void;
   readonly quit: () => void;
 }
 
@@ -112,6 +114,12 @@ export function trayMenuTemplate(i18n: I18n, actions: TrayMenuActions): MenuItem
       label: i18n.t.tray.manageRules,
       click: () => {
         actions.openRules();
+      },
+    },
+    {
+      label: i18n.t.tray.help,
+      click: () => {
+        actions.openHelp();
       },
     },
     { type: 'separator' },
@@ -267,6 +275,9 @@ export function startShell(deps: ShellDeps, context: ShellContext): Shell {
   const menuActions: TrayMenuActions = {
     openRules: () => {
       windows.openRules();
+    },
+    openHelp: () => {
+      ipc.openRulesWindow({ kind: 'section', section: 'help' });
     },
     quit: () => {
       deps.quit();

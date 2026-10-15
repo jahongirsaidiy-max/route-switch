@@ -1617,6 +1617,25 @@ describe('rs:openRulesWindow (main process only)', () => {
     expect(await h.callAs(RULES_EVENT, 'rs:takeRulesIntent')).toEqual({ ok: true, value: null });
   });
 
+  it("the main process's own way in (the tray's Help, TASK-DELTA-22): the same slot and signal; nothing after dispose", async () => {
+    const openRulesWindow = vi.fn();
+    const rules = windowRecipient(viewUrl(APP_ENTRY_URL, 'rules'));
+    const h = await setup({ openRulesWindow, recipients: [rules.target] });
+    // `help` is a section the channel accepts too.
+    expect(await h.call('rs:openRulesWindow', { kind: 'section', section: 'help' })).toEqual({ ok: true, value: null });
+    expect(await h.callAs(RULES_EVENT, 'rs:takeRulesIntent')).toEqual({ ok: true, value: { kind: 'section', section: 'help' } });
+    h.registration.openRulesWindow({ kind: 'section', section: 'help' });
+    expect(openRulesWindow).toHaveBeenCalledTimes(2);
+    expect(rules.intents()).toHaveLength(2);
+    expect(await h.callAs(RULES_EVENT, 'rs:takeRulesIntent')).toEqual({ ok: true, value: { kind: 'section', section: 'help' } });
+    expect(h.entries.some((entry) => entry.msg === 'Rules window requested' && entry['channel'] === 'tray' && entry['section'] === 'help')).toBe(true);
+    h.registration.openRulesWindow();
+    expect(openRulesWindow).toHaveBeenCalledTimes(3);
+    h.registration.dispose();
+    h.registration.openRulesWindow({ kind: 'section', section: 'help' });
+    expect(openRulesWindow).toHaveBeenCalledTimes(3);
+  });
+
   it('keeps a valid intent for the rules window, tells the rules window only, and hands it out once', async () => {
     const openRulesWindow = vi.fn();
     const rules = windowRecipient(viewUrl(APP_ENTRY_URL, 'rules'));

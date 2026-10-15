@@ -21,7 +21,7 @@ export function isActiveWarning(state: Pick<RuleState, 'status' | 'reasonCode'>)
 }
 
 /** The translated reason of a rule state; null for a plain `active` rule. */
-export function ruleReasonText(state: Pick<RuleState, 'reasonCode'>, i18n: I18n = UZ): string | null {
+export function ruleReasonText(state: Pick<RuleState, 'reasonCode'>, i18n: I18n): string | null {
   return state.reasonCode === null ? null : i18n.t.ruleReason[state.reasonCode];
 }
 

@@ -24,6 +24,7 @@ export const shellUz = {
     /** DNS servers reached through the other interface (`dnsWarnings`; counted once per server). */
     dnsWarnings: (count: number): string => `${String(count)} ta DNS server boshqa interfeysdan ketmoqda`,
     manageRules: 'Qoidalarni boshqarish',
+    help: 'Yordam',
     quit: 'RouteSwitch ilovasidan chiqish',
   },
 

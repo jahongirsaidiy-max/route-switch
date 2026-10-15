@@ -20,6 +20,7 @@ export const shellEn: Shape<typeof shellUz> = {
     sameSubnet: 'Ethernet and Wi‑Fi are on the same network',
     dnsWarnings: (count) => `${n(count, 'DNS server goes', 'DNS servers go')} through the other interface`,
     manageRules: 'Manage Rules',
+    help: 'RouteSwitch Help',
     quit: 'Quit RouteSwitch',
   },
 

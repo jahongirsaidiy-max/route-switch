@@ -20,6 +20,7 @@ export const shellRu: Shape<typeof shellUz> = {
     dnsWarnings: (count) =>
       `${String(count)} ${plural('ru', count, ruForms('DNS-сервер идёт', 'DNS-сервера идут', 'DNS-серверов идут'))} через другой интерфейс`,
     manageRules: 'Открыть правила',
+    help: 'Справка',
     quit: 'Выйти из RouteSwitch',
   },
 

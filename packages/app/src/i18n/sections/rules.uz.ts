@@ -8,7 +8,7 @@ export type RowFilterKey = 'all' | 'problems' | 'off';
 
 export const rulesUz = {
   /** The sidebar of the rules window. */
-  sections: { rules: 'Qoidalar', log: 'Jurnal', diagnostics: 'Diagnostika', settings: 'Sozlamalar' },
+  sections: { rules: 'Qoidalar', log: 'Jurnal', diagnostics: 'Diagnostika', settings: 'Sozlamalar', help: 'Yordam' },
   sectionsNav: "Bo'limlar",
   /** Under the helper status when connected. */
   helperDaemon: (version: string): string => `root daemon · v${version}`,

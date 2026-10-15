@@ -1,0 +1,174 @@
+/*
+ * The "Yordam" section of the rules window. Not in the design file: laid out like the
+ * other sections' main column (header 22/24, 13px body), a table of contents beside the text.
+ */
+.screen {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  min-width: 0;
+  min-height: 0;
+  background: var(--rs-color-surface);
+}
+
+.header {
+  flex-shrink: 0;
+  padding: 22px var(--rs-space-12) var(--rs-space-8);
+  border-bottom: 1px solid var(--rs-color-divider);
+}
+
+.title {
+  font-size: var(--rs-text-title);
+  font-weight: var(--rs-weight-semibold);
+}
+
+.subtitle {
+  margin-top: var(--rs-space-2);
+  color: var(--rs-color-text-muted);
+  font-size: var(--rs-text-body);
+}
+
+.body {
+  display: flex;
+  flex: 1;
+  min-height: 0;
+}
+
+/* Table of contents: 200px, the sidebar's item look. */
+.contents {
+  flex-shrink: 0;
+  width: 200px;
+  padding: var(--rs-space-7) var(--rs-space-5);
+  overflow-y: auto;
+  border-right: 1px solid var(--rs-color-divider);
+}
+
+.contents ol {
+  display: flex;
+  flex-direction: column;
+  gap: var(--rs-space-1);
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.contentsItem {
+  width: 100%;
+  padding: var(--rs-space-3) var(--rs-space-5);
+  border: none;
+  border-radius: var(--rs-radius-sm);
+  background: transparent;
+  color: var(--rs-color-text-strong-secondary);
+  font-size: var(--rs-text-small);
+  text-align: left;
+  cursor: pointer;
+  transition: background-color var(--rs-transition);
+}
+
+.contentsItem:hover {
+  background: var(--rs-color-hover);
+}
+
+.contentsItem:focus-visible,
+.link:focus-visible,
+.topicTitle:focus-visible {
+  outline: none;
+  box-shadow: var(--rs-shadow-focus);
+}
+
+.topics {
+  flex: 1;
+  min-width: 0;
+  padding: var(--rs-space-8) var(--rs-space-12) var(--rs-space-12);
+  overflow-y: auto;
+  color: var(--rs-color-text);
+  font-size: var(--rs-text-body);
+  line-height: var(--rs-line-height);
+  -webkit-user-select: text;
+  user-select: text;
+}
+
+.topic {
+  display: flex;
+  flex-direction: column;
+  gap: var(--rs-space-5);
+  max-width: 640px;
+  padding-bottom: var(--rs-space-12);
+}
+
+.topicTitle {
+  border-radius: var(--rs-radius-sm);
+  font-size: var(--rs-text-dialog-title);
+  font-weight: var(--rs-weight-semibold);
+  scroll-margin-top: var(--rs-space-8);
+}
+
+.subheading {
+  margin-top: var(--rs-space-4);
+  font-size: var(--rs-text-body);
+  font-weight: var(--rs-weight-semibold);
+}
+
+.paragraph {
+  margin: 0;
+}
+
+.list {
+  display: flex;
+  flex-direction: column;
+  gap: var(--rs-space-3);
+  margin: 0;
+  padding-left: var(--rs-space-10);
+}
+
+.note {
+  margin: 0;
+  padding: var(--rs-space-5) var(--rs-space-6);
+  border-radius: var(--rs-radius-control);
+  background: var(--rs-color-warning-soft);
+  color: var(--rs-color-warning-soft-text);
+}
+
+.ui {
+  font-weight: var(--rs-weight-semibold);
+}
+
+.code {
+  padding: 0 var(--rs-space-1);
+  border-radius: var(--rs-radius-tag);
+  background: var(--rs-color-code);
+  font-family: var(--rs-font-mono);
+  font-size: var(--rs-text-mono-small);
+  overflow-wrap: anywhere;
+}
+
+/* The design's command preview look (add-rule form, Settings). */
+.terminal {
+  margin: 0;
+  padding: var(--rs-space-5) var(--rs-space-6);
+  overflow-x: auto;
+  border-radius: var(--rs-radius-control);
+  background: var(--rs-color-code);
+  color: var(--rs-color-text-strong-secondary);
+  font-family: var(--rs-font-mono);
+  font-size: var(--rs-text-mono-small);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+/* A link inside the app: a button that reads as a link. */
+.link {
+  padding: 0;
+  border: none;
+  border-radius: var(--rs-radius-sm);
+  background: none;
+  color: var(--rs-color-accent);
+  font: inherit;
+  text-decoration: underline;
+  text-underline-offset: 2px;
+  cursor: pointer;
+}
+
+.link:hover {
+  color: var(--rs-color-accent-hover);
+}

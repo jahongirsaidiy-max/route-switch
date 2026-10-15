@@ -6,7 +6,7 @@ import type { Config, DnsWarning, EngineState } from '@routeswitch/shared';
 import { describe, expect, it, vi } from 'vitest';
 
 import { i18nFor, type Locale } from '../../../../i18n';
-import { dnsWarningBanners } from '../../text';
+import { dnsWarningBanners, UZ } from '../../text';
 import { CONFIG, ID, STATE } from '../MenuBar/fixtures';
 import { createAddRuleController, initialAddRuleUiFor, type AddRuleUiState } from './controller';
 import {
@@ -31,7 +31,7 @@ const withWarnings = (dnsWarnings: DnsWarning[], extra: Partial<EngineState> = {
 
 describe('dnsWarningBanners — one banner per server, words by source and code', () => {
   it('names the interface or the rule (by its domain), the other interface, and why', () => {
-    const banners = dnsWarningBanners(withWarnings([ethernetDns(), ruleDns]), CONFIG);
+    const banners = dnsWarningBanners(withWarnings([ethernetDns(), ruleDns]), CONFIG, UZ);
     expect(banners.map(({ id, server, role, title }) => ({ id, server, role, title }))).toEqual([
       { id: 'dns-192.168.0.53', server: '192.168.0.53', role: 'ethernet', title: 'Ethernet DNS serveri (192.168.0.53) Wi‑Fi orqali ketmoqda' },
       { id: 'dns-10.20.0.10', server: '10.20.0.10', role: 'ethernet', title: '«corp.local» qoidasining DNS serveri (10.20.0.10) Wi‑Fi orqali ketmoqda' },
@@ -42,20 +42,20 @@ describe('dnsWarningBanners — one banner per server, words by source and code'
   });
 
   it('shows a server once, the first warning winning', () => {
-    const banners = dnsWarningBanners(withWarnings([ethernetDns(), ethernetDns({ source: 'rule', ruleId: ID.dnsDomain, code: 'routed-via-other-interface' })]), CONFIG);
+    const banners = dnsWarningBanners(withWarnings([ethernetDns(), ethernetDns({ source: 'rule', ruleId: ID.dnsDomain, code: 'routed-via-other-interface' })]), CONFIG, UZ);
     expect(banners).toHaveLength(1);
     expect(banners[0]?.title).toContain('Ethernet DNS serveri');
   });
 
   it('a rule not in the config (or no config yet) is named generically; a null `via` is the other role', () => {
-    const [banner] = dnsWarningBanners(withWarnings([{ ...ruleDns, via: null }]), null);
+    const [banner] = dnsWarningBanners(withWarnings([{ ...ruleDns, via: null }]), null, UZ);
     expect(banner?.title).toBe('Qoidaning DNS serveri (10.20.0.10) Wi‑Fi orqali ketmoqda');
-    const [wifi] = dnsWarningBanners(withWarnings([ethernetDns({ server: '10.20.4.53', role: 'wifi', via: null })]), CONFIG);
+    const [wifi] = dnsWarningBanners(withWarnings([ethernetDns({ server: '10.20.4.53', role: 'wifi', via: null })]), CONFIG, UZ);
     expect(wifi?.title).toBe('Wi‑Fi DNS serveri (10.20.4.53) Ethernet orqali ketmoqda');
   });
 
   it('nothing without warnings (an older helper sends none)', () => {
-    expect(dnsWarningBanners(STATE, CONFIG)).toEqual([]);
+    expect(dnsWarningBanners(STATE, CONFIG, UZ)).toEqual([]);
     expect(dnsWarningViews(withWarnings([]), CONFIG)).toEqual([]);
   });
 

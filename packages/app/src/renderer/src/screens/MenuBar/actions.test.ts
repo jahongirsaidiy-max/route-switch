@@ -3,7 +3,7 @@ import { describe, expect, it, vi } from 'vitest';
 
 import { i18nFor } from '../../../../i18n';
 import type { RsResult } from '../../rs';
-import { openRules, reapply, setRouting, type MenuBarApi } from './actions';
+import { openHelp, openRules, reapply, setRouting, type MenuBarApi } from './actions';
 import { STATE } from './fixtures';
 
 const done: RsResult<StateResult> = { ok: true, value: { state: STATE } };
@@ -36,6 +36,14 @@ describe('menu bar actions', () => {
   it('a lost answer says the outcome is unknown', async () => {
     const rs = api({ ok: false, code: 'timeout', error: 'timed out' });
     expect((await reapply(rs))?.text).toContain("noma'lum");
+  });
+
+  it('"?" opens the rules window at its Help section (TASK-DELTA-22)', async () => {
+    const rs = api();
+    expect(await openHelp(rs, i18nFor('uz'))).toBeNull();
+    expect(rs.openRulesWindow).toHaveBeenCalledWith({ kind: 'section', section: 'help' });
+    const forbidden = api({ ok: false, code: 'forbidden', error: 'x' });
+    expect((await openHelp(forbidden, i18nFor('en')))?.text).toBe('The rules window did not open. This window is not allowed to do that.');
   });
 
   it('a rules window that would not open says so', async () => {

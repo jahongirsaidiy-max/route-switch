@@ -7,7 +7,6 @@
 import type { Config, DnsWarning, EngineState, IfaceRole, RuleState } from '@routeswitch/shared';
 
 import type { I18n } from '../../../i18n';
-import { UZ } from './errors';
 
 /** Product names: the same in every language. */
 const ROLE_NAMES: Readonly<Record<IfaceRole, string>> = { ethernet: 'Ethernet', wifi: 'Wi‑Fi' };
@@ -42,7 +41,7 @@ export function sameSubnetGateway(interfaces: EngineState['interfaces']): string
  * off (no rule is waiting then). Without the config the rules cannot be told
  * apart by interface, so the count is left out but the interface still is.
  */
-export function networkWarnings(state: EngineState, config: Config | null, i18n: I18n = UZ): NetworkWarning[] {
+export function networkWarnings(state: EngineState, config: Config | null, i18n: I18n): NetworkWarning[] {
   const words = i18n.t.network;
   const warnings: NetworkWarning[] = [];
   if (state.enabled) {
@@ -87,7 +86,7 @@ export interface DnsWarningBanner extends NetworkWarning {
  * (or the rule, by its domain from the config) the server belongs to; the
  * text says why, by the helper's code.
  */
-export function dnsWarningBanners(state: EngineState, config: Config | null, i18n: I18n = UZ): DnsWarningBanner[] {
+export function dnsWarningBanners(state: EngineState, config: Config | null, i18n: I18n): DnsWarningBanner[] {
   const words = i18n.t.dnsWarnings;
   const banners: DnsWarningBanner[] = [];
   const seen = new Set<string>();
@@ -130,7 +129,7 @@ export function lastKnownText(
   state: RuleState,
   now: number,
   shown = LAST_KNOWN_SHOWN,
-  i18n: I18n = UZ,
+  i18n: I18n,
 ): string | null {
   if (state.status !== 'error' || rule.kind !== 'domain') return null;
   const addresses = state.appliedDestinations.filter((destination) => destination !== rule.dns);

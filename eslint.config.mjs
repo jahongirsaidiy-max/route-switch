@@ -151,6 +151,15 @@ const RENDERER_SYNTAX = [
     selector: 'CallExpression[callee.name="require"]',
     message: 'The renderer has no require(). Use ES imports, and the API the preload exposes.',
   },
+  // Text is rendered as React text nodes only (the in-app Help is typed data, TASK-DELTA-22).
+  {
+    selector: 'JSXAttribute[name.name="dangerouslySetInnerHTML"], Property[key.name="dangerouslySetInnerHTML"]',
+    message: 'No HTML injection: render text as React nodes.',
+  },
+  {
+    selector: 'MemberExpression[property.name=/^(innerHTML|outerHTML)$/], CallExpression[callee.property.name="insertAdjacentHTML"]',
+    message: 'No HTML injection: render text as React nodes.',
+  },
 ];
 
 const appConfigs = [

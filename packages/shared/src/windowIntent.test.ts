@@ -4,7 +4,7 @@ import { RULES_WINDOW_SECTIONS, RulesWindowIntent } from './index';
 
 describe('RulesWindowIntent (TASK-DELTA-21)', () => {
   it('a section, or a DNS offer by server and role', () => {
-    expect(RULES_WINDOW_SECTIONS).toEqual(['rules', 'log', 'diagnostics', 'settings']);
+    expect(RULES_WINDOW_SECTIONS).toEqual(['rules', 'log', 'diagnostics', 'settings', 'help']);
     for (const section of RULES_WINDOW_SECTIONS) expect(RulesWindowIntent.parse({ kind: 'section', section })).toEqual({ kind: 'section', section });
     expect(RulesWindowIntent.parse({ kind: 'dns-offer', server: '10.0.0.53', role: 'ethernet' })).toEqual({ kind: 'dns-offer', server: '10.0.0.53', role: 'ethernet' });
   });

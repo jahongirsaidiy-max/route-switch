@@ -1,5 +1,5 @@
 // The rules window (`?view=rules`, 1040×680): a sidebar with the window's
-// sections — Qoidalar, Jurnal, Diagnostika, Sozlamalar — and the helper's status, and the
+// sections — Qoidalar, Jurnal, Diagnostika, Sozlamalar, Yordam — and the helper's status, and the
 // chosen section beside it. The macOS title bar is the real one, so the
 // design's drawn traffic lights are not repeated. The design's "Interfeyslar"
 // and "DNS resolverlar" items have no screen in the MVP and are left out.
@@ -23,6 +23,7 @@ import type { IfaceRole, RulesWindowSection } from '@routeswitch/shared';
 
 import { AddRuleDialog, dnsWarningViews, requestedForm, type RuleEditorTarget, type RuleForm } from '../AddRule';
 import { DiagnosticsScreen } from '../Diagnostics';
+import { HelpScreen } from '../Help';
 import { useInstall } from '../Install';
 import { LogScreen } from '../Log';
 import { SettingsScreen } from '../Settings';
@@ -80,12 +81,23 @@ function SettingsIcon(): ReactElement {
   );
 }
 
+/** "Yordam" (not in the design): a question mark in a circle, in the stroke of the design's icons. */
+function HelpIcon(): ReactElement {
+  return (
+    <Svg>
+      <circle cx="12" cy="12" r="9" />
+      <path d="M9.5 9.5a2.5 2.5 0 0 1 4.9.7c0 1.7-2.4 2.1-2.4 3.6M12 17v.01" />
+    </Svg>
+  );
+}
+
 /** The sidebar's sections, in order; their names are `t.rules.sections`. */
 export const SECTIONS: readonly { readonly id: RulesSection; readonly icon: () => ReactElement }[] = [
   { id: 'rules', icon: () => <RouteIcon size={16} /> },
   { id: 'log', icon: LogIcon },
   { id: 'diagnostics', icon: DiagnosticsIcon },
   { id: 'settings', icon: SettingsIcon },
+  { id: 'help', icon: HelpIcon },
 ];
 
 /** What a section's screen gets from the window: the way into the add-rule form. */
@@ -93,6 +105,8 @@ export interface SectionScreenProps {
   /** Opens the add-rule form; filled in with `prefill` (a DNS warning's offer). */
   readonly onAddRule: (prefill?: RuleForm) => void;
   readonly onEditRule: (id: string) => void;
+  /** Shows another section of this window (a link of the Help). */
+  readonly onOpenSection: (section: RulesSection) => void;
 }
 
 /** The screen of each section. */
@@ -101,6 +115,7 @@ export const SECTION_SCREENS: Readonly<Record<RulesSection, ComponentType<Sectio
   log: () => <LogScreen />,
   diagnostics: () => <DiagnosticsScreen />,
   settings: () => <SettingsScreen />,
+  help: ({ onOpenSection }) => <HelpScreen onOpenSection={onOpenSection} />,
 };
 
 export interface RulesWindowFrameProps {
@@ -371,6 +386,7 @@ export function RulesWindow({
           onEditRule={(id) => {
             open({ mode: 'edit', id });
           }}
+          onOpenSection={setSection}
         />
       </RulesWindowFrame>
       {/* Keyed by what it edits: another rule opens a fresh form. */}

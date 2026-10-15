@@ -24,13 +24,13 @@ const HELPER_STATUS_TONE: Readonly<Record<EngineStateView['helper'], HelperStatu
 };
 
 /** The short status line of a helper status, in the language of `i18n`. */
-export function helperStatusText(status: EngineStateView['helper'], i18n: I18n = UZ): HelperStatusText {
+export function helperStatusText(status: EngineStateView['helper'], i18n: I18n): HelperStatusText {
   return { text: i18n.t.helperStatus[status], tone: HELPER_STATUS_TONE[status] };
 }
 
 /** Every status line in Uzbek (screens that do not pass their language yet). */
 export const HELPER_STATUS_TEXT: Readonly<Record<EngineStateView['helper'], HelperStatusText>> = Object.fromEntries(
-  Object.keys(HELPER_STATUS_TONE).map((status) => [status, helperStatusText(status as EngineStateView['helper'])]),
+  Object.keys(HELPER_STATUS_TONE).map((status) => [status, helperStatusText(status as EngineStateView['helper'], UZ)]),
 ) as Record<EngineStateView['helper'], HelperStatusText>;
 
 /**
@@ -54,12 +54,12 @@ export interface HelperNotice {
 }
 
 /** The notice while the first snapshot is on its way. */
-export const loadingNotice = (i18n: I18n = UZ): HelperNotice => ({ title: i18n.t.notice.loadingTitle, text: '', tone: 'neutral', recovery: null });
+export const loadingNotice = (i18n: I18n): HelperNotice => ({ title: i18n.t.notice.loadingTitle, text: '', tone: 'neutral', recovery: null });
 
-export const LOADING_NOTICE: HelperNotice = loadingNotice();
+export const LOADING_NOTICE: HelperNotice = loadingNotice(UZ);
 
 /** The notice for every helper status but `connected`; where it matters it says that applied routes stay with the helper. */
-export function helperNotice(engine: EngineStateView, i18n: I18n = UZ): HelperNotice | null {
+export function helperNotice(engine: EngineStateView, i18n: I18n): HelperNotice | null {
   const connection = engine.connection;
   const words = i18n.t.notice;
   switch (engine.helper) {

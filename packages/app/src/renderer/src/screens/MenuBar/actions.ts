@@ -30,6 +30,12 @@ export async function openRules(rs: MenuBarApi, i18n: I18n = UZ): Promise<Feedba
   return result.ok ? null : { tone: 'danger', text: i18n.t.menuBar.rulesWindowFailed(errorText(result.code, i18n)) };
 }
 
+/** The header's "?": the rules window at its "Yordam" section (TASK-DELTA-22). */
+export async function openHelp(rs: MenuBarApi, i18n: I18n = UZ): Promise<Feedback | null> {
+  const result = await rs.openRulesWindow({ kind: 'section', section: 'help' });
+  return result.ok ? null : { tone: 'danger', text: i18n.t.menuBar.rulesWindowFailed(errorText(result.code, i18n)) };
+}
+
 /**
  * A DNS warning's "qoidasini qo'shish" (TASK-DELTA-21): opens the rules window
  * with the intent of that warning — its server and role, not a rule. The

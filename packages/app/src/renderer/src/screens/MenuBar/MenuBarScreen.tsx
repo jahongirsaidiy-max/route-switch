@@ -33,7 +33,7 @@ import { installHelper } from '../Install';
 import { dnsWarningViews } from '../AddRule/model';
 import { backupKey, backupOffer, useBackup, type BackupApi } from '../Rules/recovery';
 import { DnsWarningBanner } from '../Rules/RulesScreen';
-import { openRules, reapply, setRouting, suggestRule, type MenuBarApi } from './actions';
+import { openHelp, openRules, reapply, setRouting, suggestRule, type MenuBarApi } from './actions';
 import styles from './MenuBarScreen.module.css';
 import { defaultRole, interfacesKey, menuRules, statusLine, type MenuRule, type StatusLine } from './model';
 
@@ -57,6 +57,8 @@ export interface MenuBarPanelProps {
   readonly onToggle: (next: boolean) => void;
   readonly onApply: () => void;
   readonly onOpenRules: () => void;
+  /** The header's "?": the rules window at its Help section (TASK-DELTA-22). Absent: no button. */
+  readonly onOpenHelp?: () => void;
   readonly onReloadConfig: () => void;
   /** "Qayta ulanish" of the helper notice. */
   readonly onReconnect: () => void;
@@ -250,6 +252,17 @@ export function MenuBarPanel(props: MenuBarPanelProps): ReactElement {
             </h1>
           </div>
           <div className={styles['switch']}>
+            {props.onOpenHelp === undefined ? null : (
+              <button
+                type="button"
+                className={styles['helpButton']}
+                aria-label={i18n.t.rules.sections.help}
+                title={i18n.t.rules.sections.help}
+                onClick={props.onOpenHelp}
+              >
+                ?
+              </button>
+            )}
             <span aria-hidden="true">{state === null ? '' : enabled ? words.on : words.off}</span>
             <Toggle
               checked={enabled}
@@ -417,6 +430,9 @@ export function MenuBarScreen({ rs: given }: MenuBarScreenProps): ReactElement {
       }}
       onOpenRules={() => {
         run('rules', () => openRules(rs, i18n));
+      }}
+      onOpenHelp={() => {
+        run('rules', () => openHelp(rs, i18n));
       }}
       onSuggestRule={(request) => {
         run('rules', () => suggestRule(rs, request, i18n));

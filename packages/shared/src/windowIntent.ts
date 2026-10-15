@@ -7,12 +7,12 @@ import { IfaceRole } from './schema';
  * What the rules window is opened for (`rs:openRulesWindow`, TASK-DELTA-21).
  * App-only, like the preferences: the helper never sees it; it lives here so
  * that the main process checks the IPC argument with zod without importing
- * zod itself. A new section (TASK-DELTA-22: `help`) is one more entry of
- * `RULES_WINDOW_SECTIONS`; a new kind, one more member of the union.
+ * zod itself. A new section is one more entry of `RULES_WINDOW_SECTIONS`
+ * (TASK-DELTA-22 added `help`); a new kind, one more member of the union.
  */
 
-/** The sidebar sections of the rules window. */
-export const RULES_WINDOW_SECTIONS = ['rules', 'log', 'diagnostics', 'settings'] as const;
+/** The sidebar sections of the rules window (`help`: the in-app guide, TASK-DELTA-22). */
+export const RULES_WINDOW_SECTIONS = ['rules', 'log', 'diagnostics', 'settings', 'help'] as const;
 export const RulesWindowSection = z.enum(RULES_WINDOW_SECTIONS);
 export type RulesWindowSection = z.infer<typeof RulesWindowSection>;
 

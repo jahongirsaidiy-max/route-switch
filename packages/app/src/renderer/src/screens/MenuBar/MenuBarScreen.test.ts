@@ -10,7 +10,7 @@ import { IDLE_CONFIG, type ConfigView } from '../../hooks/useConfig';
 import { LOADING_VIEW, type EngineStateView } from '../../hooks/useEngineState';
 import type { RsApi, RsServiceOrder, RsSnapshot } from '../../rs';
 import { CONFIG, ID, NOW, ORDER_WIFI_FIRST, STATE, ruleState } from './fixtures';
-import { helperNotice, INSTALL_TEXT } from '../../text';
+import { helperNotice, INSTALL_TEXT, UZ } from '../../text';
 import { followServiceOrder, MenuBarPanel, MenuBarScreen, type MenuBarPanelProps } from './MenuBarScreen';
 
 const connected = (state: EngineState = STATE): EngineStateView => ({
@@ -140,6 +140,18 @@ describe('MenuBarPanel — connected', () => {
     button(elements, 'Qoidalarni boshqarish').props.onClick?.();
     expect(all.onApply).toHaveBeenCalledTimes(1);
     expect(all.onOpenRules).toHaveBeenCalledTimes(1);
+  });
+
+  it('the header\'s "?" opens the Help (TASK-DELTA-22), named in the window\'s language; no button without the action', () => {
+    const onOpenHelp = vi.fn();
+    const { elements } = treeOf({ onOpenHelp });
+    const help = elements.find((element) => element.type === 'button' && element.props.children === '?');
+    expect(help?.props).toMatchObject({ 'aria-label': 'Yordam', title: 'Yordam' });
+    help?.props.onClick?.();
+    expect(onOpenHelp).toHaveBeenCalledTimes(1);
+    expect(render({ onOpenHelp, i18n: i18nFor('ru') })).toContain('aria-label="Справка"');
+    expect(render({ onOpenHelp, i18n: i18nFor('en') })).toContain('aria-label="Help"');
+    expect(render()).not.toContain('aria-label="Yordam"');
   });
 
   it('a running action is busy (announced, focus kept), not disabled', () => {
@@ -320,12 +332,12 @@ describe('MenuBarPanel — no live state', () => {
   });
 
   it('says why the helper is unreachable and that routes stay applied', () => {
-    expect(helperNotice(views[3]?.[1] ?? LOADING_VIEW)?.text).toBe(
+    expect(helperNotice(views[3]?.[1] ?? LOADING_VIEW, UZ)?.text).toBe(
       "Helper ishlamayapti. U launchd orqali qayta ishga tushadi; bo'lmasa qayta o'rnating. Qo'llangan route'lar helper'da qoladi.",
     );
-    expect(helperNotice(views[4]?.[1] ?? LOADING_VIEW)?.text).toContain('v0.0.9');
-    expect(helperNotice(views[7]?.[1] ?? LOADING_VIEW)?.text).toBe("Bu oynadan ruxsat yo'q.");
-    expect(helperNotice(connected())).toBeNull();
+    expect(helperNotice(views[4]?.[1] ?? LOADING_VIEW, UZ)?.text).toContain('v0.0.9');
+    expect(helperNotice(views[7]?.[1] ?? LOADING_VIEW, UZ)?.text).toBe("Bu oynadan ruxsat yo'q.");
+    expect(helperNotice(connected(), UZ)).toBeNull();
   });
 
   it('helper away: "Qayta ulanish" asks for a reconnect, and is busy (not disabled) while asked', () => {
