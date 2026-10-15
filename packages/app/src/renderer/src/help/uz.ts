@@ -146,7 +146,7 @@ export const helpUz: HelpDoc = {
       blocks: [
         p(
           "Hech bir qoidaga tushmagan trafik default kanaldan ketadi. macOS uni tarmoq xizmatlari tartibidan oladi: ro'yxatdagi birinchi ulangan xizmat. ",
-          "Menu bar'dagi interfeys kartasida DEFAULT belgisi shuni ko'rsatadi.",
+          `Menu bar'dagi interfeys kartasida ${m.components.iface.defaultTag} belgisi shuni ko'rsatadi.`,
         ),
         p(
           "Ethernet ro'yxatda Wi‑Fi'dan yuqori bo'lsa, internet ham kabel orqali ketadi. RouteSwitch default route'ga tegmaydi; tartibni o'zgartirish administrator huquqini talab qiladi, shuning uchun ",
@@ -245,7 +245,7 @@ export const helpUz: HelpDoc = {
         ),
         sub("«Tekshiruvlar juda ko'p»"),
         p(
-          "Helper daqiqasiga 10 tagacha diagnostika so'rovini bajaradi (qoidaga tushmagan nomning har manzili — alohida so'rov). Bir daqiqa kutib, qayta urinib ko'ring.",
+          "Helper har bir ulanish uchun daqiqasiga 10 tagacha diagnostika so'rovini bajaradi (qoidaga tushmagan nomning har manzili — alohida so'rov). Bir daqiqa kutib, qayta urinib ko'ring.",
         ),
         p(
           "Boshqa xatolar sababini ",

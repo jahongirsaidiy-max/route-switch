@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 
-import { LOCALES } from '../../../i18n';
+import { LOCALES, MESSAGES } from '../../../i18n';
 import { HELP_DOCS, HELP_TOPICS, type HelpBlock, type HelpDoc, type HelpInline, type HelpTopic } from './index';
 import { helpUz } from './uz';
 
@@ -50,6 +50,8 @@ describe('the Help documents', () => {
       // Secure DNS in the browser, and the diagnostics limit of 10 a minute.
       expect(text).toMatch(/DNS.over.HTTPS/);
       expect(text).toMatch(/\b10\b/);
+      // The tag the menu bar shows on the default interface, in this language (ru: not "DEFAULT").
+      expect(text).toContain(`${MESSAGES[locale].components.iface.defaultTag} `);
     }
   });
 

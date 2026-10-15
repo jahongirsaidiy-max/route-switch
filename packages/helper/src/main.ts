@@ -73,7 +73,7 @@ import { UNINSTALL_REPLY_TIMEOUT_MS, requestUninstall, type UninstallReply } fro
  */
 
 /** Version of the helper, reported in `EngineState.helperVersion`. Kept equal to `package.json` by a test. */
-export const HELPER_VERSION = '0.1.0';
+export const HELPER_VERSION = '0.2.0';
 
 export const EXIT_CODES = {
   ok: 0,

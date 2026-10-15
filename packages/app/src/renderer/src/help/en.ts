@@ -145,7 +145,7 @@ export const helpEn: HelpDoc = {
       blocks: [
         p(
           'Traffic that no rule covers goes through the default route. macOS takes it from the network service order: the first connected service in the list. ',
-          'The DEFAULT tag on an interface card in the menu bar shows which one it is.',
+          `The ${m.components.iface.defaultTag} tag on an interface card in the menu bar shows which one it is.`,
         ),
         p(
           'If Ethernet is above Wi‑Fi in that list, the internet goes over the cable too. RouteSwitch never touches the default route, and changing the order needs administrator rights, so the ',
@@ -245,7 +245,7 @@ export const helpEn: HelpDoc = {
         ),
         sub('“Too many checks”'),
         p(
-          'The helper runs up to 10 diagnostic requests a minute (each address of a name no rule covers is a request of its own). Wait a minute and try again.',
+          'For each connection, the helper runs up to 10 diagnostic requests a minute (each address of a name no rule covers is a request of its own). Wait a minute and try again.',
         ),
         p(
           'For other errors, ',

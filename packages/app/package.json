@@ -1,6 +1,6 @@
 {
   "name": "@routeswitch/app",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "license": "MIT",
   "private": true,
   "description": "RouteSwitch Electron app",
@@ -13,7 +13,7 @@
     "typecheck": "tsc --noEmit -p tsconfig.node.json && tsc --noEmit -p tsconfig.web.json"
   },
   "devDependencies": {
-    "@routeswitch/shared": "0.1.0",
+    "@routeswitch/shared": "0.2.0",
     "@types/react": "19.3.0",
     "@types/react-dom": "19.3.0",
     "@vitejs/plugin-react": "5.1.4",

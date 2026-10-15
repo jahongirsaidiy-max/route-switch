@@ -31,7 +31,10 @@ network changes.
   &nbsp;
   <img src="docs/rules-window.png" width="520" alt="Rules window">
 </p>
-<p align="center"><sub>Screenshots with sample data. The interface is in Uzbek.</sub></p>
+<p align="center">
+  <img src="docs/diagnostics.png" width="520" alt="Diagnostics: which rule matches corp.local and the route each address takes">
+</p>
+<p align="center"><sub>Screenshots with sample data. The interface is available in English, Russian and Uzbek.</sub></p>
 
 ## Download
 
@@ -63,27 +66,38 @@ to install the helper.
    `xattr -dr com.apple.quarantine /Applications/RouteSwitch.app` once.
    A copy you built yourself is not quarantined and opens directly.
 3. RouteSwitch lives in the menu bar (no Dock icon). It shows
-   "Helper o'rnatilmagan" (*helper not installed*); click
-   **Helper'ni o'rnatish** (*install helper*) and enter the administrator
-   password once. The helper daemon then runs as root under `launchd` and
-   keeps your routes even when the app is closed.
+   "Helper is not installed"; click **Install the helper** and enter the
+   administrator password once. The helper daemon then runs as root under
+   `launchd` and keeps your routes even when the app is closed.
+
+The app starts in the language of macOS (English, Russian, otherwise Uzbek);
+change it in **Settings → Til / Язык / Language**.
+
+### Updating from 0.1
+
+Replace the app in Applications with the new one and open it. The 0.1 helper
+speaks an older protocol, so RouteSwitch reports "Helper version does not
+match": click **Reinstall the helper** and enter the administrator password.
+Your rules are kept.
 
 ## Quick start
 
 Route an office network and its internal domain through Ethernet, leave the
 rest on Wi‑Fi:
 
-1. Click the menu bar icon, then **Qoidalarni boshqarish** (*manage rules*).
-2. Click **Qoida qo'shish** (*add rule*):
-   - type **Subnet**, address `10.0.0.0/8`, interface **Ethernet**;
-   - optionally **Sinab ko'rish** (*test*) to see which interface the
-     address uses right now;
-   - **Saqlash va qo'llash** (*save and apply*).
-3. Add a second rule: type **Domen** (*domain*), address `corp.local`,
-   interface **Ethernet**. If internal names are only known to the office DNS,
-   tick **Ichki DNS server orqali resolve qilish** (*resolve through an
-   internal DNS server*) and enter its address, e.g. `10.0.0.53`.
-4. Check it from Terminal:
+1. Click the menu bar icon, then **Manage rules**.
+2. Click **Add rule**:
+   - type **Subnet**, address `10.0.0.0/8` (or the wildcard `10.*.*.*`),
+     interface **Ethernet**;
+   - optionally **Test** to see which interface the address uses right now;
+   - **Save and apply**.
+3. Add a second rule: type **Domain**, address `corp.local`, interface
+   **Ethernet**. If internal names are only known to the office DNS, tick
+   **Resolve through an internal DNS server** and enter its address, e.g.
+   `10.0.0.53`.
+4. Check it in **Diagnostics** (rules window): enter `corp.local` or an
+   address to see the matching rule and the route each address takes. Or from
+   Terminal:
 
    ```bash
    route -n get 10.1.2.3     # interface: the Ethernet device (e.g. en5)
@@ -92,24 +106,25 @@ rest on Wi‑Fi:
 
 Rules are re-applied automatically when the cable, the Wi‑Fi network or sleep
 state changes. Use **Export** in the rules window to save them as JSON and
-**Import** to load them on another Mac.
+**Import** to load them on another Mac. **Help** in the rules window explains
+every part of the app.
 
 ## Uninstall
 
-> [!WARNING]
-> **Removing the helper also deletes your rules** — they are stored by the
-> helper. Use **Export** in the rules window first if you want to keep them.
-
-1. **Sozlamalar → Helper'ni o'chirish** (*Settings → remove helper*) removes
-   the helper's routes and resolver files, the daemon and its files, including
-   the rules.
+1. **Settings → Remove the helper** removes the helper's routes and resolver
+   files, the daemon and its files, including the rules it stores. The app
+   keeps a backup of your rules and offers to restore them if you install the
+   helper again.
 2. Quit RouteSwitch and move it from Applications to the Trash.
+3. To remove the backup and the app settings too, delete
+   `~/Library/Application Support/RouteSwitch`.
 
 ## What it does
 
 - **Three kinds of rules**
   - **IP** — a single host, e.g. `10.20.30.40`
-  - **Subnet** — an IPv4 CIDR block, e.g. `10.0.0.0/8`
+  - **Subnet** — an IPv4 CIDR block, e.g. `10.0.0.0/8`, or a wildcard such as
+    `10.*.*.*` (saved as `10.0.0.0/8`)
   - **Domain** — e.g. `corp.local`; its A records are resolved and applied as
     IP routes, then refreshed periodically
 - **Per-rule interface** — each rule is bound to Ethernet or Wi‑Fi.
@@ -122,9 +137,16 @@ state changes. Use **Export** in the rules window to save them as JSON and
   helper, so quitting the UI does not drop your routes.
 - **Menu bar UI** — a compact status window, a rules manager, and an "add rule"
   form with a "test" button that shows which interface a target would use.
-- **Config import / export** as JSON.
+- **Diagnostics** — for a host, IP or URL: the matching rule and why, the
+  route each address really takes compared with the expected one, and the DNS
+  server in use. Read-only.
+- **DNS server warnings** — when an internal DNS server is reached through the
+  wrong interface, with a one-click rule suggestion.
+- **Config import / export** as JSON, and an automatic **backup of your rules**
+  that can be restored after reinstalling the helper.
 - **Journal and settings** — an event log, launch at login, choice of the
   Ethernet adapter, and the Wi‑Fi service order.
+- **English, Russian and Uzbek** UI, with built-in **Help** in each.
 
 ## How it works
 
@@ -293,11 +315,18 @@ Builds are signed ad hoc. To distribute to other Macs later:
   removal, import/export, journal and settings, launch at login.
 - Packaging — one `.dmg` per architecture, uninstall script.
 
-**Next:** IPv6 routes (planned for 0.2).
+**Done in 0.2.0:** English, Russian and Uzbek UI; IP wildcards; rules backup
+and restore; Diagnostics; DNS server warnings; in-app Help.
 
-**Not planned in 0.1:**
+**Planned:**
 
-- Wildcard domains (`*.example.com`) — would need a DNS proxy
+- **0.3.0** — wildcard domains (`*.example.com`) through a local DNS proxy.
+- **0.4.0** — rule profiles, notifications, keeping Wi‑Fi first as the default
+  route, and a command-line tool.
+
+**Not planned:**
+
+- IPv6 routes
 - VPN (`utun`) interfaces
 - Per-application routing — would need a Network Extension
 - Mac App Store distribution
