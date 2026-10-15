@@ -13,6 +13,7 @@ import { logEn } from './sections/log.en';
 import { settingsEn } from './sections/settings.en';
 import { backupEn } from './sections/backup.en';
 import { diagnosticsEn } from './sections/diagnostics.en';
+import { dnsWarningsEn } from './sections/dnsWarnings.en';
 
 const unexpected = (code: string): string => `Unexpected error (${code}).`;
 
@@ -31,6 +32,7 @@ export const en: Messages = {
     disconnected: 'No answer came, so the outcome is unknown. The status will update when the helper reconnects.',
     timeout: 'No answer came, so the outcome is unknown. The status will update when the helper reconnects.',
     busy: 'The helper is busy — try again in a moment.',
+    'rate-limited': 'Too many requests — try again in a minute.',
     'not-implemented': 'The installed helper cannot do this yet.',
     'invalid-config': 'The value was not accepted.',
     'invalid-input': 'The value was not accepted.',
@@ -221,4 +223,6 @@ export const en: Messages = {
   addRule: addRuleEn,
   /** The "Diagnostika" section of the rules window (TASK-DELTA-20): `sections/diagnostics.*`. */
   diagnostics: diagnosticsEn,
+  /** "DNS server boshqa interfeysda" and its add-rule offer (TASK-DELTA-21): `sections/dnsWarnings.*`. */
+  dnsWarnings: dnsWarningsEn,
 };

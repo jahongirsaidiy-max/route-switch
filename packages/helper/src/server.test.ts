@@ -899,7 +899,7 @@ describe('request handler: diagnose', () => {
     const first = send(h.handler.dispatch, diagnoseRequest(1), { connection: 1 });
     await flush();
     const second = await send(h.handler.dispatch, diagnoseRequest(2), { connection: 1 });
-    expect(second.response).toEqual({ id: 2, ok: false, code: 'operation-failed', error: 'A diagnosis is already running on this connection' });
+    expect(second.response).toEqual({ id: 2, ok: false, code: 'busy', error: 'A diagnosis is already running on this connection' });
     await held.releaseAll();
     expect((await first).response).toMatchObject({ ok: true });
     expect((await send(h.handler.dispatch, diagnoseRequest(3), { connection: 1 })).response).toMatchObject({ ok: true });
@@ -911,7 +911,7 @@ describe('request handler: diagnose', () => {
     const running = [send(h.handler.dispatch, diagnoseRequest(1), { connection: 1 }), send(h.handler.dispatch, diagnoseRequest(2), { connection: 2 })];
     await flush();
     const third = await send(h.handler.dispatch, diagnoseRequest(3), { connection: 3 });
-    expect(third.response).toEqual({ id: 3, ok: false, code: 'operation-failed', error: 'Too many diagnoses are running; try again shortly' });
+    expect(third.response).toEqual({ id: 3, ok: false, code: 'busy', error: 'Too many diagnoses are running; try again shortly' });
     await held.releaseAll();
     for (const outcome of await Promise.all(running)) expect(outcome.response).toMatchObject({ ok: true });
   });
@@ -922,11 +922,18 @@ describe('request handler: diagnose', () => {
       expect((await send(h.handler.dispatch, diagnoseRequest(id), { connection: 1 })).response).toMatchObject({ ok: true });
     }
     const refused = await send(h.handler.dispatch, diagnoseRequest(99), { connection: 1 });
-    expect(refused.response).toEqual({ id: 99, ok: false, code: 'operation-failed', error: 'Too many diagnoses on this connection; try again in a minute' });
+    expect(refused.response).toEqual({ id: 99, ok: false, code: 'rate-limited', error: 'Too many diagnoses on this connection; try again in a minute' });
     // Another connection has its own budget.
     expect((await send(h.handler.dispatch, diagnoseRequest(100), { connection: 2 })).response).toMatchObject({ ok: true });
     h.scheduler.advance(DIAGNOSE_LIMITS.windowMs);
     expect((await send(h.handler.dispatch, diagnoseRequest(101), { connection: 1 })).response).toMatchObject({ ok: true });
+  });
+
+  it('a limit refusal is an expected answer: no warning in the log (TASK-DELTA-21)', async () => {
+    const entries: LogEntry[] = [];
+    const h = handlerHarness({ logger: createLogger({ sinks: [(entry) => entries.push(entry)] }) });
+    for (let id = 1; id <= DIAGNOSE_LIMITS.perConnectionPerWindow + 1; id += 1) await send(h.handler.dispatch, diagnoseRequest(id), { connection: 1 });
+    expect(entries.filter((entry) => entry.level === 'warn' && entry.msg === 'request failed')).toEqual([]);
   });
 
   it('a request without an origin shares one budget instead of escaping the limits', async () => {
@@ -934,7 +941,7 @@ describe('request handler: diagnose', () => {
     const h = handlerHarness({ routeGet: held.routeGet });
     const first = h.handler.dispatch(diagnoseRequest(1));
     await flush();
-    expect((await h.handler.dispatch(diagnoseRequest(2))).response).toMatchObject({ ok: false, code: 'operation-failed' });
+    expect((await h.handler.dispatch(diagnoseRequest(2))).response).toMatchObject({ ok: false, code: 'busy' });
     await held.releaseAll();
     expect((await first).response).toMatchObject({ ok: true });
   });
@@ -957,6 +964,7 @@ describe('request handler: diagnose', () => {
     // The lookup still runs: the connection's one slot is still taken.
     expect((await send(h.handler.dispatch, diagnoseRequest(2), { connection: 1 })).response).toMatchObject({
       ok: false,
+      code: 'busy',
       error: 'A diagnosis is already running on this connection',
     });
     await held.releaseAll();

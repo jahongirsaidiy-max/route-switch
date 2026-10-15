@@ -12,6 +12,7 @@ import type {
   IfaceRole,
   Language,
   RuleInput,
+  RulesWindowIntent,
   SetConfigResult,
   StateResult,
   TestResult,
@@ -343,9 +344,25 @@ export interface RsApi {
   /**
    * Opens the rules window, or brings the open one to the front ("Qoidalarni
    * boshqarish" of the menu bar window). Main process only: nothing is sent to
-   * the helper. The value is null.
+   * the helper. The value is null. With `intent` (checked with the shared
+   * `RulesWindowIntent`; anything else is `invalid-input` and nothing opens),
+   * the main process keeps it for the rules window — a minute at most, the
+   * last one wins — and tells that window through `onRulesIntent`; the window
+   * takes it with `takeRulesIntent` (TASK-DELTA-21).
    */
-  openRulesWindow(): Promise<RsResult<null>>;
+  openRulesWindow(intent?: RsRulesIntent): Promise<RsResult<null>>;
+  /**
+   * The intent waiting for the rules window, once: it is gone after this call.
+   * Null when there is none (or it is older than a minute). Answered to the
+   * rules window only (`forbidden` elsewhere).
+   */
+  takeRulesIntent(): Promise<RsResult<RsRulesIntent | null>>;
+  /**
+   * Calls `listener` when an intent is waiting (sent to the rules window only;
+   * no value — take it with `takeRulesIntent`). Subscribe first, then take
+   * once for one that arrived before.
+   */
+  onRulesIntent(listener: () => void): RsUnsubscribe;
   /**
    * Tries to connect to the helper now instead of waiting for the next
    * automatic attempt ("Qayta ulanish"). The value is null; the outcome
@@ -427,7 +444,8 @@ export interface RsInvokeChannels {
   'rs:getServiceOrder': { readonly args: readonly []; readonly value: RsServiceOrder };
   'rs:copyServiceOrderCommand': { readonly args: readonly []; readonly value: RsServiceOrder };
   'rs:uninstall': { readonly args: readonly []; readonly value: UninstallResult };
-  'rs:openRulesWindow': { readonly args: readonly []; readonly value: null };
+  'rs:openRulesWindow': { readonly args: readonly [] | readonly [intent: RsRulesIntent]; readonly value: null };
+  'rs:takeRulesIntent': { readonly args: readonly []; readonly value: RsRulesIntent | null };
   'rs:reconnect': { readonly args: readonly []; readonly value: null };
   'rs:resetConfig': { readonly args: readonly []; readonly value: SetConfigResult };
   'rs:installHelper': { readonly args: readonly []; readonly value: RsHelperSetupResult };
@@ -450,6 +468,12 @@ export type RsLogChannel = 'rs:log';
 
 /** The channel the main process sends every new UI language on. */
 export type RsLanguageChannel = 'rs:language';
+
+/** The channel that tells the rules window an intent is waiting (`takeRulesIntent`). No value. */
+export type RsRulesIntentChannel = 'rs:rulesIntent';
+
+/** What the rules window is opened for: a section, or a DNS warning's add-rule offer (shared `RulesWindowIntent`). */
+export type RsRulesIntent = RulesWindowIntent;
 
 declare global {
   interface Window {

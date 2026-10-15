@@ -169,7 +169,11 @@ function verdictOf(
       advice: lookup.outcome === 'not-found' ? words.advice.noAddresses : null,
     };
   }
-  if (rows.length === 0) return { tone: 'warning', title: words.verdict.noAddresses, advice: words.advice.noAddresses };
+  if (rows.length === 0) {
+    // `localhost` and the like: the resolver answered, but only with addresses that are never routed.
+    if (lookup !== null && lookup.excluded > 0) return { tone: 'neutral', title: words.verdict.onlyExcluded, advice: words.advice.onlyExcluded };
+    return { tone: 'warning', title: words.verdict.noAddresses, advice: words.advice.noAddresses };
+  }
   if (rows.some((row) => row.status === 'mismatch' || row.status === 'unknown')) {
     const advice = notes.has('interface-down') || notes.has('no-gateway')
       ? words.advice.interfaceDown
@@ -209,6 +213,8 @@ function lookupLines(diagnosis: RsDiagnosis, i18n: I18n): string[] {
   const words = i18n.t.diagnostics.lookup;
   // A failed lookup is the verdict itself; it is not repeated.
   if (lookup.outcome !== 'ok') return [];
+  // Only addresses that are never routed: one line that says so (not "0 IPv4 addresses" next to the excluded ones).
+  if (lookup.addresses.length === 0 && lookup.excluded > 0) return [words.onlyExcluded(lookup.excluded)];
   // Truncated: only the first addresses were diagnosed (the main process's limit) — as many as are listed.
   const lines = [lookup.truncated ? words.truncated(lookup.addresses.length) : words.ok(lookup.addresses.length)];
   if (lookup.excluded > 0) lines.push(words.excluded(lookup.excluded));

@@ -25,7 +25,7 @@ import {
 
 import type { I18n } from '../../../../i18n';
 import { ROLE_LABELS } from '../../components';
-import { isValidationCode, UZ } from '../../text';
+import { dnsWarningBanners, isValidationCode, UZ, type DnsWarningBanner } from '../../text';
 
 /** The fields that can carry an error of their own. */
 export type FormField = 'target' | 'dns' | 'refreshSec' | 'note';
@@ -396,4 +396,82 @@ export function describeTest(result: TestResult, iface: IfaceRole, ruleId: strin
   }
   const now = result.role === null ? words.testOtherNow : words.testRoleNow(roleOf(result.role));
   return { tone: 'warning', route, verdict: saved ? words.testNotRole(now, roleOf(iface)) : words.testAfterSave(now, roleOf(iface)) };
+}
+
+// ---------------------------------------------------------------------------
+// "DNS server boshqa interfeysda": the one-click offer (TASK-DELTA-21)
+// ---------------------------------------------------------------------------
+
+/** The rule a DNS warning offers: the server as an `ip` rule through the role it belongs to, noted "DNS server". */
+export function dnsRuleForm(server: string, role: IfaceRole, i18n: I18n = UZ): RuleForm {
+  return { ...NEW_RULE_FORM, kind: 'ip', target: server, iface: role, note: i18n.t.dnsWarnings.ruleNote };
+}
+
+/** The offer's button (it opens the form filled in), or why there is none. */
+export type DnsRuleOffer =
+  | { readonly kind: 'offer'; readonly form: RuleForm; readonly label: string }
+  | { readonly kind: 'blocked'; readonly text: string };
+
+/** The id the offer is checked with: the form gets its own when it opens. Any valid UUID would do. */
+const OFFER_CHECK_ID = '00000000-0000-4000-8000-000000000000';
+
+/**
+ * Whether the rule a warning offers would be routed, before it is offered:
+ * the helper's connected-network guard for a host route (the server is the
+ * gateway or the own address of an interface of either role — the state
+ * carries no netmask, so this is the part of the guard the renderer can
+ * see), the role up with a gateway, then the shared schema against the
+ * config, like the form's own save (`checkForm`: a forbidden address, the
+ * server bound to the other interface by another rule, the 500-rule limit).
+ * A rule for the same destination through the same role is not offered
+ * again: it exists (off, or failing — its row says why).
+ */
+export function dnsRuleOffer(
+  warning: Pick<DnsWarningBanner, 'server' | 'role'>,
+  interfaces: EngineState['interfaces'],
+  config: Config | null,
+  i18n: I18n = UZ,
+): DnsRuleOffer {
+  const words = i18n.t.dnsWarnings;
+  const { server, role } = warning;
+  for (const each of ['ethernet', 'wifi'] as const) {
+    const iface = interfaces[each];
+    if (iface.gateway === server) return { kind: 'blocked', text: words.blockedGateway(server, roleOf(each)) };
+    if (iface.ip === server) return { kind: 'blocked', text: words.blockedOwnAddress(server, roleOf(each)) };
+  }
+  const own = interfaces[role];
+  if (!own.up || own.gateway === null) return { kind: 'blocked', text: words.blockedNoGateway(roleOf(role)) };
+  const form = dnsRuleForm(server, role, i18n);
+  const check = checkForm(form, OFFER_CHECK_ID, config, i18n);
+  if (check.rule === null) {
+    const field = firstErrorField(check.errors);
+    const reason = (field === null ? null : check.errors[field]) ?? check.formError ?? i18n.t.addRule.errors.invalidRule;
+    return { kind: 'blocked', text: words.blockedInvalid(reason) };
+  }
+  if (check.sameAs !== null) return { kind: 'blocked', text: words.blockedExists(check.sameAs, roleOf(role)) };
+  return { kind: 'offer', form, label: words.addRule(server, roleOf(role)) };
+}
+
+/** A DNS warning's banner and its offer. */
+export interface DnsWarningView extends DnsWarningBanner {
+  readonly offer: DnsRuleOffer;
+}
+
+/** Every DNS warning of the state, one per server, each with its offer. */
+export function dnsWarningViews(state: EngineState, config: Config | null, i18n: I18n = UZ): DnsWarningView[] {
+  return dnsWarningBanners(state, config, i18n).map((banner) => ({
+    ...banner,
+    offer: dnsRuleOffer(banner, state.interfaces, config, i18n),
+  }));
+}
+
+/**
+ * The form a DNS offer opens in the rules window (the menu bar's
+ * `openRulesWindow({ kind: 'dns-offer', server, role })`, TASK-DELTA-21): the
+ * offer of the same warning in the window's own state — the intent names a
+ * warning, not a rule. Null when that state has no such offer (any more).
+ */
+export function requestedForm(request: { readonly server: string; readonly role: IfaceRole }, views: readonly DnsWarningView[]): RuleForm | null {
+  const view = views.find((each) => each.server === request.server && each.role === request.role);
+  return view?.offer.kind === 'offer' ? view.offer.form : null;
 }

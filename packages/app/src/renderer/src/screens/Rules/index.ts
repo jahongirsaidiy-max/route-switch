@@ -18,6 +18,7 @@ export {
 } from './model';
 export {
   ADD_RULE_UNAVAILABLE,
+  DnsWarningBanner,
   RulesPanel,
   RulesScreen,
   type RulesPanelProps,

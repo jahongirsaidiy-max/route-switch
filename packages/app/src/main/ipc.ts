@@ -1,6 +1,6 @@
 // The main-process side of `window.rs`: one `ipcMain.handle` per method of the
 // renderer API (`src/renderer/src/rs.d.ts`) and the `rs:state`, `rs:log` and
-// `rs:language` pushes.
+// `rs:language` pushes, and `rs:rulesIntent` to the rules window.
 //
 // The renderer is treated as untrusted. Every call is checked, in this order:
 // it must come from the top frame of the app's own page; its arguments must
@@ -20,6 +20,7 @@ import {
   findStructureViolation,
   Language,
   Rule,
+  RulesWindowIntent,
   SetEnabledRequest,
   TestRequest,
   type Config,
@@ -35,6 +36,8 @@ import type {
   RsLanguageChannel,
   RsLogChannel,
   RsResult,
+  RsRulesIntent,
+  RsRulesIntentChannel,
   RsSnapshot,
   RsStateChannel,
 } from '../renderer/src/rs';
@@ -49,6 +52,7 @@ import type { PreferencesStore } from './preferences';
 import type { RulesBackupStore } from './rulesBackup';
 import { isAllowedNavigation } from './security';
 import type { Settings } from './settings';
+import { VIEW_PARAM, type WindowView } from './windows';
 
 // `RsConnection` is the renderer's copy of `HelperStatus`; this line fails to
 // compile as soon as the two drift apart.
@@ -57,6 +61,19 @@ const toConnection = (status: HelperStatus): RsConnection => status;
 export const STATE_CHANNEL: RsStateChannel = 'rs:state';
 export const LOG_CHANNEL: RsLogChannel = 'rs:log';
 export const LANGUAGE_CHANNEL: RsLanguageChannel = 'rs:language';
+export const RULES_INTENT_CHANNEL: RsRulesIntentChannel = 'rs:rulesIntent';
+
+/** How long an intent waits for the rules window to take it (TASK-DELTA-21). */
+export const RULES_INTENT_TTL_MS = 60_000;
+
+/** The view of the app page at `url` (`?view=`), or null when it names none. */
+export function viewOf(url: string): string | null {
+  try {
+    return new URL(url).searchParams.get(VIEW_PARAM);
+  } catch {
+    return null;
+  }
+}
 
 /** The channels handled here, in the order of the renderer API. */
 export const INVOKE_CHANNELS = [
@@ -80,6 +97,7 @@ export const INVOKE_CHANNELS = [
   'rs:copyServiceOrderCommand',
   'rs:uninstall',
   'rs:openRulesWindow',
+  'rs:takeRulesIntent',
   'rs:reconnect',
   'rs:resetConfig',
   'rs:installHelper',
@@ -189,6 +207,12 @@ type ArgsResult<A> = { readonly ok: true; readonly value: A } | { readonly ok: f
 /** Checks the argument list of one call: exactly as many values as `schemas`, each one parsed by its schema. */
 type ArgsParser<A> = (args: readonly unknown[]) => ArgsResult<A>;
 
+/** Like `argumentsOf(a)`, but the one argument may also be left out (not `undefined`: absent). */
+function optionalArgumentOf<A>(a: Schema<A>): ArgsParser<readonly [] | readonly [A]> {
+  const one = argumentsOf(a);
+  return (args) => (args.length === 0 ? { ok: true, value: [] } : one(args));
+}
+
 function argumentsOf(): ArgsParser<readonly []>;
 function argumentsOf<A>(a: Schema<A>): ArgsParser<readonly [A]>;
 function argumentsOf<A, B>(a: Schema<A>, b: Schema<B>): ArgsParser<readonly [A, B]>;
@@ -222,6 +246,8 @@ const ImportToken: Schema<string> = Rule.in.shape.id;
 const IfaceOverrides: Schema<RsIfaceOverrides> = ConfigSchema.shape.ifaceOverrides.unwrap();
 /** A UI language: exactly `uz`, `ru` or `en`. */
 const LanguageArgument: Schema<RsLanguage> = Language;
+/** What the rules window is opened for: a section, or a DNS offer by routable server and role (shared, strict). */
+const IntentArgument: Schema<RsRulesIntent> = RulesWindowIntent;
 
 const ARGUMENTS = {
   'rs:getState': argumentsOf(),
@@ -243,7 +269,8 @@ const ARGUMENTS = {
   'rs:getServiceOrder': argumentsOf(),
   'rs:copyServiceOrderCommand': argumentsOf(),
   'rs:uninstall': argumentsOf(),
-  'rs:openRulesWindow': argumentsOf(),
+  'rs:openRulesWindow': optionalArgumentOf(IntentArgument),
+  'rs:takeRulesIntent': argumentsOf(),
   'rs:reconnect': argumentsOf(),
   'rs:resetConfig': argumentsOf(),
   'rs:installHelper': argumentsOf(),
@@ -259,6 +286,9 @@ const ARGUMENTS = {
 type ParsedArgs<C extends RsInvokeChannel> = (typeof ARGUMENTS)[C] extends ArgsParser<infer A> ? A : never;
 
 type Handlers = { readonly [C in RsInvokeChannel]: (args: ParsedArgs<C>) => Promise<RsResult<RsInvokeChannels[C]['value']>> };
+
+/** Channels answered to one window only; any other page of the app gets `forbidden`. */
+const ONLY_FOR_VIEW: Partial<Readonly<Record<RsInvokeChannel, WindowView>>> = { 'rs:takeRulesIntent': 'rules' };
 
 const isTrustedSender = (event: InvokeEvent, entryUrl: string): boolean => {
   // A frame that is gone, or one whose properties cannot be read, is not trusted.
@@ -312,6 +342,32 @@ export function registerIpcHandlers(deps: IpcDeps): IpcRegistration {
   const configFs = deps.configFs;
   const newToken = deps.newToken ?? (() => globalThis.crypto.randomUUID());
   const now = deps.now ?? Date.now;
+
+  // -- what the rules window is opened for (TASK-DELTA-21) ---------------------
+  // One intent waits at a time (the last wins), until the rules window takes it or a minute passes.
+  let rulesIntent: { readonly intent: RsRulesIntent; readonly at: number } | null = null;
+  const intentLog = logger.limited('ipc-rules-intent');
+  /** Tells the rules window (and no other) that an intent is waiting; a new window takes it on load instead. */
+  const pushToRulesWindow = (): void => {
+    let recipients: readonly StateRecipient[];
+    try {
+      recipients = deps.listRecipients();
+    } catch (error) {
+      intentLog.error('Could not list the windows to tell of a waiting intent', { detail: error });
+      return;
+    }
+    for (const recipient of recipients) {
+      try {
+        if (recipient.isDestroyed()) continue;
+        const url = recipient.getURL();
+        if (!isAllowedNavigation(url, entryUrl) || viewOf(url) !== 'rules') continue;
+        recipient.send(RULES_INTENT_CHANNEL, null);
+      } catch (error) {
+        intentLog.error('Could not tell the rules window of a waiting intent', { detail: error });
+      }
+    }
+  };
+
   // At most one system file dialog at a time; a second click is answered `busy`.
   let dialogOpen = false;
   const withDialog = async <T>(task: () => Promise<RsResult<T>>): Promise<RsResult<T>> => {
@@ -508,10 +564,20 @@ export function registerIpcHandlers(deps: IpcDeps): IpcRegistration {
         return result;
       }),
     // A window of this process; the helper is not involved. A throw is answered `internal` below.
-    'rs:openRulesWindow': () => {
+    'rs:openRulesWindow': ([intent]) => {
+      // Kept before the window opens: a new window takes it once it has loaded.
+      if (intent !== undefined) rulesIntent = { intent, at: now() };
       deps.openRulesWindow();
-      windowLog.info('Rules window requested', { channel: 'rs:openRulesWindow' });
+      if (intent !== undefined) pushToRulesWindow();
+      // The kind only: a DNS offer's server is the user's network, not for the log above debug.
+      windowLog.info('Rules window requested', { channel: 'rs:openRulesWindow', intent: intent?.kind ?? null });
       return Promise.resolve({ ok: true, value: null });
+    },
+    'rs:takeRulesIntent': () => {
+      const waiting = rulesIntent;
+      rulesIntent = null;
+      const fresh = waiting !== null && now() - waiting.at <= RULES_INTENT_TTL_MS ? waiting.intent : null;
+      return Promise.resolve({ ok: true, value: fresh });
     },
     // "Qayta ulanish": the client ignores it while a connection is open or being opened.
     'rs:reconnect': () => {
@@ -564,6 +630,11 @@ export function registerIpcHandlers(deps: IpcDeps): IpcRegistration {
       if (!isTrustedSender(event, entryUrl)) {
         senderLog.warn('Refused a call that did not come from the app page', { channel });
         return failure('forbidden', 'Calls are answered only for the app page');
+      }
+      const onlyFor = ONLY_FOR_VIEW[channel];
+      if (onlyFor !== undefined && viewOf(event.senderFrame?.url ?? '') !== onlyFor) {
+        senderLog.warn('Refused a call from another window of the app', { channel });
+        return failure('forbidden', `Calls on this channel are answered only for the ${onlyFor} window`);
       }
       // Bounded walk first: zod does not stop early on an oversized array.
       const violation = findStructureViolation(args);

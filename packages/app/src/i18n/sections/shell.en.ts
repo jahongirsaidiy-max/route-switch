@@ -18,6 +18,7 @@ export const shellEn: Shape<typeof shellUz> = {
     failing: (count) => `RouteSwitch — ${n(count, 'rule', 'rules')} failing`,
     rulesWaiting: (count) => `${n(count, 'rule is', 'rules are')} waiting for an interface`,
     sameSubnet: 'Ethernet and Wi‑Fi are on the same network',
+    dnsWarnings: (count) => `${n(count, 'DNS server goes', 'DNS servers go')} through the other interface`,
     manageRules: 'Manage Rules',
     quit: 'Quit RouteSwitch',
   },

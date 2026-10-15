@@ -214,6 +214,8 @@ describe('constants', () => {
       'not-implemented',
       'internal',
       'invalid-response',
+      'rate-limited',
+      'busy',
     ]);
     expect(RECONCILE_REASONS).toEqual([
       'startup',

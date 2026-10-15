@@ -49,8 +49,10 @@ import { Config, DEVICE_NAME, IfaceRole, LIMITS, findDuplicateIds } from './sche
  * Reported by `status`; the app offers to reinstall the helper on a mismatch.
  *
  * History: `2` — `overridden-by-rule` and `dns-server-excluded` rule reason
- * codes (TASK-DELTA-07). `3` — the read-only `diagnose` method and
- * `EngineState.dnsWarnings` (TASK-DELTA-17, release 0.2.0).
+ * codes (TASK-DELTA-07). `3` — the read-only `diagnose` method,
+ * `EngineState.dnsWarnings` (TASK-DELTA-17) and the `rate-limited` / `busy`
+ * error codes of `diagnose`'s limits (TASK-DELTA-21; added before 0.2.0
+ * shipped, so still `3`) — release 0.2.0.
  */
 export const PROTOCOL_VERSION = 3;
 
@@ -826,6 +828,10 @@ export const RESULT_SCHEMAS: { readonly [M in RequestMethod]: z.ZodType<ResultMa
  * - `invalid-config`    — the `config` of `setConfig` failed validation.
  * - `operation-failed`  — the request was valid but the helper could not carry it out.
  * - `not-implemented`   — the method exists but this helper build cannot perform it.
+ * - `rate-limited`      — `diagnose` only: the connection used up its per-minute
+ *                         budget; try again in a minute (TASK-DELTA-21).
+ * - `busy`              — `diagnose` only: a diagnosis is already running on the
+ *                         connection, or too many run at once; try again shortly.
  * - `internal`          — an unexpected error inside the helper.
  * - `invalid-response`  — never sent: produced on the app side when a line
  *                         from the helper does not match this contract.
@@ -840,6 +846,8 @@ export const ERROR_CODES = [
   'not-implemented',
   'internal',
   'invalid-response',
+  'rate-limited',
+  'busy',
 ] as const;
 export const ErrorCode = z.enum(ERROR_CODES);
 export type ErrorCode = z.infer<typeof ErrorCode>;

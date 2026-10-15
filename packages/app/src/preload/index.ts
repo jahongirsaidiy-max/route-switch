@@ -17,6 +17,7 @@ import type {
   RsLogChannel,
   RsLogEntry,
   RsResult,
+  RsRulesIntentChannel,
   RsSnapshot,
   RsStateChannel,
 } from '../renderer/src/rs';
@@ -31,6 +32,7 @@ const invoke = <C extends RsInvokeChannel>(
 const STATE_CHANNEL: RsStateChannel = 'rs:state';
 const LOG_CHANNEL: RsLogChannel = 'rs:log';
 const LANGUAGE_CHANNEL: RsLanguageChannel = 'rs:language';
+const RULES_INTENT_CHANNEL: RsRulesIntentChannel = 'rs:rulesIntent';
 
 const api: RsApi = {
   getState: () => invoke('rs:getState'),
@@ -62,7 +64,18 @@ const api: RsApi = {
   getServiceOrder: () => invoke('rs:getServiceOrder'),
   copyServiceOrderCommand: () => invoke('rs:copyServiceOrderCommand'),
   uninstallHelper: () => invoke('rs:uninstall'),
-  openRulesWindow: () => invoke('rs:openRulesWindow'),
+  // Without an intent no argument is sent: the main process counts them.
+  openRulesWindow: (intent) => (intent === undefined ? invoke('rs:openRulesWindow') : invoke('rs:openRulesWindow', intent)),
+  takeRulesIntent: () => invoke('rs:takeRulesIntent'),
+  onRulesIntent: (listener) => {
+    const forward = (): void => {
+      listener();
+    };
+    ipcRenderer.on(RULES_INTENT_CHANNEL, forward);
+    return () => {
+      ipcRenderer.removeListener(RULES_INTENT_CHANNEL, forward);
+    };
+  },
   reconnectHelper: () => invoke('rs:reconnect'),
   resetConfig: () => invoke('rs:resetConfig'),
   installHelper: () => invoke('rs:installHelper'),

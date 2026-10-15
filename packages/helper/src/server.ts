@@ -590,6 +590,9 @@ export interface RequestHandlerDeps {
 
 type HandlerResult<M extends keyof ResultMap> = { readonly ok: true; readonly result: ResultMap[M] } | { readonly ok: false; readonly code: ErrorCode; readonly message: string };
 
+/** Failures that are an answer, not a fault: the request was valid and was refused or could not be carried out. */
+const EXPECTED_FAILURES: ReadonlySet<ErrorCode> = new Set<ErrorCode>(['operation-failed', 'rate-limited', 'busy']);
+
 const failed = (code: ErrorCode, message: string): { readonly ok: false; readonly code: ErrorCode; readonly message: string } => ({ ok: false, code, message });
 
 /** Serialises async sections: each runs after the previous one has settled, whatever its outcome. */
@@ -776,18 +779,20 @@ export const createRequestHandler = (deps: RequestHandlerDeps): RequestHandler =
     return { ok: true, result: checked.data };
   };
 
+  /** Each limit's own code (the app words them), with a message for the log. */
   const DIAGNOSE_REFUSALS = {
-    'connection-busy': 'A diagnosis is already running on this connection',
-    'connection-rate': 'Too many diagnoses on this connection; try again in a minute',
-    busy: 'Too many diagnoses are running; try again shortly',
-  } as const;
+    'connection-busy': { code: 'busy', message: 'A diagnosis is already running on this connection' },
+    'connection-rate': { code: 'rate-limited', message: 'Too many diagnoses on this connection; try again in a minute' },
+    busy: { code: 'busy', message: 'Too many diagnoses are running; try again shortly' },
+  } as const satisfies Record<string, { readonly code: ErrorCode; readonly message: string }>;
 
   const diagnose = async (target: string, origin: RequestOrigin | undefined): Promise<HandlerResult<'diagnose'>> => {
     // A caller without an origin (none in the daemon) shares one budget instead of escaping the limit.
     const slot = diagnoseLimiter.tryAcquire(origin?.connection ?? 0);
     if (!slot.ok) {
       logger.debug('diagnose refused', { reason: slot.reason });
-      return failed('operation-failed', DIAGNOSE_REFUSALS[slot.reason]);
+      const refusal = DIAGNOSE_REFUSALS[slot.reason];
+      return failed(refusal.code, refusal.message);
     }
     // The slot is held until the work is really over, also when the answer went out at the deadline.
     const work = runDiagnose(target, {
@@ -850,7 +855,8 @@ export const createRequestHandler = (deps: RequestHandlerDeps): RequestHandler =
       result = failed('internal', 'Internal error');
     }
     if (!result.ok) {
-      if (result.code !== 'operation-failed') logger.warn('request failed', { method: request.method, code: result.code });
+      // An expected refusal (a limit, an operation that could not be done) is not a warning.
+      if (!EXPECTED_FAILURES.has(result.code)) logger.warn('request failed', { method: request.method, code: result.code });
       return { response: errorResponse(request.id, result.code, result.message) };
     }
     const response: Response = { id: request.id, ok: true, result: result.result };

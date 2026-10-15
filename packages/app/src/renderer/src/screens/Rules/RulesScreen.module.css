@@ -153,6 +153,11 @@
   margin: 0 var(--rs-space-12) var(--rs-space-5);
 }
 
+/* A DNS warning that offers no rule: the reason in place of the button (derived). */
+.dnsBlocked {
+  color: var(--rs-color-text-secondary);
+}
+
 .overlaps {
   flex-shrink: 0;
   margin: 0 var(--rs-space-12) var(--rs-space-5);

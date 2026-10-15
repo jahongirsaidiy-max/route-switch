@@ -1,4 +1,4 @@
-export { openRules, reapply, setRouting, type MenuBarApi } from './actions';
+export { openRules, reapply, setRouting, suggestRule, type MenuBarApi } from './actions';
 export {
   MenuBarPanel,
   MenuBarScreen,

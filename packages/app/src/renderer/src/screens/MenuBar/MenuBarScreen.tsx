@@ -5,6 +5,7 @@
 // read again whenever its revision changes); the window keeps no truth of
 // its own — a switch shows the state the helper reported, not the click.
 
+import type { IfaceRole } from '@routeswitch/shared';
 import { useCallback, useEffect, useState, type ReactElement } from 'react';
 
 import {
@@ -29,10 +30,18 @@ import { browserShowSignal, readOnShow, type ShowSignal, type ShownReader } from
 import type { RsApi, RsServiceOrder } from '../../rs';
 import { errorText, helperNotice, loadingNotice, networkWarnings, UZ, type Feedback } from '../../text';
 import { installHelper } from '../Install';
+import { dnsWarningViews } from '../AddRule/model';
 import { backupKey, backupOffer, useBackup, type BackupApi } from '../Rules/recovery';
-import { openRules, reapply, setRouting, type MenuBarApi } from './actions';
+import { DnsWarningBanner } from '../Rules/RulesScreen';
+import { openRules, reapply, setRouting, suggestRule, type MenuBarApi } from './actions';
 import styles from './MenuBarScreen.module.css';
 import { defaultRole, interfacesKey, menuRules, statusLine, type MenuRule, type StatusLine } from './model';
+
+/** Which DNS warning's offer to open in the rules window. */
+export interface DnsOfferRequest {
+  readonly server: string;
+  readonly role: IfaceRole;
+}
 
 export type MenuBarAction = 'enabled' | 'apply' | 'rules' | 'reconnect' | 'install';
 
@@ -59,6 +68,11 @@ export interface MenuBarPanelProps {
    * the preview and the confirmation are.
    */
   readonly backupOffer?: { readonly count: number; readonly savedAt: string } | null;
+  /**
+   * A DNS warning's "qoidasini qo'shish" (TASK-DELTA-21): the rules window
+   * opens with the add-rule form filled in. Absent: the warnings show without it.
+   */
+  readonly onSuggestRule?: (request: DnsOfferRequest) => void;
   /** The language of the window (`useI18n()`); Uzbek without it. */
   readonly i18n?: I18n;
 }
@@ -151,23 +165,49 @@ function RulesSection({
   );
 }
 
-/** Rules waiting for an interface, both interfaces on one subnet (`networkWarnings`). */
+/**
+ * Rules waiting for an interface, both interfaces on one subnet
+ * (`networkWarnings`), and DNS servers reached through the wrong interface,
+ * each with its add-rule offer (`dnsWarningViews`, TASK-DELTA-21).
+ */
 function Warnings({
   engine,
   config,
+  onSuggestRule,
+  suggesting,
   i18n,
 }: {
   readonly engine: EngineStateView;
   readonly config: ConfigView;
+  readonly onSuggestRule: ((request: DnsOfferRequest) => void) | undefined;
+  readonly suggesting: boolean;
   readonly i18n: I18n;
 }): ReactElement | null {
   const state = engine.state;
   const warnings = state === null ? [] : networkWarnings(state, config.config, i18n);
-  if (warnings.length === 0) return null;
+  const dnsWarnings = state === null ? [] : dnsWarningViews(state, config.config, i18n);
+  if (warnings.length === 0 && dnsWarnings.length === 0) return null;
   return (
     <div className={styles['warnings']}>
       {warnings.map((warning) => (
         <Banner key={warning.id} tone="warning" size="compact" title={warning.title} text={warning.text} />
+      ))}
+      {dnsWarnings.map((warning) => (
+        <DnsWarningBanner
+          key={warning.id}
+          warning={warning}
+          size="compact"
+          addRuleOff={null}
+          busy={suggesting}
+          onOffer={
+            onSuggestRule === undefined
+              ? undefined
+              : (_form, { server, role }) => {
+                  onSuggestRule({ server, role });
+                }
+          }
+          i18n={i18n}
+        />
       ))}
     </div>
   );
@@ -257,7 +297,13 @@ export function MenuBarPanel(props: MenuBarPanelProps): ReactElement {
                 </Banner>
               </div>
             )}
-            <Warnings engine={engine} config={props.config} i18n={i18n} />
+            <Warnings
+              engine={engine}
+              config={props.config}
+              onSuggestRule={props.onSuggestRule}
+              suggesting={busy.has('rules')}
+              i18n={i18n}
+            />
             <RulesSection config={props.config} engine={engine} now={props.now} onReloadConfig={props.onReloadConfig} i18n={i18n} />
             <StatusRow line={statusLine(state, props.now, i18n)} />
           </>
@@ -371,6 +417,9 @@ export function MenuBarScreen({ rs: given }: MenuBarScreenProps): ReactElement {
       }}
       onOpenRules={() => {
         run('rules', () => openRules(rs, i18n));
+      }}
+      onSuggestRule={(request) => {
+        run('rules', () => suggestRule(rs, request, i18n));
       }}
       onReloadConfig={() => {
         configStoreFor(rs).reload();

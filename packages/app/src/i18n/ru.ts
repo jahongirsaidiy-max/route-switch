@@ -13,6 +13,7 @@ import { logRu } from './sections/log.ru';
 import { settingsRu } from './sections/settings.ru';
 import { backupRu } from './sections/backup.ru';
 import { diagnosticsRu } from './sections/diagnostics.ru';
+import { dnsWarningsRu } from './sections/dnsWarnings.ru';
 
 const unexpected = (code: string): string => `Непредвиденная ошибка (${code}).`;
 
@@ -34,6 +35,7 @@ export const ru: Messages = {
     disconnected: 'Ответ не пришёл: результат неизвестен. Состояние обновится, когда helper снова подключится.',
     timeout: 'Ответ не пришёл: результат неизвестен. Состояние обновится, когда helper снова подключится.',
     busy: 'Helper занят — попробуйте чуть позже.',
+    'rate-limited': 'Слишком много запросов — повторите через минуту.',
     'not-implemented': 'Установленный helper пока не умеет выполнять это действие.',
     'invalid-config': 'Значение не принято.',
     'invalid-input': 'Значение не принято.',
@@ -225,4 +227,6 @@ export const ru: Messages = {
   addRule: addRuleRu,
   /** The "Diagnostika" section of the rules window (TASK-DELTA-20): `sections/diagnostics.*`. */
   diagnostics: diagnosticsRu,
+  /** "DNS server boshqa interfeysda" and its add-rule offer (TASK-DELTA-21): `sections/dnsWarnings.*`. */
+  dnsWarnings: dnsWarningsRu,
 };

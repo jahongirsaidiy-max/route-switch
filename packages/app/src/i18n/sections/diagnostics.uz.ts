@@ -36,6 +36,10 @@ export const diagnosticsUz = {
     'invalid-host': "Bu xost nomi emas. Masalan: corp.local, 10.20.4.37 yoki https://example.com.",
   } satisfies Readonly<Record<DiagnosticInputError, string>>,
   failed: (reason: string): string => `Tekshirib bo'lmadi: ${reason}`,
+  /** The helper refused the diagnosis: its per-minute budget (10 requests per connection) is used up. */
+  rateLimited: "Tekshiruvlar juda ko'p: helper daqiqasiga 10 tagacha so'rovni tekshiradi (qamralmagan nomning har manzili alohida so'rov). Bir daqiqadan keyin qayta urinib ko'ring.",
+  /** The helper refused it: other diagnoses are running. */
+  helperBusy: "Helper hozir boshqa tekshiruv bilan band — birozdan keyin qayta urinib ko'ring.",
 
   emptyTitle: "Hali tekshiruv yo'q",
   emptyText: "Xost, IP yoki URL kiriting — natijada mos qoida, har manzilning haqiqiy interfeysi va DNS server ko'rinadi.",
@@ -48,6 +52,7 @@ export const diagnosticsUz = {
     mismatch: 'Trafik kutilgan interfeysdan ketmayapti',
     noRule: "Qoida yo'q — default kanaldan ketadi",
     noAddresses: 'Manzil topilmadi',
+    onlyExcluded: 'Nom route qilinmaydigan manzilga yechiladi',
     dnsDown: 'DNS server javob bermayapti',
     partial: 'Ayrim manzillar tekshirilmadi',
   },
@@ -62,6 +67,7 @@ export const diagnosticsUz = {
     dnsDown: "Ichki nomlar yechilmasligi mumkin — DNS serverga yo'l qaysi interfeysdan ketishini tekshiring.",
     partial: "Bir daqiqadan keyin qayta tekshirib ko'ring.",
     noAddresses: "Nom to'g'ri yozilganini va DNS ishlayotganini tekshiring.",
+    onlyExcluded: "Bu nom kompyuterning o'ziga (masalan localhost) yoki link-local manzilga ishora qiladi — bunday trafik hech qaysi interfeysdan chiqmaydi va qoida kerak emas.",
   },
 
   matchTitle: 'Mos qoida',
@@ -150,6 +156,9 @@ export const diagnosticsUz = {
     ok: (count: number): string => `Tizim resolveri ${String(count)} ta IPv4 manzil berdi.`,
     truncated: (max: number): string => `Tizim resolveri ${String(max)} tadan ko'p IPv4 manzil berdi — faqat birinchi ${String(max)} tasi tekshirildi.`,
     excluded: (count: number): string => `${String(count)} ta manzil (loopback, link-local va h.k.) route qilinmaydi — tekshirilmadi.`,
+    /** Every address the resolver gave is one that is never routed: nothing to check. */
+    onlyExcluded: (count: number): string =>
+      `Tizim resolveri faqat route qilinmaydigan manzil berdi (${String(count)} ta: loopback, link-local va h.k.) — tekshiradigan manzil yo'q.`,
     outcomes: {
       'not-found': "Nom topilmadi: tizim resolveri unga IPv4 manzil bermadi.",
       timeout: 'Tizim resolveri 3 soniya ichida javob bermadi.',

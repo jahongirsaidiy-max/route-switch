@@ -124,8 +124,12 @@ export async function resolveName(
   };
 }
 
-/** After one of these the remaining addresses are not sent: the connection is gone. */
-const STOP_CODES: ReadonlySet<RsErrorCode> = new Set<RsErrorCode>(['not-connected', 'disconnected']);
+/**
+ * After one of these the remaining addresses are not sent: the connection is
+ * gone, or its per-minute budget of diagnoses is (`rate-limited`: every
+ * further request this minute would be refused too).
+ */
+const STOP_CODES: ReadonlySet<RsErrorCode> = new Set<RsErrorCode>(['not-connected', 'disconnected', 'rate-limited']);
 
 export interface DiagnoserDeps {
   readonly request: HelperClient['request'];

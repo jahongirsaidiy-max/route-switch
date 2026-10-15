@@ -6,7 +6,7 @@
 // answer `busy` anyway).
 
 import type { I18n } from '../../../../i18n';
-import type { RsApi, RsDiagnosis } from '../../rs';
+import type { RsApi, RsDiagnosis, RsErrorCode } from '../../rs';
 import { errorText, isValidationCode, UZ } from '../../text';
 import { parseDiagnosticTarget } from './target';
 
@@ -31,6 +31,19 @@ export interface DiagnosticsController {
   readonly setInput: (input: string) => void;
   /** "Tekshirish": checks the input, then asks the main process. Ignored while one runs. */
   readonly run: () => Promise<void>;
+}
+
+/**
+ * Why a diagnosis could not be made, in words. The helper's limits have codes
+ * of their own (TASK-DELTA-21): `rate-limited` — the connection's per-minute
+ * budget is used up; `busy` — another diagnosis runs (the helper's, or the
+ * main process's one at a time). Any other code keeps the generic words.
+ */
+export function failureText(code: RsErrorCode, i18n: I18n = UZ): string {
+  const words = i18n.t.diagnostics;
+  if (code === 'rate-limited') return words.rateLimited;
+  if (code === 'busy') return words.helperBusy;
+  return words.failed(errorText(code, i18n));
 }
 
 /** The words of a refused input. */
@@ -64,7 +77,7 @@ export function createDiagnosticsController(
       try {
         const result = await rs.diagnose(parsed.target);
         if (result.ok) diagnosis = result.value;
-        else failure = i18n().t.diagnostics.failed(errorText(result.code, i18n()));
+        else failure = failureText(result.code, i18n());
       } catch {
         // The preload never rejects; a page without a main process answers this way.
         failure = i18n().t.diagnostics.failed(errorText('unspecified', i18n()));

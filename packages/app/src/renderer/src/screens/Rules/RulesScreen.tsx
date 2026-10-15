@@ -27,6 +27,7 @@ import { useI18n } from '../../hooks/useI18n';
 import { useNow } from '../../hooks/useNow';
 import type { RsApi } from '../../rs';
 import { errorText, helperNotice, networkWarnings, UZ, type Feedback } from '../../text';
+import { dnsWarningViews, type DnsWarningView, type RuleForm } from '../AddRule/model';
 import { statusLine } from '../MenuBar';
 import type { RulesApi } from './actions';
 import { createRulesController, focusTrashButton, INITIAL_RULES_UI, rulesHandlers, type RulesUiState } from './controller';
@@ -90,8 +91,11 @@ export interface RulesPanelProps {
   readonly onCancelDelete: () => void;
   readonly onConfirmDelete: (id: string) => void;
   readonly onReloadConfig: () => void;
-  /** Opens the add-rule form; absent until that form exists (the button is then disabled, with the reason). */
-  readonly onAddRule?: (() => void) | undefined;
+  /**
+   * Opens the add-rule form; absent until that form exists (the button is then disabled, with the reason).
+   * With `prefill`, the form opens filled in (a DNS warning's offer, TASK-DELTA-21); it is not saved.
+   */
+  readonly onAddRule?: ((prefill?: RuleForm) => void) | undefined;
   /** Opens a rule in the add-rule form; absent like `onAddRule`. */
   readonly onEditRule?: ((id: string) => void) | undefined;
   /** The ref for a rule's trash button, so the focus can return to it after a cancelled removal. */
@@ -304,6 +308,51 @@ function TableBody(
   );
 }
 
+/**
+ * A DNS server reached through the wrong interface (TASK-DELTA-21), with its
+ * offer: the button opens the add-rule form filled in (nothing is saved), or,
+ * when no rule can be offered, the reason in its place. While the form cannot
+ * open (`addRuleOff`) the button says why, like "Qoida qo'shish".
+ */
+export function DnsWarningBanner({
+  warning,
+  addRuleOff,
+  onOffer,
+  busy = false,
+  i18n,
+  size = 'md',
+}: {
+  readonly warning: DnsWarningView;
+  /** Why the form cannot open now; null when it can. */
+  readonly addRuleOff: string | null;
+  /** The offer's button: the form it fills in, and the warning (the menu bar passes its server and role on). */
+  readonly onOffer: ((form: RuleForm, warning: DnsWarningView) => void) | undefined;
+  readonly busy?: boolean;
+  readonly i18n: I18n;
+  readonly size?: 'md' | 'compact';
+}): ReactElement {
+  const offer = warning.offer;
+  return (
+    <Banner tone="warning" size={size} title={warning.title} text={warning.text}>
+      {offer.kind === 'blocked' ? (
+        <p className={styles['dnsBlocked']}>{offer.text}</p>
+      ) : addRuleOff !== null ? (
+        <p className={styles['dnsBlocked']}>{i18n.t.dnsWarnings.blockedUnavailable(addRuleOff)}</p>
+      ) : (
+        <Button
+          variant="primary"
+          busy={busy}
+          onClick={() => {
+            onOffer?.(offer.form, warning);
+          }}
+        >
+          {offer.label}
+        </Button>
+      )}
+    </Banner>
+  );
+}
+
 /** The screen for given data; `RulesScreen` supplies the live data and the actions. */
 export function RulesPanel(props: RulesPanelProps): ReactElement {
   const { engine, config } = props;
@@ -313,6 +362,7 @@ export function RulesPanel(props: RulesPanelProps): ReactElement {
   const loaded = state !== null && config.config !== null ? { state, config: config.config } : null;
   const rows = loaded === null ? [] : ruleRows(loaded.config, loaded.state, props.now, i18n);
   const warnings = state === null ? [] : networkWarnings(state, config.config, i18n);
+  const dnsWarnings = state === null ? [] : dnsWarningViews(state, config.config, i18n);
   const visible = loaded === null ? [] : visibleRows(rows, notesById(loaded.config), props.query, props.filter);
   const overlaps = loaded === null ? [] : overlapWarnings(loaded.config);
   const confirming = rows.find((row) => row.id === props.confirmingDelete) ?? null;
@@ -507,10 +557,21 @@ export function RulesPanel(props: RulesPanelProps): ReactElement {
         </div>
       )}
 
-      {warnings.length === 0 ? null : (
+      {warnings.length === 0 && dnsWarnings.length === 0 ? null : (
         <div className={styles['warnings']}>
           {warnings.map((warning) => (
             <Banner key={warning.id} tone="warning" title={warning.title} text={warning.text} />
+          ))}
+          {dnsWarnings.map((warning) => (
+            <DnsWarningBanner
+              key={warning.id}
+              warning={warning}
+              addRuleOff={addRuleOff}
+              onOffer={(form) => {
+                props.onAddRule?.(form);
+              }}
+              i18n={i18n}
+            />
           ))}
         </div>
       )}
@@ -587,8 +648,8 @@ export function RulesPanel(props: RulesPanelProps): ReactElement {
 export interface RulesScreenProps {
   /** The preload API; `window.rs` in the app. */
   readonly rs?: RulesApi & TransferApi & RecoveryApi & BackupApi & Pick<RsApi, 'getState' | 'onState' | 'getConfig' | 'restoreBackup' | 'dismissBackup'>;
-  /** Opens the add-rule form (TASK-213). */
-  readonly onAddRule?: () => void;
+  /** Opens the add-rule form (TASK-213), filled in by a DNS warning's offer when `prefill` is given (TASK-DELTA-21). */
+  readonly onAddRule?: (prefill?: RuleForm) => void;
   readonly onEditRule?: (id: string) => void;
 }
 

@@ -28,7 +28,10 @@ import {
   LANGUAGE_CHANNEL,
   LOG_CHANNEL,
   registerIpcHandlers,
+  RULES_INTENT_CHANNEL,
+  RULES_INTENT_TTL_MS,
   STATE_CHANNEL,
+  viewOf,
   type ConfigDialogs,
   type InvokeEvent,
   type StateRecipient,
@@ -39,6 +42,7 @@ import type { PreferencesStore } from './preferences';
 import type { RulesBackupStore } from './rulesBackup';
 import { APP_ENTRY_URL } from './runtime';
 import { createSettings, type Settings } from './settings';
+import { viewUrl } from './windows';
 
 // ---------------------------------------------------------------------------
 // The preload, loaded against a stand-in for Electron's renderer side. Its
@@ -361,7 +365,7 @@ describe('registration', () => {
   it('handles exactly the thirty invoke channels of the renderer API', async () => {
     const h = await setup({ connect: false });
     expect([...h.ipcMain.handlers.keys()].sort()).toEqual([...INVOKE_CHANNELS].sort());
-    expect(INVOKE_CHANNELS).toHaveLength(30);
+    expect(INVOKE_CHANNELS).toHaveLength(31);
   });
 
   it('dispose removes every handler and stops the state pushes; a second dispose does nothing', async () => {
@@ -372,7 +376,7 @@ describe('registration', () => {
     h.registration.dispose();
     h.registration.dispose();
     expect(h.ipcMain.handlers.size).toBe(0);
-    expect(h.ipcMain.removeHandler).toHaveBeenCalledTimes(30);
+    expect(h.ipcMain.removeHandler).toHaveBeenCalledTimes(31);
     h.sockets[0]?.emit('connect');
     for (let i = 0; i < 6; i += 1) await flush();
     expect(sent).toEqual([]);
@@ -1583,6 +1587,95 @@ describe('rs:openRulesWindow (main process only)', () => {
     expect(openRulesWindow).not.toHaveBeenCalled();
   });
 
+  // TASK-DELTA-21: what the rules window is opened for.
+  const RULES_EVENT: InvokeEvent = { senderFrame: { url: viewUrl(APP_ENTRY_URL, 'rules'), parent: null } };
+  const POPOVER_EVENT: InvokeEvent = { senderFrame: { url: viewUrl(APP_ENTRY_URL, 'popover'), parent: null } };
+  const windowRecipient = (url: string) => {
+    const sent: [string, unknown][] = [];
+    const target: StateRecipient = { isDestroyed: () => false, getURL: () => url, send: (channel, payload) => sent.push([channel, payload]) };
+    return { target, intents: () => sent.filter(([channel]) => channel === RULES_INTENT_CHANNEL) };
+  };
+
+  it.each([
+    ['junk', 'rules'],
+    ['null', null],
+    ['an unknown kind', { kind: 'navigate', url: 'https://example.com/' }],
+    ['an unknown section', { kind: 'section', section: 'admin' }],
+    ['an extra key', { kind: 'section', section: 'log', extra: 1 }],
+    ['a rule instead of a warning', { kind: 'dns-offer', server: '10.0.0.53', role: 'ethernet', rule: { target: '0.0.0.0/0' } }],
+    ['a forbidden server', { kind: 'dns-offer', server: '127.0.0.1', role: 'ethernet' }],
+    ['a name as server', { kind: 'dns-offer', server: 'corp.local', role: 'wifi' }],
+    ['another role', { kind: 'dns-offer', server: '10.0.0.53', role: 'utun0' }],
+    ['two arguments', { kind: 'section', section: 'log' }, { kind: 'section', section: 'log' }],
+  ] as [string, ...unknown[]][])('refuses %s as an intent: nothing opens, nothing waits, nothing is pushed', async (_name, ...args) => {
+    const openRulesWindow = vi.fn();
+    const rules = windowRecipient(viewUrl(APP_ENTRY_URL, 'rules'));
+    const h = await setup({ openRulesWindow, recipients: [rules.target] });
+    expect(await h.call('rs:openRulesWindow', ...args)).toMatchObject({ ok: false, code: 'invalid-input' });
+    expect(openRulesWindow).not.toHaveBeenCalled();
+    expect(rules.intents()).toEqual([]);
+    expect(await h.callAs(RULES_EVENT, 'rs:takeRulesIntent')).toEqual({ ok: true, value: null });
+  });
+
+  it('keeps a valid intent for the rules window, tells the rules window only, and hands it out once', async () => {
+    const openRulesWindow = vi.fn();
+    const rules = windowRecipient(viewUrl(APP_ENTRY_URL, 'rules'));
+    const popover = windowRecipient(viewUrl(APP_ENTRY_URL, 'popover'));
+    const foreign = windowRecipient(viewUrl('https://example.com/', 'rules'));
+    const h = await setup({ openRulesWindow, recipients: [rules.target, popover.target, foreign.target] });
+    const intent = { kind: 'dns-offer', server: '10.0.0.53', role: 'ethernet' };
+    expect(await h.callAs(POPOVER_EVENT, 'rs:openRulesWindow', intent)).toEqual({ ok: true, value: null });
+    expect(openRulesWindow).toHaveBeenCalledTimes(1);
+    expect(rules.intents()).toEqual([[RULES_INTENT_CHANNEL, null]]);
+    expect(popover.intents()).toEqual([]);
+    expect(foreign.intents()).toEqual([]);
+    // Only the rules window may take it; the popover is refused and the intent stays.
+    expect(await h.callAs(POPOVER_EVENT, 'rs:takeRulesIntent')).toMatchObject({ ok: false, code: 'forbidden' });
+    expect(await h.callAs(RULES_EVENT, 'rs:takeRulesIntent')).toEqual({ ok: true, value: intent });
+    expect(await h.callAs(RULES_EVENT, 'rs:takeRulesIntent')).toEqual({ ok: true, value: null });
+    // The server is not logged above debug.
+    expect(JSON.stringify(h.entries.filter((entry) => entry.level !== 'debug'))).not.toContain('10.0.0.53');
+    expect(h.sentAfterHandshake()).toEqual([]);
+  });
+
+  it('without an intent nothing waits and nothing is pushed; the last intent wins; a minute later it is gone', async () => {
+    let clock = 1_000_000;
+    const rules = windowRecipient(viewUrl(APP_ENTRY_URL, 'rules'));
+    const h = await setup({ recipients: [rules.target], now: () => clock });
+    await h.call('rs:openRulesWindow');
+    expect(rules.intents()).toEqual([]);
+    expect(await h.callAs(RULES_EVENT, 'rs:takeRulesIntent')).toEqual({ ok: true, value: null });
+    await h.call('rs:openRulesWindow', { kind: 'section', section: 'log' });
+    await h.call('rs:openRulesWindow', { kind: 'section', section: 'diagnostics' });
+    expect(await h.callAs(RULES_EVENT, 'rs:takeRulesIntent')).toEqual({ ok: true, value: { kind: 'section', section: 'diagnostics' } });
+    await h.call('rs:openRulesWindow', { kind: 'section', section: 'settings' });
+    clock += RULES_INTENT_TTL_MS;
+    expect(await h.callAs(RULES_EVENT, 'rs:takeRulesIntent')).toEqual({ ok: true, value: { kind: 'section', section: 'settings' } });
+    await h.call('rs:openRulesWindow', { kind: 'section', section: 'settings' });
+    clock += RULES_INTENT_TTL_MS + 1;
+    expect(await h.callAs(RULES_EVENT, 'rs:takeRulesIntent')).toEqual({ ok: true, value: null });
+  });
+
+  it('a window that cannot be told is logged; the intent still waits for it', async () => {
+    const broken: StateRecipient = {
+      isDestroyed: () => false,
+      getURL: () => viewUrl(APP_ENTRY_URL, 'rules'),
+      send: () => {
+        throw new Error('Object has been destroyed');
+      },
+    };
+    const h = await setup({ recipients: [broken] });
+    expect(await h.call('rs:openRulesWindow', { kind: 'section', section: 'log' })).toEqual({ ok: true, value: null });
+    expect(h.entries.some((entry) => entry.level === 'error' && entry.msg === 'Could not tell the rules window of a waiting intent')).toBe(true);
+    expect(await h.callAs(RULES_EVENT, 'rs:takeRulesIntent')).toEqual({ ok: true, value: { kind: 'section', section: 'log' } });
+  });
+
+  it('viewOf reads the view of a page URL', () => {
+    expect(viewOf(viewUrl(APP_ENTRY_URL, 'rules'))).toBe('rules');
+    expect(viewOf(APP_ENTRY_URL)).toBeNull();
+    expect(viewOf('not a url')).toBeNull();
+  });
+
   it.each([
     ['another document', { senderFrame: { url: 'https://example.com/', parent: null } }],
     ['a sub-frame of the app page', { senderFrame: { url: APP_ENTRY_URL, parent: {} } }],
@@ -1606,7 +1699,7 @@ describe('rs:openRulesWindow (main process only)', () => {
 });
 
 describe('the preload against the main process (window.rs)', () => {
-  it('exposes exactly the thirty-three methods of the renderer API (thirty calls, three subscriptions), each wired to a handled channel', async () => {
+  it('exposes exactly the thirty-five methods of the renderer API (thirty-one calls, four subscriptions), each wired to a handled channel', async () => {
     const openRulesWindow = vi.fn();
     const h = await setup({ settings: fakeSettings().settings, openRulesWindow });
     bridge.setInvokeTarget((channel, ...args) => {
@@ -1637,6 +1730,7 @@ describe('the preload against the main process (window.rs)', () => {
         'installHelper',
         'onLanguage',
         'onLog',
+        'onRulesIntent',
         'onState',
         'openRulesWindow',
         'reconnectHelper',
@@ -1648,6 +1742,7 @@ describe('the preload against the main process (window.rs)', () => {
         'setIfaceOverrides',
         'setLanguage',
         'setOpenAtLogin',
+        'takeRulesIntent',
         'test',
         'toggleRule',
         'uninstallHelper',
@@ -1682,6 +1777,10 @@ describe('the preload against the main process (window.rs)', () => {
     expect(await settle(rs.uninstallHelper())).toMatchObject({ ok: false, code: 'not-implemented' });
     expect(await settle(rs.openRulesWindow())).toEqual({ ok: true, value: null });
     expect(openRulesWindow).toHaveBeenCalledTimes(1);
+    expect(await settle(rs.openRulesWindow({ kind: 'section', section: 'log' }))).toEqual({ ok: true, value: null });
+    expect(openRulesWindow).toHaveBeenCalledTimes(2);
+    // This page is not the rules window (no `?view=rules`): the intent is not its to take.
+    expect(await settle(rs.takeRulesIntent())).toMatchObject({ ok: false, code: 'forbidden' });
     // Connected: nothing to reconnect, and a readable config is never reset.
     expect(await settle(rs.reconnectHelper())).toEqual({ ok: true, value: null });
     expect(await settle(rs.resetConfig())).toMatchObject({ ok: false, code: 'operation-failed' });

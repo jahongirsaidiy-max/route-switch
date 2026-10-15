@@ -21,6 +21,7 @@ import { logUz } from './sections/log.uz';
 import { settingsUz } from './sections/settings.uz';
 import { backupUz } from './sections/backup.uz';
 import { diagnosticsUz } from './sections/diagnostics.uz';
+import { dnsWarningsUz } from './sections/dnsWarnings.uz';
 
 /** What the UI shows about the helper: the connection kinds plus the renderer's own two. */
 export type HelperStatusKey = RsConnection['kind'] | 'loading' | 'unavailable';
@@ -62,6 +63,7 @@ export const uz = {
     disconnected: "Javob kelmadi: natija noma'lum. Helper qayta ulanganda holat yangilanadi.",
     timeout: "Javob kelmadi: natija noma'lum. Helper qayta ulanganda holat yangilanadi.",
     busy: "Helper band — birozdan keyin qayta urinib ko'ring.",
+    'rate-limited': "So'rovlar juda ko'p — bir daqiqadan keyin qayta urinib ko'ring.",
     'not-implemented': "O'rnatilgan helper bu amalni hali bajara olmaydi.",
     'invalid-config': 'Qiymat qabul qilinmadi.',
     'invalid-input': 'Qiymat qabul qilinmadi.',
@@ -265,4 +267,6 @@ export const uz = {
   addRule: addRuleUz,
   /** The "Diagnostika" section of the rules window (TASK-DELTA-20): `sections/diagnostics.*`. */
   diagnostics: diagnosticsUz,
+  /** "DNS server boshqa interfeysda" and its add-rule offer (TASK-DELTA-21): `sections/dnsWarnings.*`. */
+  dnsWarnings: dnsWarningsUz,
 };

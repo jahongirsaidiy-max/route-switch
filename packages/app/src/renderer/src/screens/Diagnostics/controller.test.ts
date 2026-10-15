@@ -2,7 +2,7 @@ import { describe, expect, it, vi } from 'vitest';
 
 import { i18nFor, type I18n } from '../../../../i18n';
 import type { RsDiagnosis, RsResult } from '../../rs';
-import { createDiagnosticsController, INITIAL_DIAGNOSTICS_UI, inputErrorText, type DiagnosticsUiState } from './controller';
+import { createDiagnosticsController, failureText, INITIAL_DIAGNOSTICS_UI, inputErrorText, type DiagnosticsUiState } from './controller';
 import { COVERED_DOMAIN } from './fixtures';
 
 function harness(diagnose: (target: string) => Promise<RsResult<RsDiagnosis>>, language: () => I18n = () => i18nFor('uz')) {
@@ -92,5 +92,29 @@ describe('the Diagnostika controller', () => {
     expect(inputErrorText('')).toBe('Xost, IP manzil yoki URL kiriting.');
     expect(inputErrorText('127.0.0.1', i18nFor('ru'))).toBe(i18nFor('ru').t.validation.loopback);
     expect(inputErrorText('fe80::1', i18nFor('en'))).toContain('IPv6');
+  });
+
+  // DELTA-20 QA follow-up (TASK-DELTA-21): the helper's limits have codes of their own.
+  it.each([
+    ['rate-limited', "Bir daqiqadan keyin qayta urinib ko'ring."],
+    ['busy', 'boshqa tekshiruv bilan band'],
+  ] as const)('the helper refuses with %s: its own words, not the generic failure', async (code, words) => {
+    const error = 'any message — never shown';
+    const h = harness(() => Promise.resolve({ ok: false, code, error }));
+    h.controller.setInput('corp.local');
+    await h.controller.run();
+    expect(h.state().failure).toContain(words);
+    expect(h.state().failure).not.toContain('Amal bajarilmadi');
+    expect(h.state().failure).not.toContain(error);
+    expect(h.state().failure).toBe(failureText(code));
+    expect(h.state().failure).not.toContain("Tekshirib bo'lmadi");
+  });
+
+  it('other failures keep the generic words, whatever the message; the limit words are translated', () => {
+    expect(failureText('operation-failed')).toBe("Tekshirib bo'lmadi: Amal bajarilmadi.");
+    expect(failureText('timeout')).toContain("Tekshirib bo'lmadi: ");
+    expect(failureText('rate-limited', i18nFor('ru'))).toContain('Повторите через минуту');
+    expect(failureText('rate-limited', i18nFor('en'))).toContain('Try again in a minute');
+    expect(failureText('busy', i18nFor('en'))).toContain('busy');
   });
 });

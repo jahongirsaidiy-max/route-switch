@@ -26,6 +26,9 @@ export const diagnosticsRu: Shape<typeof diagnosticsUz> = {
     'invalid-host': 'Это не имя хоста. Например: corp.local, 10.20.4.37 или https://example.com.',
   },
   failed: (reason) => `Не удалось проверить: ${reason}`,
+  rateLimited:
+    'Слишком много проверок: helper проверяет до 10 запросов в минуту (каждый адрес непокрытого имени — отдельный запрос). Повторите через минуту.',
+  helperBusy: 'Helper сейчас занят другой проверкой — повторите чуть позже.',
 
   emptyTitle: 'Проверок ещё не было',
   emptyText: 'Введите хост, IP или URL — в результате будут подходящее правило, фактический интерфейс каждого адреса и DNS-сервер.',
@@ -37,6 +40,7 @@ export const diagnosticsRu: Shape<typeof diagnosticsUz> = {
     mismatch: 'Трафик уходит не через ожидаемый интерфейс',
     noRule: 'Правила нет — трафик идёт по каналу по умолчанию',
     noAddresses: 'Адреса не найдены',
+    onlyExcluded: 'Имя указывает на адрес, который не маршрутизируется',
     dnsDown: 'DNS-сервер не отвечает',
     partial: 'Часть адресов не проверена',
   },
@@ -50,6 +54,7 @@ export const diagnosticsRu: Shape<typeof diagnosticsUz> = {
     dnsDown: 'Внутренние имена могут не разрешаться — проверьте, через какой интерфейс идёт путь к DNS-серверу.',
     partial: 'Попробуйте проверить ещё раз через минуту.',
     noAddresses: 'Проверьте, что имя написано верно и DNS работает.',
+    onlyExcluded: 'Это имя указывает на сам компьютер (например, localhost) или на link-local адрес — такой трафик не уходит ни через один интерфейс, правило не нужно.',
   },
 
   matchTitle: 'Подходящее правило',
@@ -133,7 +138,9 @@ export const diagnosticsRu: Shape<typeof diagnosticsUz> = {
     ok: (count) => `Системный резолвер вернул ${addresses(count)}.`,
     truncated: (max) => `Системный резолвер вернул больше ${String(max)} IPv4-адресов — проверены только первые ${String(max)}.`,
     excluded: (count) =>
-      `${String(count)} ${plural('ru', count, ruForms('адрес', 'адреса', 'адресов'))} (loopback, link-local и т. п.) не маршрутизируются — не проверялись.`,
+      `${String(count)} ${plural('ru', count, ruForms('адрес', 'адреса', 'адресов'))} (loopback, link-local и т. п.) ${plural('ru', count, ruForms('не маршрутизируется — не проверялся', 'не маршрутизируются — не проверялись', 'не маршрутизируются — не проверялись'))}.`,
+    onlyExcluded: (count) =>
+      `Системный резолвер вернул только адреса, которые не маршрутизируются (${String(count)}: loopback, link-local и т. п.), — проверять нечего.`,
     outcomes: {
       'not-found': 'Имя не найдено: системный резолвер не вернул IPv4-адреса.',
       timeout: 'Системный резолвер не ответил за 3 секунды.',

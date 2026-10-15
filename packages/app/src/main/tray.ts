@@ -44,7 +44,8 @@ export const INITIAL_APPEARANCE: TrayAppearance = initialAppearance();
  * Rules waiting for their interface (`pending`: `interface-down`,
  * `no-gateway`), and whether both roles are up behind the same gateway (one
  * subnet: which interface a gateway route leaves through is the system's
- * choice). Neither is an error — the icon stays `active` — but the tooltip
+ * choice), and DNS servers reached through the other interface
+ * (`dnsWarnings`, one per server). None is an error — the icon stays `active` — but the tooltip
  * says so.
  */
 function connectedNotes(state: EngineState, words: Messages['tray']): string {
@@ -57,6 +58,9 @@ function connectedNotes(state: EngineState, words: Messages['tray']): string {
   if (ethernet.up && wifi.up && ethernet.gateway !== null && ethernet.gateway === wifi.gateway) {
     notes.push(words.sameSubnet);
   }
+  // A DNS server reached through the other interface (TASK-DELTA-21): a note, the icon keeps its look.
+  const servers = new Set((state.dnsWarnings ?? []).map((warning) => warning.server)).size;
+  if (servers > 0) notes.push(words.dnsWarnings(servers));
   return notes.map((note) => ` · ${note}`).join('');
 }
 

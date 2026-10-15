@@ -21,6 +21,8 @@ export const shellUz = {
     /** Notes after the status, each as " · …". */
     rulesWaiting: (count: number): string => `${String(count)} ta qoida interfeysni kutmoqda`,
     sameSubnet: 'Ethernet va Wi‑Fi bitta tarmoqda',
+    /** DNS servers reached through the other interface (`dnsWarnings`; counted once per server). */
+    dnsWarnings: (count: number): string => `${String(count)} ta DNS server boshqa interfeysdan ketmoqda`,
     manageRules: 'Qoidalarni boshqarish',
     quit: 'RouteSwitch ilovasidan chiqish',
   },

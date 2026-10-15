@@ -42,6 +42,15 @@ export const initialAddRuleUi = (form: RuleForm = NEW_RULE_FORM, loaded = false)
   focusField: null,
 });
 
+/**
+ * The first state of the dialog for what it opens on: an edit waits for the
+ * stored rule (`load`); a new rule starts empty, or filled in by an offer
+ * (TASK-DELTA-21) — counted as loaded, nothing touched or submitted, nothing
+ * sent: the save stays the user's.
+ */
+export const initialAddRuleUiFor = (editor: { readonly mode: 'add'; readonly prefill?: RuleForm } | { readonly mode: 'edit' }): AddRuleUiState =>
+  editor.mode === 'add' && editor.prefill !== undefined ? initialAddRuleUi(editor.prefill, true) : initialAddRuleUi();
+
 export type AddRuleUiUpdate = (change: (state: AddRuleUiState) => AddRuleUiState) => void;
 
 export interface AddRuleController {

@@ -18,7 +18,7 @@ import type { RsApi } from '../../rs';
 import { errorText, helperStatusText, UZ } from '../../text';
 import type { AddRuleApi } from './actions';
 import styles from './AddRuleScreen.module.css';
-import { createAddRuleController, initialAddRuleUi, type AddRuleController, type AddRuleUiState } from './controller';
+import { createAddRuleController, initialAddRuleUiFor, type AddRuleController, type AddRuleUiState } from './controller';
 import {
   acceptedValues,
   checkForm,
@@ -29,10 +29,17 @@ import {
   testAddressOf,
   type FieldErrors,
   type FormField,
+  type RuleForm,
 } from './model';
 
-/** What the rules window opens the form for. */
-export type RuleEditorTarget = { readonly mode: 'add' } | { readonly mode: 'edit'; readonly id: string };
+/**
+ * What the dialog edits. A new rule may come filled in (`prefill`: the DNS
+ * warning's offer, TASK-DELTA-21) — only filled in: it is saved like any new
+ * rule, when the user presses "Saqlash va qo'llash".
+ */
+export type RuleEditorTarget =
+  | { readonly mode: 'add'; readonly prefill?: RuleForm }
+  | { readonly mode: 'edit'; readonly id: string };
 
 const ROLES: readonly IfaceRole[] = ['ethernet', 'wifi'];
 const UNKNOWN_INTERFACE: InterfaceState = { device: null, ip: null, gateway: null, up: false };
@@ -462,7 +469,7 @@ export function AddRuleDialog({ editor, onClose, rs: given, newId }: AddRuleDial
   language.current = i18n;
   // One id for the life of the dialog: changing the kind edits the same rule.
   const [ruleId] = useState(() => (editor.mode === 'edit' ? editor.id : (newId ?? (() => globalThis.crypto.randomUUID()))()));
-  const [ui, setUi] = useState<AddRuleUiState>(() => initialAddRuleUi());
+  const [ui, setUi] = useState<AddRuleUiState>(() => initialAddRuleUiFor(editor));
   const latest = useRef(ui);
   latest.current = ui;
   const close = useRef(onClose);

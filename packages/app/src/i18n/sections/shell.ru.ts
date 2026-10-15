@@ -17,6 +17,8 @@ export const shellRu: Shape<typeof shellUz> = {
     rulesWaiting: (count) =>
       `${String(count)} ${plural('ru', count, ruForms('правило ждёт', 'правила ждут', 'правил ждут'))} интерфейс`,
     sameSubnet: 'Ethernet и Wi‑Fi в одной сети',
+    dnsWarnings: (count) =>
+      `${String(count)} ${plural('ru', count, ruForms('DNS-сервер идёт', 'DNS-сервера идут', 'DNS-серверов идут'))} через другой интерфейс`,
     manageRules: 'Открыть правила',
     quit: 'Выйти из RouteSwitch',
   },

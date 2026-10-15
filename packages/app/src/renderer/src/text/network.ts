@@ -4,7 +4,7 @@
 // functions of the engine state (and the config, for each rule's interface);
 // the menu bar window and the rules window show the same words.
 
-import type { Config, EngineState, IfaceRole, RuleState } from '@routeswitch/shared';
+import type { Config, DnsWarning, EngineState, IfaceRole, RuleState } from '@routeswitch/shared';
 
 import type { I18n } from '../../../i18n';
 import { UZ } from './errors';
@@ -67,6 +67,52 @@ export function networkWarnings(state: EngineState, config: Config | null, i18n:
     warnings.push({ id: 'same-subnet', title: words.sameSubnetTitle, text: words.sameSubnetText(gateway) });
   }
   return warnings;
+}
+
+/** The role a DNS warning's server is wrongly reached through: there are two roles, so it is the other one. */
+const OTHER_ROLE: Readonly<Record<IfaceRole, IfaceRole>> = { ethernet: 'wifi', wifi: 'ethernet' };
+
+/** A DNS server reached through the wrong interface (`EngineState.dnsWarnings`), as a banner. */
+export interface DnsWarningBanner extends NetworkWarning {
+  readonly server: string;
+  /** The interface the server should be reached through: the rule the offer adds goes there. */
+  readonly role: IfaceRole;
+}
+
+/**
+ * The helper's DNS warnings, one banner per server (the first warning of a
+ * server wins: the helper lists an interface's own servers before the rules'),
+ * in the helper's order. Shown whatever routing's switch says: the warning
+ * is about the interfaces, not about a rule. The title names the interface
+ * (or the rule, by its domain from the config) the server belongs to; the
+ * text says why, by the helper's code.
+ */
+export function dnsWarningBanners(state: EngineState, config: Config | null, i18n: I18n = UZ): DnsWarningBanner[] {
+  const words = i18n.t.dnsWarnings;
+  const banners: DnsWarningBanner[] = [];
+  const seen = new Set<string>();
+  const targetOf = new Map(config?.rules.map((rule) => [rule.id, rule.target]) ?? []);
+  for (const warning of state.dnsWarnings ?? []) {
+    if (seen.has(warning.server)) continue;
+    seen.add(warning.server);
+    banners.push(dnsWarningBanner(warning, warning.ruleId === undefined ? null : (targetOf.get(warning.ruleId) ?? null), words));
+  }
+  return banners;
+}
+
+function dnsWarningBanner(warning: DnsWarning, ruleTarget: string | null, words: I18n['t']['dnsWarnings']): DnsWarningBanner {
+  const { server, role } = warning;
+  const name = ROLE_NAMES[role];
+  // `via` is null when the helper did not learn it; with two roles it can only be the other one.
+  const other = ROLE_NAMES[warning.via ?? OTHER_ROLE[role]];
+  const title =
+    warning.source === 'interface'
+      ? words.titleInterface(name, server, other)
+      : ruleTarget === null
+        ? words.titleRuleUnknown(server, other)
+        : words.titleRule(ruleTarget, server, other);
+  const text = warning.code === 'other-interface-subnet' ? words.textSubnet(server, name, other) : words.textRouted(server, name, other);
+  return { id: `dns-${server}`, title, text, server, role };
 }
 
 /** How many of the last known addresses are named; the rest are counted. */

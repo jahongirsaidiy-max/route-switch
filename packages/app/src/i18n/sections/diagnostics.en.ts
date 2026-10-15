@@ -25,6 +25,9 @@ export const diagnosticsEn: Shape<typeof diagnosticsUz> = {
     'invalid-host': 'This is not a host name. For example: corp.local, 10.20.4.37 or https://example.com.',
   },
   failed: (reason) => `Could not check: ${reason}`,
+  rateLimited:
+    'Too many checks: the helper checks up to 10 requests a minute (each address of a name no rule covers is a request of its own). Try again in a minute.',
+  helperBusy: 'The helper is busy with another check — try again shortly.',
 
   emptyTitle: 'Nothing checked yet',
   emptyText: "Enter a host, IP or URL — the result shows the matching rule, each address's actual interface and the DNS server.",
@@ -36,6 +39,7 @@ export const diagnosticsEn: Shape<typeof diagnosticsUz> = {
     mismatch: 'Traffic does not leave through the expected interface',
     noRule: 'No rule — it uses the default route',
     noAddresses: 'No addresses found',
+    onlyExcluded: 'The name points to an address that is never routed',
     dnsDown: 'The DNS server does not answer',
     partial: 'Some addresses were not checked',
   },
@@ -49,6 +53,7 @@ export const diagnosticsEn: Shape<typeof diagnosticsUz> = {
     dnsDown: 'Internal names may not resolve — check which interface the way to the DNS server takes.',
     partial: 'Try checking again in a minute.',
     noAddresses: 'Check that the name is spelled correctly and that DNS works.',
+    onlyExcluded: 'This name points to the computer itself (localhost, for example) or to a link-local address — such traffic leaves through no interface, no rule is needed.',
   },
 
   matchTitle: 'Matching rule',
@@ -131,7 +136,9 @@ export const diagnosticsEn: Shape<typeof diagnosticsUz> = {
   lookup: {
     ok: (n) => `The system resolver gave ${count(n, 'IPv4 address', 'IPv4 addresses')}.`,
     truncated: (max) => `The system resolver gave more than ${String(max)} IPv4 addresses — only the first ${String(max)} were checked.`,
-    excluded: (n) => `${count(n, 'address', 'addresses')} (loopback, link-local, …) are never routed and were not checked.`,
+    excluded: (n) =>
+      `${count(n, 'address', 'addresses')} (loopback, link-local, …) ${n === 1 ? 'is never routed and was' : 'are never routed and were'} not checked.`,
+    onlyExcluded: (n) => `The system resolver gave only addresses that are never routed (${String(n)}: loopback, link-local, …) — nothing to check.`,
     outcomes: {
       'not-found': 'Name not found: the system resolver gave no IPv4 address.',
       timeout: 'The system resolver did not answer within 3 seconds.',

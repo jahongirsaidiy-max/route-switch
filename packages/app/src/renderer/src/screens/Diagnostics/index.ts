@@ -7,6 +7,7 @@ export {
 } from './DiagnosticsScreen';
 export {
   createDiagnosticsController,
+  failureText,
   INITIAL_DIAGNOSTICS_UI,
   inputErrorText,
   type DiagnosticsApi,

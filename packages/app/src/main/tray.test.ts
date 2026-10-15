@@ -100,6 +100,33 @@ describe('trayAppearance', () => {
     expect(trayAppearance(connected, both('192.168.1.1', false), current).tooltip).toBe('RouteSwitch — faol');
   });
 
+  // TASK-DELTA-21
+  it('notes DNS servers reached through the other interface, once per server; the icon keeps its look', () => {
+    const base = engineState(1);
+    const warning = (server: string, role: 'ethernet' | 'wifi', source: 'interface' | 'rule' = 'interface') => ({
+      server,
+      source,
+      role,
+      via: role === 'ethernet' ? ('wifi' as const) : ('ethernet' as const),
+      code: 'other-interface-subnet' as const,
+      ...(source === 'rule' ? { ruleId: RULE_ID } : {}),
+    });
+    const two = { ...base, dnsWarnings: [warning('10.0.0.53', 'ethernet'), warning('10.0.0.53', 'ethernet', 'rule'), warning('10.0.0.54', 'ethernet')] };
+    expect(trayAppearance(connected, two, current)).toEqual({ kind: 'active', tooltip: 'RouteSwitch — faol · 2 ta DNS server boshqa interfeysdan ketmoqda' });
+    expect(trayAppearance(connected, { ...base, dnsWarnings: [] }, current).tooltip).toBe('RouteSwitch — faol');
+    const failing = engineState(1, 1, { rules: [ruleState('error')], dnsWarnings: [warning('10.0.0.53', 'ethernet')] });
+    expect(trayAppearance(connected, failing, current).kind).toBe('error');
+    const ru = i18nFor('ru');
+    const ruTip = (count: number) =>
+      trayAppearance(connected, { ...base, dnsWarnings: Array.from({ length: count }, (_, i) => warning(`10.0.0.${String(i + 1)}`, 'wifi')) }, current, ru).tooltip;
+    expect(ruTip(1)).toBe('RouteSwitch — активно · 1 DNS-сервер идёт через другой интерфейс');
+    expect(ruTip(2)).toBe('RouteSwitch — активно · 2 DNS-сервера идут через другой интерфейс');
+    expect(ruTip(5)).toBe('RouteSwitch — активно · 5 DNS-серверов идут через другой интерфейс');
+    expect(trayAppearance(connected, two, current, i18nFor('en')).tooltip).toBe('RouteSwitch — active · 2 DNS servers go through the other interface');
+    // Off: routing is off, no note.
+    expect(trayAppearance(connected, { ...two, enabled: false }, current).tooltip).toBe('RouteSwitch — o\'chirilgan');
+  });
+
   it('starts in the neutral look', () => {
     expect(INITIAL_APPEARANCE.kind).toBe('off');
   });

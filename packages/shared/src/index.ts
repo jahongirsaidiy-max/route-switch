@@ -7,3 +7,4 @@ export * from './paths';
 export * from './preferences';
 export * from './protocol';
 export * from './schema';
+export * from './windowIntent';

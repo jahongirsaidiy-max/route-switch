@@ -105,6 +105,26 @@ describe('createDiagnoser', () => {
     notes: ['no-matching-rule' as const],
   });
 
+  it.each(['rate-limited', 'busy'] as const)('%s for one address: rate-limited stops the rest (the minute is used up), busy does not', async (code) => {
+    const { logger } = memoryLogger();
+    const request = vi.fn((_method: string, args: { target: string }) => {
+      if (args.target === 'example.com') {
+        return Promise.resolve({ ok: true, value: { ...ipResult('example.com'), targetKind: 'domain', addresses: [], notes: ['name-not-covered'] } });
+      }
+      if (args.target === '203.0.113.1') return Promise.resolve({ ok: false, code, error: 'refused' });
+      return Promise.resolve({ ok: true, value: ipResult(args.target) });
+    });
+    const diagnose = createDiagnoser({ request: request as unknown as HelperClient['request'], logger, lookup: lookupOf('203.0.113.1', '203.0.113.2') });
+    const result = await diagnose('example.com');
+    const sent = request.mock.calls.map(([, args]) => args.target);
+    if (code === 'rate-limited') {
+      expect(sent).toEqual(['example.com', '203.0.113.1']);
+      expect(result).toMatchObject({ ok: true, value: { lookup: { addresses: [{ code: 'rate-limited' }, { address: '203.0.113.2', ok: false, code: 'rate-limited' }] } } });
+    } else {
+      expect(sent).toEqual(['example.com', '203.0.113.1', '203.0.113.2']);
+    }
+  });
+
   it('stops sending once the connection is gone; the remaining addresses carry that code', async () => {
     const { logger } = memoryLogger();
     const request = vi.fn((_method: string, args: { target: string }) => {

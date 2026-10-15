@@ -49,6 +49,8 @@ const INVOKES = [
   ['copyServiceOrderCommand', [], 'rs:copyServiceOrderCommand'],
   ['uninstallHelper', [], 'rs:uninstall'],
   ['openRulesWindow', [], 'rs:openRulesWindow'],
+  ['openRulesWindow', [{ kind: 'dns-offer', server: '10.0.0.53', role: 'ethernet' }], 'rs:openRulesWindow'],
+  ['takeRulesIntent', [], 'rs:takeRulesIntent'],
   ['reconnectHelper', [], 'rs:reconnect'],
   ['resetConfig', [], 'rs:resetConfig'],
   ['installHelper', [], 'rs:installHelper'],
@@ -66,10 +68,10 @@ describe('preload', () => {
     expect([...electron.exposed.keys()]).toEqual(['rs']);
   });
 
-  it('every method but the three subscriptions is in INVOKES (a new method cannot go untested)', () => {
+  it('every method but the four subscriptions is in INVOKES (a new method cannot go untested)', () => {
     const invokes = INVOKES.map(([method]) => method as string);
-    const subscriptions = ['onState', 'onLog', 'onLanguage'];
-    expect(Object.keys(rs).filter((key) => !subscriptions.includes(key)).sort()).toEqual([...invokes].sort());
+    const subscriptions = ['onState', 'onLog', 'onLanguage', 'onRulesIntent'];
+    expect(Object.keys(rs).filter((key) => !subscriptions.includes(key)).sort()).toEqual([...new Set(invokes)].sort());
   });
 
   it.each(INVOKES)('%s is a bare invoke on %s with the arguments unchanged', async (method, args, channel) => {
@@ -138,5 +140,24 @@ describe('preload', () => {
 
     unsubscribe();
     expect(electron.removeListener).toHaveBeenCalledWith('rs:language', forward);
+  });
+
+  it('openRulesWindow without an intent sends no argument at all (the main process counts them)', async () => {
+    electron.invoke.mockResolvedValueOnce({ ok: true, value: null });
+    await rs.openRulesWindow();
+    expect(electron.invoke.mock.lastCall).toEqual(['rs:openRulesWindow']);
+  });
+
+  it('onRulesIntent calls the listener with nothing (the intent is taken with takeRulesIntent), and unsubscribes', () => {
+    const received: unknown[][] = [];
+    const unsubscribe = rs.onRulesIntent((...args: unknown[]) => {
+      received.push(args);
+    });
+    const [channel, forward] = electron.on.mock.lastCall ?? [];
+    expect(channel).toBe('rs:rulesIntent');
+    forward?.({ sender: 'ipc-renderer-event' }, { kind: 'section', section: 'log' });
+    expect(received).toEqual([[]]);
+    unsubscribe();
+    expect(electron.removeListener).toHaveBeenCalledWith('rs:rulesIntent', forward);
   });
 });

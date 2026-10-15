@@ -177,6 +177,39 @@ describe('diagnosisView', () => {
       expect(view.lookup).toEqual(["Tizim resolveri 1 tadan ko'p IPv4 manzil berdi — faqat birinchi 1 tasi tekshirildi."]);
     });
 
+    // DELTA-20 QA follow-up (TASK-DELTA-21): `localhost` — every address excluded.
+    it('only excluded addresses (localhost): one line that says so, no "0 addresses", a neutral verdict', () => {
+      const local: RsDiagnosis = { result: result('localhost', { notes: ['name-not-covered'] }), lookup: { outcome: 'ok', addresses: [], truncated: false, excluded: 1 } };
+      const view = diagnosisView(local, RULES);
+      expect(view.lookup).toEqual(["Tizim resolveri faqat route qilinmaydigan manzil berdi (1 ta: loopback, link-local va h.k.) — tekshiradigan manzil yo'q."]);
+      expect(view.lookup.join(' ')).not.toContain('0 ta');
+      expect(view.verdict).toMatchObject({ tone: 'neutral', title: 'Nom route qilinmaydigan manzilga yechiladi' });
+      expect(view.verdict.advice).toContain('localhost');
+      for (const [locale, zero] of [
+        ['ru', 'вернул 0'],
+        ['en', 'gave 0'],
+      ] as const) {
+        const own = diagnosisView(local, RULES, i18nFor(locale));
+        expect(own.lookup).toHaveLength(1);
+        expect(own.lookup[0]).not.toContain(zero);
+        expect(own.verdict.title).not.toBe(view.verdict.title);
+      }
+      // No address at all and nothing excluded is still "not found".
+      const none = diagnosisView({ ...local, lookup: { outcome: 'ok', addresses: [], truncated: false, excluded: 0 } }, RULES);
+      expect(none.verdict.title).toBe('Manzil topilmadi');
+    });
+
+    it('the excluded count agrees with its verb in Russian and English (1 vs many)', () => {
+      const ru = i18nFor('ru').t.diagnostics.lookup;
+      expect(ru.excluded(1)).toBe('1 адрес (loopback, link-local и т. п.) не маршрутизируется — не проверялся.');
+      expect(ru.excluded(2)).toBe('2 адреса (loopback, link-local и т. п.) не маршрутизируются — не проверялись.');
+      expect(ru.excluded(5)).toBe('5 адресов (loopback, link-local и т. п.) не маршрутизируются — не проверялись.');
+      expect(ru.excluded(21)).toBe('21 адрес (loopback, link-local и т. п.) не маршрутизируется — не проверялся.');
+      const en = i18nFor('en').t.diagnostics.lookup;
+      expect(en.excluded(1)).toBe('1 address (loopback, link-local, …) is never routed and was not checked.');
+      expect(en.excluded(3)).toBe('3 addresses (loopback, link-local, …) are never routed and were not checked.');
+    });
+
     it.each([
       ['not-found', 'Nom topilmadi'],
       ['timeout', '3 soniya'],
