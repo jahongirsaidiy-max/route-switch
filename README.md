@@ -73,9 +73,9 @@ to install the helper.
 The app starts in the language of macOS (English, Russian, otherwise Uzbek);
 change it in **Settings → Til / Язык / Language**.
 
-### Updating from 0.1
+### Updating from 0.1 or 0.2
 
-Replace the app in Applications with the new one and open it. The 0.1 helper
+Replace the app in Applications with the new one and open it. An older helper
 speaks an older protocol, so RouteSwitch reports "Helper version does not
 match": click **Reinstall the helper** and enter the administrator password.
 Your rules are kept.
@@ -95,13 +95,20 @@ rest on Wi‑Fi:
    **Ethernet**. If internal names are only known to the office DNS, tick
    **Resolve through an internal DNS server** and enter its address, e.g.
    `10.0.0.53`.
-4. Check it in **Diagnostics** (rules window): enter `corp.local` or an
-   address to see the matching rule and the route each address takes. Or from
-   Terminal:
+4. For every subdomain at once (`app.corp.local`, `git.corp.local`, …) add a
+   **Domain** rule `*.corp.local` → **Ethernet**. It covers subdomains only, so
+   keep the `corp.local` rule for the domain itself. Routes for subdomains are
+   added as they are looked up.
+
+   <img src="docs/add-rule-wildcard.png" width="520" alt="Add rule: the wildcard domain *.corp.local through Ethernet">
+5. Check it in **Diagnostics** (rules window): enter `corp.local`,
+   `app.corp.local` or an address to see the matching rule and the route each
+   address takes. Or from Terminal:
 
    ```bash
-   route -n get 10.1.2.3     # interface: the Ethernet device (e.g. en5)
-   route -n get 1.1.1.1      # interface: the Wi-Fi device (e.g. en0)
+   route -n get 10.1.2.3         # interface: the Ethernet device (e.g. en5)
+   route -n get app.corp.local   # the same, once the name has been looked up
+   route -n get 1.1.1.1          # interface: the Wi-Fi device (e.g. en0)
    ```
 
 Rules are re-applied automatically when the cable, the Wi‑Fi network or sleep
@@ -127,6 +134,10 @@ every part of the app.
     `10.*.*.*` (saved as `10.0.0.0/8`)
   - **Domain** — e.g. `corp.local`; its A records are resolved and applied as
     IP routes, then refreshed periodically
+  - **Wildcard domain** — e.g. `*.corp.local`: every subdomain (not
+    `corp.local` itself); routes are added as names are looked up, through a
+    DNS proxy in the helper. Apps that use their own DNS (a browser with
+    Secure DNS / DNS over HTTPS) bypass it, and IPv6 answers get no route
 - **Per-rule interface** — each rule is bound to Ethernet or Wi‑Fi.
 - **Scoped DNS for internal domains** — a per-domain resolver
   (`/etc/resolver/<domain>`) so internal names are resolved by the internal DNS
@@ -173,6 +184,12 @@ RouteSwitch runs as two processes that talk only over a Unix domain socket:
   network changes and on a timer.
 - Rules store an interface **role** (`ethernet` / `wifi`), not a device name
   like `en5`, so they keep working when you switch adapters.
+- **Wildcard domains** go through a DNS forwarding proxy inside the helper,
+  on `127.0.0.1` port 954 (UDP and TCP), running only while a wildcard rule is
+  enabled. `/etc/resolver/<domain>` sends the domain's lookups to it; it
+  forwards them to the rule's DNS server (or the interface's), adds a host
+  route for each IPv4 address of the answer, then returns the answer. Learned
+  routes live 15 minutes to a day, up to 256 per rule and 4096 in all.
 - Only standard macOS tools are used (`route`, `networksetup`, `ipconfig`,
   `scutil`). No kernel extension and no Network Extension.
 
@@ -195,6 +212,9 @@ as the most sensitive part of the project:
   alone.
 - **Restricted socket** (`0660`, group `staff`) and limits on the number of
   rules, IPs per domain and refresh rate.
+- **Loopback-only DNS proxy.** It listens on `127.0.0.1` only, answers only
+  names under an enabled wildcard rule (anything else is refused), and limits
+  query size, concurrency and rate.
 - **Hardened Electron**: context isolation, sandboxed renderer, no remote
   content, strict CSP.
 - **Clean uninstall** removes the helper, its routes and its resolver files.
@@ -318,9 +338,11 @@ Builds are signed ad hoc. To distribute to other Macs later:
 **Done in 0.2.0:** English, Russian and Uzbek UI; IP wildcards; rules backup
 and restore; Diagnostics; DNS server warnings; in-app Help.
 
-**Planned:**
+**Done in 0.3.0:** wildcard domains (`*.example.com`) through a local DNS
+proxy.
 
-- **0.3.0** — wildcard domains (`*.example.com`) through a local DNS proxy.
+**Next:**
+
 - **0.4.0** — rule profiles, notifications, keeping Wi‑Fi first as the default
   route, and a command-line tool.
 

@@ -27,7 +27,7 @@ describe('field errors in every language', () => {
   it('empty, wildcard, upper case and invalid targets', () => {
     expect(checkForm(form({ target: '' }), NEW_ID, null, EN).errors.target).toBe('Enter an address.');
     expect(checkForm(form({ target: '' }), NEW_ID, null, RU).errors.target).toBe('Введите адрес.');
-    expect(checkForm(form({ kind: 'domain', target: '*.corp.local' }), NEW_ID, null, RU).errors.target).toBe(RU.t.addRule.errors.wildcardDomain);
+    expect(checkForm(form({ kind: 'domain', target: '*.com' }), NEW_ID, null, RU).errors.target).toBe(RU.t.validation['invalid-wildcard-domain']);
     expect(checkForm(form({ kind: 'domain', target: 'Corp.Local' }), NEW_ID, null, EN).errors.target).toBe(EN.t.addRule.errors.upperCase);
     // A shared validator's code reads from the shared table (`validation`) of the language.
     expect(checkForm(form({ kind: 'subnet', target: '0.0.0.0/0' }), NEW_ID, null, EN).errors.target).toBe(EN.t.validation['default-route']);

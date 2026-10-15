@@ -1,7 +1,17 @@
 import { constants } from 'node:fs';
 import * as nodeFs from 'node:fs/promises';
 
-import { LIMITS, RESOLVER_MARKER, normalizeDomain, normalizeHostAddress, normalizeIpv4, type Config } from '@routeswitch/shared';
+import {
+  DNS_PROXY,
+  LIMITS,
+  RESOLVER_MARKER,
+  isWildcardDomain,
+  normalizeDomain,
+  normalizeHostAddress,
+  normalizeIpv4,
+  wildcardBase,
+  type Config,
+} from '@routeswitch/shared';
 
 import { ALLOWED_BINARIES, type CommandRunner } from './exec';
 import type { Logger } from './logger';
@@ -13,6 +23,28 @@ import type { Logger } from './logger';
  *
  *     nameserver 10.20.0.10
  *     # managed-by: routeswitch
+ *
+ * A wildcard rule `*.B` (ADR-002) gets `/etc/resolver/B`, which sends B and
+ * every name under it to the helper's loopback DNS proxy:
+ *
+ *     nameserver 127.0.0.1
+ *     port 954
+ *     # managed-by: routeswitch
+ *
+ * only while the proxy listens (`WildcardProxyStatus` `ready`). Otherwise no
+ * such file is written — and one left from before is removed like any stale
+ * file — so the names keep resolving through the normal DNS; the rule is
+ * `pending` (the proxy is starting) or `error` (it cannot listen), with
+ * `dns-proxy-unavailable`.
+ *
+ * One file name, several rules (`B` for an exact rule `B` with `dns` and for
+ * `*.B`): the first rule in config order decides who answers for B — its
+ * `dns` server, or for a wildcard without `dns` the system resolvers, through
+ * the proxy. A later rule that agrees (the same server) shares the file; when
+ * any of them is a wildcard the file is the proxy's, which forwards B itself
+ * to that same server (`routeQuery` passthrough). A later rule that disagrees
+ * is `error` / `resolver-conflict`. An exact rule without `dns` needs no file
+ * and so never conflicts.
  *
  * Ownership is the marker line, nothing else. A file without it belongs to
  * the user or to another tool: it is never read beyond the check, never
@@ -36,7 +68,7 @@ import type { Logger } from './logger';
  * logged and tried again on the next pass.
  */
 
-/** A file of ours is two short lines; anything larger is not ours. */
+/** A file of ours is two or three short lines; anything larger is not ours. */
 export const MAX_RESOLVER_FILE_BYTES = 4096;
 /** Directory entries looked at per pass; the rest wait for a later pass (nothing of the user's is touched either way). */
 export const MAX_RESOLVER_DIR_ENTRIES = 4 * LIMITS.maxRules;
@@ -48,9 +80,29 @@ const FLUSH_TIMEOUT_MS = 5_000;
 
 /** Why a domain rule's resolver file is not in place. */
 export interface ResolverIssue {
-  readonly reasonCode: 'resolver-conflict' | 'resolver-failed';
+  readonly reasonCode: 'resolver-conflict' | 'resolver-failed' | 'dns-proxy-unavailable';
   readonly reason: string;
+  /** The rule waits rather than fails (the DNS proxy is still starting): its status is `pending`, not `error`. */
+  readonly pending?: boolean | undefined;
 }
+
+/**
+ * Whether the DNS proxy (ADR-002) can take the names of wildcard rules now:
+ * - `ready`       — it listens; their files are written;
+ * - `starting`    — it has not been started yet, or is binding; no file, the rules wait;
+ * - `unavailable` — it cannot listen (`detail`: the error code of the bind, e.g.
+ *                   `EADDRINUSE`); no file, the rules are `error`. It is retried.
+ * - `absent`      — this process runs no proxy (the one-shot run, `--uninstall`);
+ *                   no file, the rules are `error`.
+ */
+export type WildcardProxyStatus =
+  | { readonly state: 'ready' }
+  | { readonly state: 'starting' }
+  | { readonly state: 'unavailable'; readonly detail: string | null }
+  | { readonly state: 'absent' };
+
+/** What a `sync` without a proxy status assumes: this process runs no proxy. */
+export const NO_WILDCARD_PROXY: WildcardProxyStatus = Object.freeze({ state: 'absent' });
 
 export interface ResolverSyncResult {
   /** Rule id -> the problem with its file; rules without an entry are fine (or need no file). */
@@ -95,14 +147,23 @@ export interface ResolverFilesDeps {
 }
 
 export interface ResolverFiles {
-  /** Brings the managed files in line with the config. Never rejects. */
-  sync(config: Pick<Config, 'enabled' | 'rules'>): Promise<ResolverSyncResult>;
+  /**
+   * Brings the managed files in line with the config. Never rejects. `proxy`
+   * decides about the files of wildcard rules; without it there is no proxy.
+   */
+  sync(config: Pick<Config, 'enabled' | 'rules'>, proxy?: WildcardProxyStatus): Promise<ResolverSyncResult>;
   /** Removes every managed file (global toggle off, shutdown, uninstall). Never rejects. */
   removeAll(): Promise<ResolverSyncResult>;
 }
 
 /** The exact content of a managed file. */
 export const resolverFileContent = (server: string): string => `nameserver ${server}\n${RESOLVER_MARKER}\n`;
+
+/** The `port` line of a file that points at the DNS proxy. */
+const PROXY_PORT_LINE = `port ${String(DNS_PROXY.port)}\n`;
+
+/** The exact content of the managed file of a wildcard rule's base: the loopback DNS proxy. */
+export const proxyResolverFileContent = (): string => `nameserver ${DNS_PROXY.address}\n${PROXY_PORT_LINE}${RESOLVER_MARKER}\n`;
 
 /** True when the text carries the marker as a line of its own. */
 export const hasResolverMarker = (text: string): boolean =>
@@ -114,7 +175,8 @@ const MAX_IPV4_TEXT = 15;
 /**
  * True when `text` is what a write of ours can leave behind in a temporary
  * file when it was cut short (a crash or power loss after the file was
- * created): empty, or a prefix of `nameserver <IPv4>\n# managed-by: routeswitch\n`.
+ * created): empty, or a prefix of `nameserver <IPv4>\n# managed-by: routeswitch\n`
+ * or of the proxy's `nameserver 127.0.0.1\nport 954\n# managed-by: routeswitch\n`.
  * Only used for the temporary names; a target file is ours by its marker alone.
  */
 export const isCutShortContent = (text: string): boolean => {
@@ -126,8 +188,11 @@ export const isCutShortContent = (text: string): boolean => {
     // Still inside the address: digits and dots only, no longer than an address.
     return rest.length <= MAX_IPV4_TEXT && /^[0-9.]*$/.test(rest);
   }
-  if (!normalizeIpv4(rest.slice(0, newline)).ok) return false;
-  return `${RESOLVER_MARKER}\n`.startsWith(rest.slice(newline + 1));
+  const address = rest.slice(0, newline);
+  if (!normalizeIpv4(address).ok) return false;
+  const tail = rest.slice(newline + 1);
+  if (`${RESOLVER_MARKER}\n`.startsWith(tail)) return true;
+  return address === DNS_PROXY.address && (PROXY_PORT_LINE.startsWith(tail) || `${PROXY_PORT_LINE}${RESOLVER_MARKER}\n`.startsWith(tail));
 };
 
 /**
@@ -153,11 +218,33 @@ type ReadOutcome =
   | { readonly kind: 'foreign'; readonly why: string }
   | { readonly kind: 'unreadable'; readonly detail: string };
 
+/** Who answers for the name of a file: a DNS server, or the system resolvers (a wildcard rule without `dns`). */
+const SYSTEM_RESOLVERS = 'system';
+
 interface Wanted {
   readonly name: string;
-  readonly server: string;
+  /** A DNS server, or `SYSTEM_RESOLVERS`; rules sharing a file must agree on it. */
+  readonly answeredBy: string;
   readonly ruleIds: string[];
+  /** A wildcard rule shares the file: it points at the DNS proxy, which forwards the name itself to `answeredBy`. */
+  proxy: boolean;
 }
+
+const contentOf = (entry: Wanted): string => (entry.proxy ? proxyResolverFileContent() : resolverFileContent(entry.answeredBy));
+
+const proxyIssue = (proxy: Exclude<WildcardProxyStatus, { state: 'ready' }>, base: string): ResolverIssue => {
+  switch (proxy.state) {
+    case 'starting':
+      return { reasonCode: 'dns-proxy-unavailable', reason: `The DNS proxy is starting; ${base} is sent to it once it listens`, pending: true };
+    case 'absent':
+      return { reasonCode: 'dns-proxy-unavailable', reason: 'Wildcard rules need the DNS proxy of the running helper; this run has none' };
+    case 'unavailable':
+      return {
+        reasonCode: 'dns-proxy-unavailable',
+        reason: `The DNS proxy cannot listen on ${DNS_PROXY.address}:${String(DNS_PROXY.port)}${proxy.detail === null ? '' : ` (${proxy.detail})`}; names under ${base} use the normal DNS until it can, which is tried again`,
+      };
+  }
+};
 
 export const createResolverFiles = (deps: ResolverFilesDeps): ResolverFiles => {
   const fs = deps.fs ?? realFs;
@@ -299,39 +386,59 @@ export const createResolverFiles = (deps: ResolverFilesDeps): ResolverFiles => {
     }
   };
 
-  /** What the config asks for: one entry per file name, the first rule of a name deciding its server. */
+  /**
+   * What the config asks for: one entry per file name, the first rule of a
+   * name deciding who answers for it (see the module comment).
+   */
   const wantedOf = (
     config: Pick<Config, 'enabled' | 'rules'>,
+    proxy: WildcardProxyStatus,
     issues: Map<string, ResolverIssue>,
   ): Map<string, Wanted> => {
     const wanted = new Map<string, Wanted>();
     if (!config.enabled) return wanted;
+    const unusable: ResolverIssue = {
+      reasonCode: 'resolver-failed',
+      reason: 'The domain or DNS server of the rule cannot be used for a resolver file',
+    };
     for (const rule of config.rules.slice(0, LIMITS.maxRules)) {
-      if (!rule.enabled || rule.kind !== 'domain' || rule.dns === undefined) continue;
-      const name = resolverFileName(rule.target);
-      const server = typeof rule.dns === 'string' ? normalizeHostAddress(rule.dns) : null;
-      if (name === null || server?.ok !== true) {
-        issues.set(rule.id, { reasonCode: 'resolver-failed', reason: 'The domain or DNS server of the rule cannot be used for a resolver file' });
+      if (!rule.enabled || rule.kind !== 'domain') continue;
+      const wildcard = typeof rule.target === 'string' && isWildcardDomain(rule.target);
+      if (!wildcard && rule.dns === undefined) continue;
+      const base = wildcard ? wildcardBase(rule.target) : rule.target;
+      const name = base === null ? null : resolverFileName(base);
+      const server = rule.dns === undefined ? null : typeof rule.dns === 'string' ? normalizeHostAddress(rule.dns) : undefined;
+      if (name === null || server === undefined || (server !== null && !server.ok)) {
+        issues.set(rule.id, unusable);
         continue;
       }
+      if (wildcard && proxy.state !== 'ready') {
+        issues.set(rule.id, proxyIssue(proxy, name));
+        continue;
+      }
+      const answeredBy = server === null ? SYSTEM_RESOLVERS : server.value;
       const existing = wanted.get(name);
       if (existing === undefined) {
-        wanted.set(name, { name, server: server.value, ruleIds: [rule.id] });
-      } else if (existing.server === server.value) {
+        wanted.set(name, { name, answeredBy, ruleIds: [rule.id], proxy: wildcard });
+      } else if (existing.answeredBy === answeredBy) {
         existing.ruleIds.push(rule.id);
+        if (wildcard) existing.proxy = true;
       } else {
         issues.set(rule.id, {
           reasonCode: 'resolver-conflict',
-          reason: `Another rule already sets ${existing.server} as the DNS server of ${name}`,
+          reason:
+            existing.answeredBy === SYSTEM_RESOLVERS
+              ? `Another rule already sends ${name} to the DNS proxy, which asks the system resolvers for it`
+              : `Another rule already sets ${existing.answeredBy} as the DNS server of ${name}`,
         });
       }
     }
     return wanted;
   };
 
-  const run = async (config: Pick<Config, 'enabled' | 'rules'>): Promise<ResolverSyncResult> => {
+  const run = async (config: Pick<Config, 'enabled' | 'rules'>, proxy: WildcardProxyStatus): Promise<ResolverSyncResult> => {
     const issues = new Map<string, ResolverIssue>();
-    const wanted = wantedOf(config, issues);
+    const wanted = wantedOf(config, proxy, issues);
     const failAll = (reason: string): void => {
       for (const entry of wanted.values()) {
         for (const ruleId of entry.ruleIds) issues.set(ruleId, { reasonCode: 'resolver-failed', reason });
@@ -363,7 +470,7 @@ export const createResolverFiles = (deps: ResolverFilesDeps): ResolverFiles => {
     }
 
     for (const entry of wanted.values()) {
-      const content = resolverFileContent(entry.server);
+      const content = contentOf(entry);
       const current = await readEntry(entry.name);
       let problem: string | null = null;
       if (current.kind === 'foreign') {
@@ -376,7 +483,7 @@ export const createResolverFiles = (deps: ResolverFilesDeps): ResolverFiles => {
           changed += 1;
           logger.info(current.kind === 'missing' ? 'resolver file created' : 'resolver file updated', {
             domain: entry.name,
-            server: entry.server,
+            server: entry.proxy ? `${DNS_PROXY.address}:${String(DNS_PROXY.port)}` : entry.answeredBy,
             ruleIds: entry.ruleIds,
           });
         }
@@ -445,10 +552,10 @@ export const createResolverFiles = (deps: ResolverFilesDeps): ResolverFiles => {
     return { issues, changed, notRemoved };
   };
 
-  const serialised = (config: Pick<Config, 'enabled' | 'rules'>): Promise<ResolverSyncResult> => {
+  const serialised = (config: Pick<Config, 'enabled' | 'rules'>, proxy: WildcardProxyStatus): Promise<ResolverSyncResult> => {
     const next = queue.then(
-      () => run(config),
-      () => run(config),
+      () => run(config, proxy),
+      () => run(config, proxy),
     );
     const safe = next.catch((error: unknown) => {
       // Nothing above is expected to throw; a daemon must still get an answer.
@@ -460,7 +567,7 @@ export const createResolverFiles = (deps: ResolverFilesDeps): ResolverFiles => {
   };
 
   return {
-    sync: (config) => serialised(config),
-    removeAll: () => serialised({ enabled: false, rules: [] }),
+    sync: (config, proxy = NO_WILDCARD_PROXY) => serialised(config, proxy),
+    removeAll: () => serialised({ enabled: false, rules: [] }, NO_WILDCARD_PROXY),
   };
 };

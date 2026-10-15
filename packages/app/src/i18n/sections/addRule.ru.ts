@@ -19,10 +19,12 @@ export const addRuleRu: Shape<typeof addRuleUz> = {
   targetField: {
     ip: { label: 'IP-адрес', hint: 'Добавляется маршрут для одного хоста. Можно и шаблон: 10.*.*.* → 10.0.0.0/8 (подсеть).' },
     subnet: { label: 'Подсеть (CIDR)', hint: 'Самый надёжный вариант для всей внутренней сети. Можно и шаблон: 10.*.*.* → 10.0.0.0/8.' },
-    domain: { label: 'Домен', hint: 'Домен разрешается в IP, и для каждого IP добавляется маршрут.' },
+    domain: { label: 'Домен', hint: 'Домен разрешается в IP, и для каждого IP добавляется маршрут. Для поддоменов: *.corp.local.' },
   },
   normalised: (target) => `Сохранится как ${target}.`,
   wildcardResult: (cidr) => `→ ${cidr} (подсеть)`,
+  wildcardHint: (base) => `Только поддомены (например, app.${base}) — для самого ${base} добавьте отдельное правило.`,
+  wildcardLimits: 'Браузер с включённым «Secure DNS» (DNS over HTTPS) обходит это правило. Маршруты для IPv6-адресов не добавляются.',
   sameAs: (target) => `Этот адрес уже есть в правиле «${target}» (тот же интерфейс) — второе правило лишнее.`,
   useDns: 'Разрешать через внутренний DNS-сервер',
   dnsAddress: 'Адрес DNS-сервера',
@@ -35,7 +37,6 @@ export const addRuleRu: Shape<typeof addRuleUz> = {
   notePlaceholder: 'Например: бухгалтерская система',
 
   errors: {
-    wildcardDomain: 'Wildcard-домены (*.corp.local) не поддерживаются — введите точный домен, например corp.local.',
     upperCase: 'Введите домен строчными буквами, например corp.local.',
     refresh: `Введите целое число секунд от ${String(LIMITS.refreshSecMin)} до ${String(LIMITS.refreshSecMax)}.`,
     note: `Заметка — не длиннее ${String(LIMITS.noteMaxLength)} символов.`,
@@ -55,6 +56,8 @@ export const addRuleRu: Shape<typeof addRuleUz> = {
   previewDown: (role) => `${role} не подключён — ${waiting}`,
   previewEachIp: 'Для каждого разрешённого IP.',
   previewEachIpDns: 'Для каждого разрешённого IP; для DNS-сервера — если он не в своей сети.',
+  previewWildcard: 'Маршруты не добавляются заранее: при запросе поддомена маршрут добавляется для каждого IP ответа.',
+  previewWildcardDns: 'Маршруты поддоменов добавляются по запросу; маршрут к DNS-серверу — сразу.',
 
   test: 'Проверить',
   testOff: (reason) => `Проверить — ${reason}`,

@@ -13,6 +13,7 @@ import type { RulesWindowSection } from '@routeswitch/shared';
 export const HELP_TOPICS = [
   'start',
   'rule-types',
+  'wildcard-domains',
   'precedence',
   'default-route',
   'backup',

@@ -598,7 +598,7 @@ describe('request handler', () => {
   it('status: protocol and helper version with the current state', async () => {
     const h = handlerHarness();
     const { response } = await send(h.handler.dispatch, { id: 1, method: 'status' });
-    expect(response).toMatchObject({ id: 1, ok: true, result: { protocolVersion: 3, helperVersion: '0.0.0', state: { seq: 0 } } });
+    expect(response).toMatchObject({ id: 1, ok: true, result: { protocolVersion: 4, helperVersion: '0.0.0', state: { seq: 0 } } });
   });
 
   it('getConfig: the config together with its own revision', async () => {

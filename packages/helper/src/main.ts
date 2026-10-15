@@ -1,4 +1,6 @@
-import { PATHS, type Config, type EngineState } from '@routeswitch/shared';
+import dns from 'node:dns';
+
+import { PATHS, isWildcardDomain, type Config, type EngineState, type IfaceRole } from '@routeswitch/shared';
 
 import { createConfigWriter, emptyConfig, loadConfig, type ConfigFileReader, type ConfigFs } from './config-store';
 import {
@@ -6,17 +8,27 @@ import {
   probeDns,
   realClearTimer,
   realSetTimer,
+  type CachedDomain,
   type ClearTimer,
   type DnsResolverFactory,
   type DomainResolverService,
   type SetTimer,
 } from './dns';
-import { DEGRADED_ACCEPT_AFTER, createEngine, type AppliedRoute, type ClearResult, type Engine } from './engine';
+import { createDnsProxy, type DnsProxy, type DnsProxyStatus, type LearnFn } from './dns-proxy/server';
+import { routeQuery, upstreamServers, type SocketFactory } from './dns-proxy/upstream';
+import { DEGRADED_ACCEPT_AFTER, createEngine, type AppliedRoute, type ClearResult, type Engine, type ResolverSyncContext } from './engine';
 import { createCommandRunner, createProcessSpawner, type CommandRunner, type ProcessSpawner } from './exec';
 import { createJsonLinesFileSink, createJsonLinesSink, createLogger, type LineWritable, type LogSink, type Logger } from './logger';
 import { createNetworkMonitor, type NetworkMonitor } from './monitor';
 import { createNetInfo, type NetInfo } from './netinfo';
-import { createResolverFiles, type ResolverFiles, type ResolverFs } from './resolver';
+import {
+  NO_WILDCARD_PROXY,
+  createResolverFiles,
+  type ResolverFiles,
+  type ResolverFs,
+  type ResolverSyncResult,
+  type WildcardProxyStatus,
+} from './resolver';
 import { createRouteOperations, type RouteOperations } from './route';
 import {
   SOCKET_GROUP_GID,
@@ -42,11 +54,19 @@ import { UNINSTALL_REPLY_TIMEOUT_MS, requestUninstall, type UninstallReply } fro
  * 2. clean up what a previous run left behind: the routes of `state.json`
  *    (restored into the engine, then removed through `routeDelete`, which
  *    deletes only routes that are still ours) and every managed resolver file;
- * 3. reconcile (`startup`), start the network monitor. Requests are read from
- *    step 1 on; changes wait until step 3 is done;
+ * 3. reconcile (`startup`), then start the DNS proxy when an enabled
+ *    wildcard rule wants it (ADR-002; until then those rules wait, `pending`
+ *    / `dns-proxy-unavailable`, and get no resolver file), then the network
+ *    monitor. Requests are read from step 1 on; changes wait until step 3 is
+ *    done. From then on every pass starts the proxy when the config gains
+ *    its first enabled wildcard rule and stops it, after their files are
+ *    gone, when it loses the last one (`createWildcardProxyControl`);
  * 4. on SIGTERM or SIGINT: close the socket (no event about the cleanup
- *    reaches a client), stop the DNS module, then the monitor, then
- *    `cleanupAll` (every applied route and resolver file), and exit.
+ *    reaches a client), stop the DNS module and the monitor, then
+ *    `cleanupAll`: every managed resolver file first (no name under a
+ *    wildcard base points at a proxy that is gone), then the DNS proxy (no
+ *    answer can teach a route any more), then every applied route; and exit.
+ *    `uninstall` and the global toggle off take down in the same order.
  * Every change of the applied routes is written to `state.json`, so a crash
  * at any point is cleaned up by step 2 of the next start.
  * A stored config that cannot be loaded no longer stops the daemon: the
@@ -73,7 +93,7 @@ import { UNINSTALL_REPLY_TIMEOUT_MS, requestUninstall, type UninstallReply } fro
  */
 
 /** Version of the helper, reported in `EngineState.helperVersion`. Kept equal to `package.json` by a test. */
-export const HELPER_VERSION = '0.2.0';
+export const HELPER_VERSION = '0.3.0';
 
 export const EXIT_CODES = {
   ok: 0,
@@ -170,6 +190,8 @@ export interface RunDeps {
   readonly configFs?: ConfigFs | undefined;
   /** Daemon: JSON-lines log file (`PATHS.log` in `realDeps`); without it the daemon logs to stderr. */
   readonly logPath?: string | undefined;
+  /** Daemon: sockets of the DNS proxy; defaults to real `node:dgram` / `node:net`. Tests pass a fake network. */
+  readonly dnsProxySockets?: SocketFactory | undefined;
 }
 
 export type ParsedArgs =
@@ -276,6 +298,8 @@ export interface HelperCore {
 export interface CoreHooks {
   readonly onApplied?: ((routes: readonly AppliedRoute[]) => void | Promise<void>) | undefined;
   readonly scheduleRetry?: Parameters<typeof createEngine>[0]['scheduleRetry'];
+  /** The daemon's DNS proxy, around every resolver sync; without it there is no proxy (wildcard rules get no file). */
+  readonly wildcardProxy?: Pick<WildcardProxyControl, 'beforeSync' | 'afterSync'> | undefined;
 }
 
 /**
@@ -322,7 +346,14 @@ export const createCore = (
     now: deps.now,
     resolveDomain: dns.resolveDomain,
     onConfigChanged: dns.syncConfig,
-    syncResolvers: (current) => resolverFiles.sync(current),
+    syncResolvers: async (current, context) => {
+      const proxy = hooks.wildcardProxy;
+      if (proxy === undefined) return resolverFiles.sync(current, NO_WILDCARD_PROXY);
+      const result = await resolverFiles.sync(current, await proxy.beforeSync(current, context));
+      // After the files: no name is sent to a proxy that is gone.
+      await proxy.afterSync(current);
+      return result;
+    },
     onApplied: hooks.onApplied,
     scheduleRetry: hooks.scheduleRetry,
   });
@@ -391,6 +422,194 @@ const reconcileOnce = async (core: HelperCore, deps: RunDeps, root: Logger): Pro
 };
 
 // ---------------------------------------------------------------------------
+// Daemon: the DNS proxy of wildcard rules (ADR-002)
+// ---------------------------------------------------------------------------
+
+/** True when the config has an enabled wildcard domain rule and routing is on: the only time the DNS proxy runs. */
+export const wantsWildcardProxy = (config: Pick<Config, 'enabled' | 'rules'>): boolean =>
+  config.enabled && config.rules.some((rule) => rule.enabled && rule.kind === 'domain' && isWildcardDomain(rule.target));
+
+/** The resolver-file view of the proxy's state. */
+export const proxyFileStatus = (status: DnsProxyStatus): WildcardProxyStatus => {
+  if (status.state === 'running') return { state: 'ready' };
+  if (status.state === 'unavailable') return { state: 'unavailable', detail: status.lastError };
+  return { state: 'starting' };
+};
+
+/** IPv4 entries of a `dns.getServers()` list (`a.b.c.d`, or `a.b.c.d:53`); any other entry is left out. */
+const IPV4_SERVER = /^(\d{1,3}(?:\.\d{1,3}){3})(?::53)?$/;
+export const systemServerAddresses = (list: readonly string[]): string[] =>
+  list.slice(0, 16).flatMap((entry) => {
+    const found = typeof entry === 'string' ? IPV4_SERVER.exec(entry) : null;
+    return found?.[1] === undefined ? [] : [found[1]];
+  });
+
+export interface WildcardProxyDeps {
+  readonly logger: Logger;
+  /** The engine's config now (not a pass's snapshot): the proxy answers by it. */
+  readonly getConfig: () => Config;
+  /** `engine.learn`; it ignores an id that is no rule that learns any more (wildcard, or exact under a wildcard base), or any id once routing is off. */
+  readonly learn: LearnFn;
+  /** The system's resolvers: for names under a wildcard base that no rule owns, and an exact rule whose role has no servers. */
+  readonly systemServers: () => readonly string[];
+  /** Asks the engine for a pass: the proxy began or stopped being able to listen on its own (a retried bind). */
+  readonly requestReconcile: () => unknown;
+  readonly setTimer: SetTimer;
+  readonly clearTimer: ClearTimer;
+  readonly monotonicNow?: (() => number) | undefined;
+  readonly sockets?: SocketFactory | undefined;
+  /** Builds the proxy; tests may pass their own. Defaults to `createDnsProxy`. */
+  readonly createProxy?: typeof createDnsProxy | undefined;
+}
+
+export interface WildcardProxyControl {
+  /**
+   * Before a pass syncs the resolver files: remembers the DNS servers of the
+   * roles, starts the proxy when the config wants it (only once `arm` was
+   * called, never after `close`), and says what the files of wildcard rules
+   * may be. Never rejects.
+   */
+  beforeSync(config: Config, context: ResolverSyncContext): Promise<WildcardProxyStatus>;
+  /** After the files: stops the proxy when the config no longer wants it. Never rejects. */
+  afterSync(config: Config): Promise<void>;
+  /** End of the startup (after `recoverFromState` and the first reconcile): starts the proxy when the config wants it. */
+  arm(): Promise<void>;
+  /** Stops the proxy (the global toggle off); a later pass that wants it starts it again. Never rejects. */
+  stop(): Promise<void>;
+  /** Stops the proxy for good (shutdown, uninstall). Never rejects. */
+  close(): Promise<void>;
+  status(): DnsProxyStatus;
+  /**
+   * `diagnose`: what the DNS module's cache says for an exact rule, for an
+   * enabled wildcard rule the servers the proxy forwards its names to; null
+   * for any other id.
+   */
+  peekWildcard(ruleId: string): CachedDomain | null;
+}
+
+/**
+ * Starts and stops the DNS proxy with the config. The proxy itself never
+ * throws and retries a failed bind on its own; this only decides when it
+ * runs, and asks for a pass when its ability to listen changed outside a
+ * pass, so the resolver files follow (written once it listens, removed while
+ * it cannot).
+ */
+export const createWildcardProxyControl = (deps: WildcardProxyDeps): WildcardProxyControl => {
+  const logger = deps.logger.child({ component: 'main' });
+  let roleServers: ResolverSyncContext['roleDnsServers'] = {};
+  let armed = false;
+  let closed = false;
+  /** Read through a call: `close` may set it while a start or `arm` awaits. */
+  const isClosed = (): boolean => closed;
+  /** A start or stop of this module is running: the status changes it causes are the caller's pass's to see. */
+  let busy = 0;
+  /** What the last resolver sync was told; a change the proxy makes on its own after it asks for a pass. */
+  let reported: WildcardProxyStatus['state'] | null = null;
+  /** Starts and stops run one after another. */
+  let queue: Promise<unknown> = Promise.resolve();
+
+  const proxy: DnsProxy = (deps.createProxy ?? createDnsProxy)({
+    logger: deps.logger,
+    resolveRule: (qname) => {
+      const config = deps.getConfig();
+      return routeQuery(qname, config.enabled ? config.rules : [], {
+        roleServers: (role: IfaceRole) => roleServers[role] ?? [],
+        systemServers: () => systemServerAddresses(deps.systemServers()),
+      });
+    },
+    learn: deps.learn,
+    setTimer: deps.setTimer,
+    clearTimer: deps.clearTimer,
+    monotonicNow: deps.monotonicNow,
+    sockets: deps.sockets,
+    onStatus: (status) => {
+      if (isClosed() || busy > 0 || reported === null) return;
+      // Only a settled state: `starting` is followed by one of these at once.
+      if (status.state !== 'running' && status.state !== 'unavailable') return;
+      const next = proxyFileStatus(status).state;
+      if (next === reported) return;
+      // Asked once per change: the pass this asks for tells the files the same.
+      reported = next;
+      logger.info('DNS proxy state changed; resolver files follow', { state: status.state, error: status.lastError });
+      deps.requestReconcile();
+    },
+  });
+
+  const serial = (work: () => Promise<void>): Promise<void> => {
+    const next = queue.then(async () => {
+      busy += 1;
+      try {
+        await work();
+      } finally {
+        busy -= 1;
+      }
+    });
+    queue = next.catch((error: unknown) => {
+      logger.error('starting or stopping the DNS proxy failed', { error: error instanceof Error ? error.message : String(error) });
+    });
+    return queue as Promise<void>;
+  };
+
+  const startIfWanted = (snapshot: Config | null): Promise<void> =>
+    serial(async () => {
+      // The config of the pass and the one now must both want it: a pass that started before the
+      // toggle went off must not start the proxy that `stop` has just stopped.
+      if (!armed || isClosed() || (snapshot !== null && !wantsWildcardProxy(snapshot)) || !wantsWildcardProxy(deps.getConfig())) return;
+      if (proxy.status().state !== 'stopped') return;
+      logger.info('starting the DNS proxy for wildcard rules');
+      await proxy.start();
+    });
+
+  const stopProxy = (why: string): Promise<void> =>
+    serial(async () => {
+      if (proxy.status().state === 'stopped') return;
+      logger.info('stopping the DNS proxy', { why });
+      await proxy.stop();
+    });
+
+  return {
+    beforeSync: async (config, context) => {
+      roleServers = { ...context.roleDnsServers };
+      await startIfWanted(config);
+      const status = proxyFileStatus(proxy.status());
+      reported = status.state;
+      return status;
+    },
+    afterSync: async (config) => {
+      if (!wantsWildcardProxy(config) && !wantsWildcardProxy(deps.getConfig())) await stopProxy('no enabled wildcard rule');
+    },
+    arm: async () => {
+      if (isClosed()) return;
+      armed = true;
+      await startIfWanted(null);
+      // The pass that writes the files, or reports that the proxy cannot listen.
+      const now = proxyFileStatus(proxy.status()).state;
+      if (!isClosed() && reported !== null && now !== reported) {
+        reported = now;
+        deps.requestReconcile();
+      }
+    },
+    stop: () => stopProxy('routing turned off'),
+    close: async () => {
+      closed = true;
+      await stopProxy('shutting down');
+    },
+    status: () => proxy.status(),
+    peekWildcard: (ruleId) => {
+      const config = deps.getConfig();
+      const rule = config.rules.find((candidate) => candidate.id === ruleId);
+      if (rule === undefined || rule.kind !== 'domain' || !isWildcardDomain(rule.target)) return null;
+      return {
+        addresses: null,
+        truncated: false,
+        servers: upstreamServers(rule.dns === undefined ? (roleServers[rule.iface] ?? []) : [rule.dns]),
+        source: rule.dns === undefined ? 'interface' : 'rule',
+      };
+    },
+  };
+};
+
+// ---------------------------------------------------------------------------
 // Daemon: state, cleanup, shutdown
 // ---------------------------------------------------------------------------
 
@@ -414,10 +633,21 @@ export const cleanupAll = async (
   core: Pick<HelperCore, 'engine' | 'resolverFiles'>,
   store: StateStore,
   logger: Logger,
-  options: { readonly final?: boolean } = {},
+  options: { readonly final?: boolean; readonly stopProxy?: () => Promise<void> } = {},
 ): Promise<CleanupResult> => {
-  const routes = await core.engine.clear({ final: options.final === true });
-  const files = await core.resolverFiles.removeAll();
+  // Inside the engine's exclusive slot (no pass can write a file back): the resolver files first, so no
+  // name under a wildcard base points at the loopback proxy once it is gone; then the proxy (no answer can
+  // teach a route any more); then the routes.
+  const before: { files: ResolverSyncResult | null } = { files: null };
+  const routes = await core.engine.clear({
+    final: options.final === true,
+    beforeRoutes: async () => {
+      before.files = await core.resolverFiles.removeAll();
+      await options.stopProxy?.();
+    },
+  });
+  // `clear` runs the step unless it failed before it; then the files are removed here.
+  const files = before.files ?? (await core.resolverFiles.removeAll());
   const stateSaved = await store.save(core.engine.getApplied());
   const result: CleanupResult = {
     ...routes,
@@ -506,6 +736,20 @@ const runDaemon = async (configPath: string, deps: RunDeps): Promise<number> => 
   // An object, not a `let`: `shutdown` sets it while the startup and the retry hook still run.
   const life = { stopping: false };
   let core: HelperCore | null = null;
+  const wildcardProxy = createWildcardProxyControl({
+    logger: root,
+    getConfig: () => core?.engine.getConfig() ?? config,
+    // Late-bound like the reconcile below: the engine is built with this control.
+    learn: (ruleId, addresses, ttlSec) => core?.engine.learn(ruleId, addresses, ttlSec) ?? Promise.resolve(null),
+    systemServers: deps.systemDnsServers ?? (() => dns.getServers()),
+    requestReconcile: () => {
+      if (!life.stopping) void core?.engine.reconcile('dns-refresh');
+    },
+    setTimer: deps.setTimer ?? realSetTimer,
+    clearTimer: deps.clearTimer ?? realClearTimer,
+    monotonicNow: deps.monotonicNow,
+    sockets: deps.dnsProxySockets,
+  });
   core = createCore(
     config,
     deps,
@@ -524,6 +768,7 @@ const runDaemon = async (configPath: string, deps: RunDeps): Promise<number> => 
         }, DETECTION_RETRY_DELAY_MS * attempt);
         retryTimers.add(timer);
       },
+      wildcardProxy,
     },
   );
   const helper = core;
@@ -555,7 +800,7 @@ const runDaemon = async (configPath: string, deps: RunDeps): Promise<number> => 
     helperVersion: HELPER_VERSION,
     logger: root,
     routeGet: (target, options) => helper.routes.routeGet(target, options),
-    peekDomain: (ruleId) => helper.dns.peek(ruleId),
+    peekDomain: (ruleId) => helper.dns.peek(ruleId) ?? wildcardProxy.peekWildcard(ruleId),
     probeDns: (server, name) =>
       probeDns(server, name, {
         createResolver: deps.createDnsResolver,
@@ -567,12 +812,15 @@ const runDaemon = async (configPath: string, deps: RunDeps): Promise<number> => 
     saveConfig: (next) => writer.save(next),
     started,
     storedConfigProblem: loaded.ok ? null : loaded.code,
-    disableAll: () => cleanupAll(helper, store, root),
+    disableAll: async () => {
+      // Files, then the proxy, then the routes: no name points at a dead listener, no answer teaches a route.
+      return cleanupAll(helper, store, root, { stopProxy: () => wildcardProxy.stop() });
+    },
     uninstall: async () => {
       // No event about the cleanup reaches a client (TASK-002: a cleanup publishes no state).
       stopEvents();
       stopSources();
-      const result = await cleanupAll(helper, store, root, { final: true });
+      const result = await cleanupAll(helper, store, root, { final: true, stopProxy: () => wildcardProxy.close() });
       stopSources();
       logger.info('uninstalled: nothing is applied any more; the helper waits to be stopped', { ...result });
       return result;
@@ -620,6 +868,8 @@ const runDaemon = async (configPath: string, deps: RunDeps): Promise<number> => 
     try {
       await recoverFromState(helper, store, root);
       if (loaded.ok && !life.stopping) await helper.engine.reconcile('startup');
+      // Only now: the leftovers are gone and a pass has detected the interfaces (the servers it forwards to).
+      if (!life.stopping) await wildcardProxy.arm();
     } finally {
       startupDone();
     }
@@ -636,7 +886,8 @@ const runDaemon = async (configPath: string, deps: RunDeps): Promise<number> => 
     await startup;
     // DNS first (no lookup asks for a pass any more), then the monitor, then the timers of the retries.
     stopSources();
-    const result = await cleanupAll(helper, store, root, { final: true });
+    // Resolver files, then the DNS proxy, then the routes (`cleanupAll`).
+    const result = await cleanupAll(helper, store, root, { final: true, stopProxy: () => wildcardProxy.close() });
     // Again: a pass the cleanup waited for may have asked for a retry before `stopping` was seen everywhere.
     stopSources();
     return result.failed > 0 || result.resolverFilesFailed > 0 ? EXIT_CODES.ruleError : EXIT_CODES.ok;

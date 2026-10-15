@@ -128,6 +128,8 @@ export const ru: Messages = {
     'addresses-truncated': 'Слишком много адресов — направлена только часть',
     'overridden-by-rule': 'Часть адресов направлена другим правилом через другой интерфейс',
     'dns-server-excluded': 'Часть адресов — DNS-серверы, они не направляются',
+    'shared-address': 'Часть найденных адресов направлена через другой интерфейс более точным доменным правилом',
+    'dns-proxy-unavailable': 'DNS-прокси для wildcard-доменов не работает',
   },
 
   reconcileReason: {
@@ -138,6 +140,7 @@ export const ru: Messages = {
     'network-change': 'при изменении сети',
     'dns-refresh': 'при обновлении DNS',
     'drift-check': 'при плановой проверке',
+    'dns-learned': 'при разрешении wildcard-домена',
   },
 
   validation: {
@@ -147,6 +150,7 @@ export const ru: Messages = {
     'prefix-too-wide': `Подсеть слишком широкая: префикс должен быть не меньше /${String(MIN_SUBNET_PREFIX)}.`,
     'invalid-domain': 'Домен может состоять только из строчных латинских букв, цифр, «-» и «.», например corp.local.',
     'invalid-wildcard': '«*» допускается только в последних октетах, например 10.*.*.* или 192.168.5.*.',
+    'invalid-wildcard-domain': 'Wildcard-домен — это «*.» и домен минимум из двух частей, например *.corp.local.',
     'invalid-destination': 'Введите IPv4-адрес или подсеть в формате CIDR.',
     'default-route': 'Маршрут по умолчанию (0.0.0.0/0) никогда не изменяется.',
     'this-network': 'Адреса 0.0.0.0/8 не маршрутизируются.',

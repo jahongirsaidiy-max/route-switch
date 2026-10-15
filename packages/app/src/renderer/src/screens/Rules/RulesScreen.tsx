@@ -227,7 +227,7 @@ function Row({
         </span>
         <ReasonLine row={row} i18n={i18n} />
       </span>
-      <span role="cell" className={styles['kind']}>
+      <span role="cell" className={styles['kind']} title={row.limits ?? undefined}>
         {row.kindLabel}
       </span>
       <span role="cell" className={styles['iface']}>

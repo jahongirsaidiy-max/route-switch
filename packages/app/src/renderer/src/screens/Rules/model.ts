@@ -5,7 +5,7 @@ import { findOverlaps, type Config, type EngineState, type IfaceRole, type RuleS
 
 import type { I18n } from '../../../../i18n';
 import { ROLE_TAGS } from '../../components';
-import { isActiveWarning, lastKnownText, ruleReasonText, UZ } from '../../text';
+import { isActiveWarning, isWildcardRule, lastKnownText, learnedCount, ruleReasonText, UZ } from '../../text';
 
 type ConfigRule = Config['rules'][number];
 
@@ -24,8 +24,12 @@ export interface RuleRow {
   readonly id: string;
   readonly enabled: boolean;
   readonly target: string;
-  /** "IP", "Subnet", "Domen", "Domen + DNS" (in the UI language). */
+  /** "IP", "Subnet", "Domen", "Domen + DNS", "Wildcard", "Wildcard + DNS" (in the UI language). */
   readonly kindLabel: string;
+  /** A wildcard domain rule (`*.corp.local`): its routes are learned on lookup (ADR-002). */
+  readonly wildcard: boolean;
+  /** A wildcard rule's limits (browser Secure DNS, IPv6; ADR-002 §6), for the kind cell's tooltip; null otherwise. */
+  readonly limits: string | null;
   readonly iface: IfaceRole;
   /** The role's device now ("en5"), or null when the role has none. */
   readonly device: string | null;
@@ -36,19 +40,33 @@ export interface RuleRow {
   readonly lastKnown: string | null;
 }
 
-export function kindLabel(rule: Pick<ConfigRule, 'kind' | 'dns'>, i18n: I18n = UZ): string {
+export function kindLabel(rule: Pick<ConfigRule, 'kind' | 'dns'> & Partial<Pick<ConfigRule, 'target'>>, i18n: I18n = UZ): string {
   const kinds = i18n.t.rules.kinds;
   if (rule.kind === 'ip') return kinds.ip;
   if (rule.kind === 'subnet') return kinds.subnet;
+  if (rule.target !== undefined && isWildcardRule({ kind: rule.kind, target: rule.target })) {
+    return rule.dns === undefined ? kinds.wildcard : kinds.wildcardDns;
+  }
   return rule.dns === undefined ? kinds.domain : kinds.domainDns;
 }
 
-/** The note; without one, a domain rule's DNS server or its address count and refresh interval. */
-export function rowDetail(rule: ConfigRule, state: RuleState | null, i18n: I18n = UZ): string {
+/**
+ * The note; without one, a domain rule's DNS server or its address count and
+ * refresh interval. A wildcard rule is not refreshed: it says how many
+ * addresses it learned ("3 ta o'rganilgan IP · 2 daq oldin"), after its DNS
+ * server when it has one; `now` dates the last answer (left out without it).
+ */
+export function rowDetail(rule: ConfigRule, state: RuleState | null, i18n: I18n = UZ, now?: number): string {
   const note = rule.note?.trim() ?? '';
   if (note !== '') return note;
   if (rule.kind !== 'domain') return '';
   const words = i18n.t.rules;
+  if (isWildcardRule(rule)) {
+    const parts = rule.dns === undefined ? [] : [words.detailDns(rule.dns)];
+    parts.push(words.detailLearned(learnedCount(rule, state) ?? 0));
+    if (now !== undefined && state !== null && state.lastResolvedAt !== null) parts.push(i18n.formatAgo(state.lastResolvedAt, now));
+    return parts.join(' · ');
+  }
   if (rule.dns !== undefined) return words.detailDns(rule.dns);
   const every = words.detailEvery(Math.round(rule.refreshSec / 60));
   const count = state?.appliedDestinations.length ?? 0;
@@ -72,9 +90,11 @@ export function ruleRows(config: Config, state: EngineState, now: number, i18n: 
       enabled: rule.enabled,
       target: rule.target,
       kindLabel: kindLabel(rule, i18n),
+      wildcard: isWildcardRule(rule),
+      limits: isWildcardRule(rule) ? i18n.t.addRule.wildcardLimits : null,
       iface: rule.iface,
       device: state.interfaces[rule.iface].device,
-      detail: rowDetail(rule, ruleState, i18n),
+      detail: rowDetail(rule, ruleState, i18n, now),
       status: rowStatus(ruleState, i18n),
       lastKnown: ruleState === null || !rule.enabled ? null : lastKnownText(rule, ruleState, now, undefined, i18n),
     };

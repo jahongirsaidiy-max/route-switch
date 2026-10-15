@@ -22,6 +22,7 @@ export const menuBarRu: Shape<typeof menuBarUz> = {
   warning: (text) => `Предупреждение: ${text}`,
   dnsServer: (server) => `DNS: ${server}`,
   resolved: (count, ago) => `${String(count)} IP · ${ago}`,
+  learned: (count, ago) => `${n(count, 'найденный IP', 'найденных IP', 'найденных IP')}${ago === '' ? '' : ` · ${ago}`}`,
   routingOff: 'Маршрутизация выключена — правила не применяются',
   notAppliedYet: 'Правила ещё не применялись',
   lastApply: (time) => `Последнее применение: ${time}`,

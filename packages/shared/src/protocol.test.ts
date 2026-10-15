@@ -20,6 +20,7 @@ import {
   Event,
   HelperVersionInfo,
   InterfaceState,
+  LEARNED_ROUTE_LIMITS,
   PROTOCOL_LIMITS,
   PROTOCOL_VERSION,
   RECONCILE_REASONS,
@@ -41,6 +42,7 @@ import {
   parseRequest,
   parseResult,
   parseServerMessage,
+  type DiagnosePrecedence,
   type ErrorCode,
   type OkResponseOf,
   type ParamsInputOf,
@@ -48,8 +50,9 @@ import {
   type RequestMethod,
   type RequestOf,
   type ResultOf,
+  type RuleReasonCode,
 } from './protocol';
-import { LIMITS, type Config, type ConfigInput } from './schema';
+import { LIMITS, type ClaimPrecedence, type Config, type ConfigInput, type lostClaimCode } from './schema';
 
 const uuid = (n: number): string => `00000000-0000-4000-8000-${n.toString(16).padStart(12, '0')}`;
 const AT = '2026-10-12T08:30:00.000Z';
@@ -201,7 +204,7 @@ describe('constants', () => {
   });
 
   it('pins the protocol version and the closed enumerations', () => {
-    expect(PROTOCOL_VERSION).toBe(3);
+    expect(PROTOCOL_VERSION).toBe(4);
     expect(RULE_STATUSES).toEqual(['active', 'pending', 'error', 'disabled']);
     expect(EVENT_LOG_LEVELS).toEqual(['info', 'warn', 'error']);
     expect(ERROR_CODES).toEqual([
@@ -225,6 +228,7 @@ describe('constants', () => {
       'network-change',
       'dns-refresh',
       'drift-check',
+      'dns-learned',
     ]);
     expect(RULE_REASON_CODES).toEqual([
       'rule-disabled',
@@ -243,6 +247,8 @@ describe('constants', () => {
       'addresses-truncated',
       'overridden-by-rule',
       'dns-server-excluded',
+      'shared-address',
+      'dns-proxy-unavailable',
     ]);
     expect(DNS_WARNING_CODES).toEqual(['other-interface-subnet', 'routed-via-other-interface']);
     expect(DNS_WARNING_SOURCES).toEqual(['interface', 'rule']);
@@ -277,7 +283,9 @@ describe('constants', () => {
     expect(PROTOCOL_LIMITS.maxDnsWarnings).toBe(16);
     expect(PROTOCOL_LIMITS.maxDiagnoseAddresses).toBe(LIMITS.maxIpsPerDomain);
     expect(STRUCTURE_LIMITS).toEqual({ maxNodes: 65_536, maxArrayLength: 500, maxDepth: 12, maxStringLength: 4096 });
-    expect(PROTOCOL_LIMITS.maxAppliedDestinationsPerRule).toBe(LIMITS.maxIpsPerDomain + 1);
+    expect(PROTOCOL_LIMITS.maxAppliedDestinationsPerRule).toBe(LEARNED_ROUTE_LIMITS.perRule + 1);
+    expect(LEARNED_ROUTE_LIMITS).toEqual({ perRule: 256, total: 4096, minTtlSec: 900, maxTtlSec: 86_400 });
+    expect(LEARNED_ROUTE_LIMITS.perRule).toBeGreaterThan(LIMITS.maxIpsPerDomain);
   });
 
   it('keeps the codec error codes inside the protocol error codes', () => {
@@ -351,6 +359,14 @@ describe('Request', () => {
     expect(message({ id: 1, method: 'test', target: '127.0.0.1' })).toBe('target: is invalid (loopback)');
     expect(message({ id: 1, method: 'diagnose', target: '127.0.0.1' })).toBe('target: is invalid (loopback)');
     expect(message({ id: 1, method: 'diagnose', target: '*.corp.local' })).toBe('target: is invalid (invalid-domain)');
+    const wildcardRule = (target: string) => ({ id: uuid(1), kind: 'domain', target, iface: 'ethernet' });
+    expect(message({ id: 1, method: 'setConfig', config: { version: 1, rules: [wildcardRule('*.corp.local')] } })).toBe('accepted');
+    for (const target of ['*.com', '*.*.corp.local', 'a.*.corp.local', '*', '*.Corp.local']) {
+      expect(message({ id: 1, method: 'setConfig', config: { version: 1, rules: [wildcardRule(target)] } })).toBe(
+        'config.rules.0.target: is invalid (invalid-wildcard-domain)',
+      );
+    }
+    expect(message({ id: 1, method: 'diagnose', target: '*.com' })).toBe('target: is invalid (invalid-domain)');
     expect(message({ id: 1, method: 'setConfig', config: { version: 1, rules: [], ifaceOverrides: { vpn: 'en5' } } })).toBe(
       'config.ifaceOverrides: has an unknown key',
     );
@@ -808,7 +824,7 @@ describe('RuleState', () => {
       {
         appliedDestinations: Array.from(
           { length: PROTOCOL_LIMITS.maxAppliedDestinationsPerRule + 1 },
-          (_unused, index) => `10.0.0.${String(index + 1)}`,
+          (_unused, index) => `10.0.${String(Math.floor(index / 200))}.${String((index % 200) + 1)}`,
         ),
       },
     ],
@@ -820,7 +836,7 @@ describe('RuleState', () => {
   it('accepts the maximum number of applied destinations', () => {
     const appliedDestinations = Array.from(
       { length: PROTOCOL_LIMITS.maxAppliedDestinationsPerRule },
-      (_unused, index) => `10.0.0.${String(index + 1)}`,
+      (_unused, index) => `10.0.${String(Math.floor(index / 200))}.${String((index % 200) + 1)}`,
     );
     expect(RuleState.safeParse(ruleStateInput({ appliedDestinations })).success).toBe(true);
   });
@@ -1137,6 +1153,18 @@ describe('message sizes', () => {
     })),
   });
 
+  /**
+   * Destinations listed for rule `index` of the largest state: every rule
+   * lists a domain's worth, the first ones the most a rule can, until all
+   * rules together list `PROTOCOL_LIMITS.maxAppliedDestinations`.
+   */
+  const destinationsOf = (index: number): number => {
+    const base = LIMITS.maxIpsPerDomain + 1;
+    const extra = PROTOCOL_LIMITS.maxAppliedDestinationsPerRule - base;
+    const spare = PROTOCOL_LIMITS.maxAppliedDestinations - LIMITS.maxRules * base;
+    return base + Math.max(0, Math.min(extra, spare - index * extra));
+  };
+
   const largestState = (): Record<string, unknown> => ({
     helperVersion: `1.2.3-${'a'.repeat(PROTOCOL_LIMITS.helperVersionMaxLength - 6)}`,
     seq: Number.MAX_SAFE_INTEGER,
@@ -1157,8 +1185,8 @@ describe('message sizes', () => {
       reasonCode: 'forbidden-destination',
       reason: escaped(PROTOCOL_LIMITS.reasonMaxLength),
       appliedDestinations: Array.from(
-        { length: PROTOCOL_LIMITS.maxAppliedDestinationsPerRule },
-        (_inner, octet) => `255.255.255.${String(100 + octet)}/32`,
+        { length: destinationsOf(index) },
+        (_inner, octet) => `255.255.${String(200 + Math.floor(octet / 100))}.${String(100 + (octet % 100))}/32`,
       ),
       lastResolvedAt: AT,
     })),
@@ -1224,12 +1252,25 @@ describe('message sizes', () => {
   });
 
   it('fits the largest possible state event in one line', () => {
-    const state = EngineState.safeParse(largestState());
+    const largest = largestState();
+    const rules = largest['rules'] as { appliedDestinations: string[] }[];
+    expect(rules.reduce((sum, rule) => sum + rule.appliedDestinations.length, 0)).toBe(PROTOCOL_LIMITS.maxAppliedDestinations);
+    expect(rules[0]?.appliedDestinations).toHaveLength(PROTOCOL_LIMITS.maxAppliedDestinationsPerRule);
+    const state = EngineState.safeParse(largest);
     if (!state.success) throw new Error(state.error.message);
 
     const bytes = new TextEncoder().encode(encodeJsonLine({ event: 'state', state: state.data })).length;
     expect(bytes).toBeGreaterThan(1_000_000);
     expect(bytes).toBeLessThan(MAX_LINE_BYTES / 2);
+  });
+
+  it('refuses a state whose rules list more applied destinations than all routes the helper can hold', () => {
+    const largest = largestState();
+    const rules = largest['rules'] as { appliedDestinations: string[] }[];
+    rules.at(-1)?.appliedDestinations.push('10.9.9.9');
+    const result = EngineState.safeParse(largest);
+    expect(result.success).toBe(false);
+    expect(result.error?.issues.map((issue) => issue.path)).toEqual([['rules']]);
   });
 });
 
@@ -1471,5 +1512,18 @@ describe('hostile messages at the size of the line limit', () => {
     }
     const result = parseResult('test', testResultInput({ device: hostile, [hostile]: hostile }));
     expect(result.ok ? 'accepted' : result.error.message).toBe('device: has an invalid format');
+  });
+});
+
+describe('claim helpers (schema.ts) speak the protocol\'s words', () => {
+  it('returns only diagnose precedence codes and rule reason codes', () => {
+    expectTypeOf<ClaimPrecedence>().toExtend<DiagnosePrecedence>();
+    expectTypeOf<ReturnType<typeof lostClaimCode>>().toExtend<RuleReasonCode>();
+    for (const code of ['host-route', 'exact-domain', 'deeper-wildcard', 'config-order'] satisfies ClaimPrecedence[]) {
+      expect(DIAGNOSE_PRECEDENCE_CODES).toContain(code);
+    }
+    for (const code of ['overridden-by-rule', 'shared-address'] satisfies ReturnType<typeof lostClaimCode>[]) {
+      expect(RULE_REASON_CODES).toContain(code);
+    }
   });
 });

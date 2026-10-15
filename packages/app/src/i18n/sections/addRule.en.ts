@@ -19,10 +19,12 @@ export const addRuleEn: Shape<typeof addRuleUz> = {
   targetField: {
     ip: { label: 'IP address', hint: 'Adds a route for a single host. A wildcard works too: 10.*.*.* → 10.0.0.0/8 (subnet).' },
     subnet: { label: 'Subnet (CIDR)', hint: 'The most reliable choice for a whole internal network. A wildcard works too: 10.*.*.* → 10.0.0.0/8.' },
-    domain: { label: 'Domain', hint: 'The domain is resolved to IPs, and a route is added for each IP.' },
+    domain: { label: 'Domain', hint: 'The domain is resolved to IPs, and a route is added for each IP. For subdomains: *.corp.local.' },
   },
   normalised: (target) => `Will be saved as ${target}.`,
   wildcardResult: (cidr) => `→ ${cidr} (subnet)`,
+  wildcardHint: (base) => `Subdomains only (e.g. app.${base}) — add a separate rule for ${base} itself.`,
+  wildcardLimits: 'A browser with “Secure DNS” (DNS over HTTPS) turned on bypasses this rule. No routes are added for IPv6 addresses.',
   sameAs: (target) => `This address is already in the rule “${target}” (same interface) — a second rule is redundant.`,
   useDns: 'Resolve through an internal DNS server',
   dnsAddress: 'DNS server address',
@@ -35,7 +37,6 @@ export const addRuleEn: Shape<typeof addRuleUz> = {
   notePlaceholder: 'For example: accounting system',
 
   errors: {
-    wildcardDomain: 'Wildcard domains (*.corp.local) are not supported — enter an exact domain, e.g. corp.local.',
     upperCase: 'Write the domain in lower case, e.g. corp.local.',
     refresh: `Enter a whole number of seconds from ${String(LIMITS.refreshSecMin)} to ${String(LIMITS.refreshSecMax)}.`,
     note: `The note can be at most ${String(LIMITS.noteMaxLength)} characters.`,
@@ -55,6 +56,8 @@ export const addRuleEn: Shape<typeof addRuleUz> = {
   previewDown: (role) => `${role} is not connected — ${waiting}`,
   previewEachIp: 'For each resolved IP.',
   previewEachIpDns: 'For each resolved IP; for the DNS server — unless it is on its own network.',
+  previewWildcard: 'No routes in advance: when a subdomain is looked up, a route is added for each IP of the answer.',
+  previewWildcardDns: 'Subdomain routes are added on lookup; the DNS server’s route right away.',
 
   test: 'Test',
   testOff: (reason) => `Test — ${reason}`,

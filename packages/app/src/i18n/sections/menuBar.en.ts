@@ -21,6 +21,7 @@ export const menuBarEn: Shape<typeof menuBarUz> = {
   warning: (text) => `Warning: ${text}`,
   dnsServer: (server) => `DNS: ${server}`,
   resolved: (count, ago) => `${n(count, 'IP', 'IPs')} · ${ago}`,
+  learned: (count, ago) => `${String(count)} learned ${plural('en', count, { one: 'IP', other: 'IPs' })}${ago === '' ? '' : ` · ${ago}`}`,
   routingOff: 'Routing is off — no rules are applied',
   notAppliedYet: 'Not applied yet',
   lastApply: (time) => `Last applied: ${time}`,

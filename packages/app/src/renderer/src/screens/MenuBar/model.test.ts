@@ -246,3 +246,23 @@ describe('in Russian and English (TASK-DELTA-12)', () => {
     expect(rows.find((row) => row.id === ID.domain)?.detail).toBe('3 IPs · 2 min ago');
   });
 });
+
+describe('ruleDetail — a wildcard domain rule (TASK-DELTA-29)', () => {
+  const WILD = '99999999-9999-4999-8999-999999999999';
+  const wildcard = { id: WILD, kind: 'domain', target: '*.corp.local', iface: 'ethernet', enabled: true, refreshSec: 600, dns: '10.20.0.10' } as const;
+
+  it('how many addresses it learned, less its DNS server, and when the last answer came', () => {
+    const state = ruleState(WILD, { appliedDestinations: ['10.20.0.10', '10.20.1.5'], lastResolvedAt: new Date(NOW - 120_000).toISOString() });
+    expect(ruleDetail(wildcard, state, NOW)).toBe("1 ta o'rganilgan IP · 2 daq oldin");
+    expect(ruleDetail(wildcard, ruleState(WILD), NOW)).toBe("0 ta o'rganilgan IP");
+    expect(ruleDetail(wildcard, ruleState(WILD), NOW, i18nFor('en'))).toBe('0 learned IPs');
+    expect(ruleDetail(wildcard, ruleState(WILD, { appliedDestinations: ['10.20.1.5', '10.20.1.6'] }), NOW, i18nFor('ru'))).toBe('2 найденных IP');
+  });
+
+  it('without a state yet, its DNS server; in error, its last known addresses', () => {
+    expect(ruleDetail(wildcard, null, NOW)).toBe('DNS: 10.20.0.10');
+    const failing = ruleState(WILD, { status: 'error', reasonCode: 'dns-proxy-unavailable', reason: 'x', appliedDestinations: ['10.20.1.5'] });
+    expect(ruleDetail(wildcard, failing, NOW)).toBe('10.20.1.5');
+    expect(ruleNotice(failing, wildcard, NOW)?.text).toContain(RULE_REASON_TEXT['dns-proxy-unavailable']);
+  });
+});

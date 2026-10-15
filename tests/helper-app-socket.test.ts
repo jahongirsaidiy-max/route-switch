@@ -134,7 +134,7 @@ describe('app helper client <-> helper daemon over a real socket', () => {
       { timeout: 2000 },
     );
     await connected(h.client);
-    expect(h.client.snapshot()).toMatchObject({ status: { kind: 'connected', helperVersion: '0.2.0' }, config: { rules: [] }, configRevision: 0 });
+    expect(h.client.snapshot()).toMatchObject({ status: { kind: 'connected', helperVersion: '0.3.0' }, config: { rules: [] }, configRevision: 0 });
 
     const states: number[] = [];
     h.client.onState((state) => states.push(state.seq));

@@ -4,11 +4,13 @@ import {
   MAX_DOMAIN_LENGTH,
   cidrContains,
   isIpWildcard,
-  normalizeDomain,
+  normalizeDomainTarget,
   normalizeHostAddress,
+  normalizeQueryName,
   normalizeSubnet,
   parseIpWildcard,
   parseIpv4Destination,
+  wildcardBase,
   type Normalised,
 } from './cidr';
 
@@ -33,7 +35,7 @@ export type RuleKind = z.infer<typeof RuleKind>;
 const TARGET_NORMALISERS: Record<RuleKind, (input: string) => Normalised> = {
   ip: normalizeHostAddress,
   subnet: normalizeSubnet,
-  domain: normalizeDomain,
+  domain: normalizeDomainTarget,
 };
 
 /** A rule target after normalisation, with the kind it is stored as. */
@@ -47,8 +49,9 @@ export interface NormalisedTarget {
  * `10.0.0.0/8`). An `ip` or `subnet` input with a `*` is an IPv4 wildcard:
  * it becomes the `subnet` rule it stands for (`10.*.*.*` → `subnet`
  * `10.0.0.0/8`) and then passes the same checks as any subnet (forbidden
- * ranges, minimum prefix). A stored target therefore never holds a `*`. A
- * domain with a `*` is refused as before.
+ * ranges, minimum prefix). A stored `ip` / `subnet` target therefore never
+ * holds a `*`. A domain with a `*` must be a wildcard domain (`*.corp.local`,
+ * subdomains only, ADR-002); it is stored as typed.
  */
 export const normalizeRuleTarget = (kind: RuleKind, target: string): Normalised<NormalisedTarget> => {
   const wildcard = kind !== 'domain' && isIpWildcard(target);
@@ -86,7 +89,7 @@ export const Rule = z
     id: z.uuid(),
     enabled: z.boolean().default(true),
     kind: RuleKind,
-    // '172.16.12.40' | '10.0.0.0/8' | 'corp.local'
+    // '172.16.12.40' | '10.0.0.0/8' | 'corp.local' | '*.corp.local'
     target: z.string().min(1).max(LIMITS.targetMaxLength),
     iface: IfaceRole,
     // Only used by domain rules: written to /etc/resolver/<domain>.
@@ -140,6 +143,112 @@ export const destinationKey = (rule: Pick<Rule, 'kind' | 'target'>): string | nu
   const cidr = routedCidrOf(rule.target);
   return cidr === null ? null : `net:${cidr}`;
 };
+
+/** How a domain rule covers a name: its exact target, or as a wildcard over the subdomains of its base. */
+export type DomainMatchVia = 'domain' | 'wildcard';
+
+export interface DomainMatch<T> {
+  readonly rule: T;
+  /** Index of `rule` in the `rules` array. */
+  readonly index: number;
+  readonly via: DomainMatchVia;
+}
+
+type MatchableRule = Pick<Rule, 'kind' | 'target' | 'enabled'>;
+
+const labelCount = (domain: string): number => domain.split('.').length;
+
+/**
+ * The enabled domain rule that owns a name (ADR-002 §3): an exact domain rule
+ * for the name itself wins; otherwise the wildcard whose base is the deepest
+ * strict suffix of the name (`*.a.example.com` beats `*.example.com`); equal
+ * rank goes to the earlier rule. `*.B` never matches `B` itself. The name is
+ * folded first (`normalizeQueryName`: case, one trailing dot); a name that is
+ * not a valid domain matches nothing. Pure: the helper's DNS proxy, its
+ * engine and `diagnose` all decide with this one function.
+ */
+export const matchDomainRule = <T extends MatchableRule>(name: string, rules: readonly T[]): DomainMatch<T> | null => {
+  const folded = normalizeQueryName(name);
+  if (folded === null) return null;
+
+  let best: { rule: T; index: number; depth: number } | null = null;
+  for (const [index, rule] of rules.entries()) {
+    if (!rule.enabled || rule.kind !== 'domain') continue;
+    if (rule.target === folded) return { rule, index, via: 'domain' };
+    const base = wildcardBase(rule.target);
+    if (base === null || !folded.endsWith(`.${base}`)) continue;
+    const depth = labelCount(base);
+    if (best === null || depth > best.depth) best = { rule, index, depth };
+  }
+  return best === null ? null : { rule: best.rule, index: best.index, via: 'wildcard' };
+};
+
+/** The labels of a wildcard rule's base (`*.a.example.com` → 3), the depth `compareClaim` ranks wildcards by; 0 for any other target. */
+export const wildcardDepth = (target: string): number => {
+  const base = wildcardBase(target);
+  return base === null ? 0 : labelCount(base);
+};
+
+/**
+ * Why a rule wants one routed address, from strongest to weakest:
+ * - `explicit`     — the target of an `ip` / `/32` `subnet` rule, or the `dns`
+ *                    server of a domain rule (its host route);
+ * - `exact-domain` — an address an exact domain rule resolved to;
+ * - `wildcard`     — an address learned for a wildcard domain rule.
+ * A wider `subnet` is no claim on an address: the kernel's longest prefix
+ * already prefers any host route inside it.
+ */
+export type ClaimKind = 'explicit' | 'exact-domain' | 'wildcard';
+
+export interface AddressClaim {
+  readonly kind: ClaimKind;
+  /** For `wildcard`: the labels of the rule's base (`wildcardDepth`), deeper wins. Ignored otherwise. */
+  readonly depth: number;
+  /** Tie-break between equal claims: the rule's position, lower wins (config order). */
+  readonly order: number;
+}
+
+const CLAIM_RANK: Readonly<Record<ClaimKind, number>> = { explicit: 0, 'exact-domain': 1, wildcard: 2 };
+
+/** The claim a rule makes on an address it wants: see `ClaimKind`. `isExplicit` says the address is the rule's own target or `dns` server. */
+export const claimOf = (rule: Pick<Rule, 'kind' | 'target'>, isExplicit: boolean, order: number): AddressClaim => {
+  if (rule.kind !== 'domain' || isExplicit) return { kind: 'explicit', depth: 0, order };
+  const depth = wildcardDepth(rule.target);
+  return depth === 0 ? { kind: 'exact-domain', depth, order } : { kind: 'wildcard', depth, order };
+};
+
+/**
+ * Orders two claims on the same address (ADR-002 §3): negative when `a`
+ * wins, positive when `b` wins, 0 only for the same rank and order. Rank:
+ * `explicit` > `exact-domain` > deeper `wildcard` > shallower `wildcard` >
+ * config order (earlier wins). Usable as an `Array.sort` comparator (winner
+ * first). Two exact domain rules are ranked by order too; what the engine does
+ * with the loser of that pair (`route-failed`, TASK-DELTA-07) is its own rule.
+ */
+export const compareClaim = (a: AddressClaim, b: AddressClaim): number => {
+  const rank = CLAIM_RANK[a.kind] - CLAIM_RANK[b.kind];
+  if (rank !== 0) return rank;
+  if (a.kind === 'wildcard' && a.depth !== b.depth) return b.depth - a.depth;
+  return a.order - b.order;
+};
+
+/** Which rule of `compareClaim` decided between a winner and a loser: the wording `diagnose` reports. */
+export type ClaimPrecedence = 'host-route' | 'exact-domain' | 'deeper-wildcard' | 'config-order';
+
+/** Why `winner` beats `loser` (call it with `compareClaim(winner, loser) <= 0`). */
+export const claimPrecedence = (winner: AddressClaim, loser: AddressClaim): ClaimPrecedence => {
+  if (winner.kind !== loser.kind) return winner.kind === 'explicit' ? 'host-route' : 'exact-domain';
+  if (winner.kind === 'wildcard' && winner.depth !== loser.depth) return 'deeper-wildcard';
+  return 'config-order';
+};
+
+/**
+ * The warning a wildcard rule carries for an address another rule won:
+ * `overridden-by-rule` against an explicit target or DNS server
+ * (TASK-DELTA-07's meaning), `shared-address` against another name rule.
+ */
+export const lostClaimCode = (winner: AddressClaim): 'overridden-by-rule' | 'shared-address' =>
+  winner.kind === 'explicit' ? 'overridden-by-rule' : 'shared-address';
 
 export interface IfaceConflict {
   /** Index of the earlier rule in the `rules` array. */

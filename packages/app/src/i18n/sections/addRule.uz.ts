@@ -14,11 +14,17 @@ export const addRuleUz = {
   targetField: {
     ip: { label: 'IP manzil', hint: "Bitta host uchun route qo'shiladi. Wildcard ham bo'ladi: 10.*.*.* → 10.0.0.0/8 (subnet)." },
     subnet: { label: 'Subnet (CIDR)', hint: "Butun ichki tarmoq uchun eng ishonchli variant. Wildcard ham bo'ladi: 10.*.*.* → 10.0.0.0/8." },
-    domain: { label: 'Domen', hint: "Domen IP'ga resolve qilinib, har bir IP uchun route qo'shiladi." },
+    domain: { label: 'Domen', hint: "Domen IP'ga resolve qilinib, har bir IP uchun route qo'shiladi. Subdomenlar uchun: *.corp.local." },
   } satisfies Readonly<Record<RuleKind, { readonly label: string; readonly hint: string }>>,
   normalised: (target: string): string => `${target} sifatida saqlanadi.`,
   /** An IP wildcard (`10.*.*.*`) and the subnet it is saved as (the shared normaliser's CIDR). */
   wildcardResult: (cidr: string): string => `→ ${cidr} (subnet)`,
+  /** A wildcard domain (`*.corp.local`, ADR-002): `base` is the part after `*.`. */
+  wildcardHint: (base: string): string =>
+    `Faqat subdomenlar (masalan app.${base}) — ${base} ning o'zi uchun alohida qoida qo'shing.`,
+  /** What a wildcard rule cannot do (ADR-002 §6). */
+  wildcardLimits:
+    "Brauzerda «Secure DNS» (DNS over HTTPS) yoqilgan bo'lsa, u bu qoidani chetlab o'tadi. IPv6 manzillarga route qo'yilmaydi.",
   sameAs: (target: string): string => `Bu manzil «${target}» qoidasida ham bor (shu interfeys) — ikkinchi qoida ortiqcha.`,
   useDns: 'Ichki DNS server orqali resolve qilish',
   dnsAddress: 'DNS server manzili',
@@ -33,7 +39,6 @@ export const addRuleUz = {
 
   /** Field errors besides the shared validators' codes (`validation`). */
   errors: {
-    wildcardDomain: "Wildcard domen (*.corp.local) qo'llab-quvvatlanmaydi — aniq domen kiriting, masalan corp.local.",
     upperCase: 'Domenni kichik harflarda yozing, masalan corp.local.',
     refresh: `${String(LIMITS.refreshSecMin)} dan ${String(LIMITS.refreshSecMax)} gacha butun son (soniya) kiriting.`,
     note: `Izoh ${String(LIMITS.noteMaxLength)} belgidan oshmasin.`,
@@ -54,6 +59,9 @@ export const addRuleUz = {
   previewDown: (role: string): string => `${role} ulanmagan — qoida «Kutilmoqda» bo'ladi va ulanganda qo'llanadi.`,
   previewEachIp: 'Har bir resolve qilingan IP uchun.',
   previewEachIpDns: "Har bir resolve qilingan IP uchun; DNS server — o'z tarmog'ida bo'lmasa.",
+  /** A wildcard domain: no route before a name is asked for. */
+  previewWildcard: "Route'lar oldindan qo'yilmaydi: subdomen so'ralganda javobdagi har IP uchun qo'yiladi.",
+  previewWildcardDns: "Subdomenlar route'i so'rov bo'yicha qo'yiladi; DNS server route'i — darhol.",
 
   /** "Sinab ko'rish". */
   test: "Sinab ko'rish",

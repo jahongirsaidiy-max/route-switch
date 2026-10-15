@@ -1,4 +1,12 @@
-import { Config, EngineState, RECONCILE_REASONS, parseIpv4Destination, type ReconcileReason, type Rule } from '@routeswitch/shared';
+import {
+  Config,
+  EngineState,
+  LEARNED_ROUTE_LIMITS,
+  RECONCILE_REASONS,
+  parseIpv4Destination,
+  type ReconcileReason,
+  type Rule,
+} from '@routeswitch/shared';
 import { describe, expect, it, vi } from 'vitest';
 
 import {
@@ -9,10 +17,13 @@ import {
   FAILURE_BACKOFF_AFTER,
   FAILURE_BACKOFF_BASE_MS,
   FAILURE_BACKOFF_MAX_MS,
+  LEARN_WAIT_MAX_MS,
+  MAX_APPLIED_ROUTES,
   MAX_EXCLUDED_DNS_PER_ROLE,
   MAX_EXCLUDED_DNS_SERVERS,
   MAX_EXCLUDED_OTHER_DNS,
   REFUSAL_RETRY_REASONS,
+  STATE_ANNOUNCE_MIN_INTERVAL_MS,
   buildEngineState,
   createEngine,
   findConnectedConflict,
@@ -1273,7 +1284,8 @@ describe('reconcile: a rule refused because a connected route is in the way is n
 
   it('names exactly the event reasons; the periodic ones are the rest', () => {
     expect([...REFUSAL_RETRY_REASONS].sort()).toEqual(['config-change', 'enabled-change', 'manual', 'network-change', 'startup']);
-    expect(PERIODIC).toEqual(['dns-refresh', 'drift-check']);
+    // `dns-learned` (ADR-002) fires on DNS traffic: frequent, so it must not retry refused adds either.
+    expect(PERIODIC).toEqual(['dns-refresh', 'drift-check', 'dns-learned']);
   });
 
   it.each(PERIODIC)('runs no command on a %s pass and keeps showing the rule as connected-network', async (reason) => {
@@ -4461,20 +4473,20 @@ describe('isReconciling and getRetryNeeds', () => {
     const LAN = rule(1, 'subnet', '10.20.4.0/24', 'ethernet');
     const netinfo = createFakeNetInfo(network({ degraded: true }), network({ ethernet: iface('ethernet', { subnet: null, netmask: null }) }));
     const h = setup(config([LAN, HOST_B]), { netinfo });
-    expect(h.engine.getRetryNeeds()).toEqual({ deferred: 0, refused: 0, failing: 0 });
+    expect(h.engine.getRetryNeeds()).toEqual({ deferred: 0, refused: 0, failing: 0, learnedExpired: 0 });
 
     await h.run('startup');
     // The LAN rule is the ethernet's own subnet, which the guard keeps out; only HOST_B waits.
-    expect(h.engine.getRetryNeeds()).toEqual({ deferred: 1, refused: 0, failing: 0 });
+    expect(h.engine.getRetryNeeds()).toEqual({ deferred: 1, refused: 0, failing: 0, learnedExpired: 0 });
 
     h.routes.onAdd = (request) =>
       request.dst === '10.20.4.0/24' ? inspectFailed('connected-route', 'connected route in the way') : addFailed('add');
     await h.run('startup');
-    expect(h.engine.getRetryNeeds()).toEqual({ deferred: 0, refused: 1, failing: 1 });
+    expect(h.engine.getRetryNeeds()).toEqual({ deferred: 0, refused: 1, failing: 1, learnedExpired: 0 });
 
     h.routes.onAdd = (request) => added(request);
     await h.run('network-change');
-    expect(h.engine.getRetryNeeds()).toEqual({ deferred: 0, refused: 0, failing: 0 });
+    expect(h.engine.getRetryNeeds()).toEqual({ deferred: 0, refused: 0, failing: 0, learnedExpired: 0 });
   });
 });
 
@@ -4736,6 +4748,32 @@ describe('clear', () => {
       dst: '172.16.12.40',
     });
     expect(engineLogs(h.entries, 'error', 'route delete failed during cleanup; the route stays applied')).toHaveLength(1);
+  });
+
+  it('beforeRoutes (DELTA-31) runs before the first delete; when it rejects, that is logged and the routes go anyway', async () => {
+    const h = setup(config([HOST, NET]));
+    await h.run('startup');
+    h.take();
+    const order: string[] = [];
+    h.routes.onDelete = (request) => {
+      order.push(`delete ${request.dst}`);
+      return deleted(request);
+    };
+    expect(
+      await h.engine.clear({
+        beforeRoutes: () => {
+          order.push('before');
+          return Promise.resolve();
+        },
+      }),
+    ).toEqual({ removed: 2, forgotten: 0, failed: 0 });
+    expect(order[0]).toBe('before');
+    expect(order).toHaveLength(3);
+
+    await h.run('manual');
+    h.take();
+    expect(await h.engine.clear({ beforeRoutes: () => Promise.reject(new Error('boom')) })).toEqual({ removed: 2, forgotten: 0, failed: 0 });
+    expect(engineLogs(h.entries, 'error', 'the step before clearing the routes failed')).toHaveLength(1);
   });
 
   it('removes routes restored from state.json; one now through another gateway is forgotten, not deleted', async () => {
@@ -5196,5 +5234,1154 @@ describe('buildEngineState — dnsWarnings', () => {
     expect(state.dnsWarnings).toEqual([WARNING]);
     expect(state.dnsWarnings?.[0]).not.toBe(WARNING);
     expect(EngineState.safeParse(state).success).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Wildcard domain rules: learned routes (TASK-DELTA-27, ADR-002 §3, §4)
+// ---------------------------------------------------------------------------
+
+interface FakeTimers {
+  readonly set: NonNullable<EngineDeps['setTimer']>;
+  readonly clear: NonNullable<EngineDeps['clearTimer']>;
+  /** Delays of the timers that are pending, in the order they were set. */
+  pending(): number[];
+  /** Fires every pending timer. */
+  fireAll(): void;
+}
+
+const createFakeTimers = (): FakeTimers => {
+  const timers = new Map<number, { callback: () => void; delayMs: number }>();
+  let next = 0;
+  return {
+    set: (callback, delayMs) => {
+      next += 1;
+      timers.set(next, { callback, delayMs });
+      return next;
+    },
+    clear: (handle) => {
+      timers.delete(handle as number);
+    },
+    pending: () => [...timers.values()].map((timer) => timer.delayMs),
+    fireAll: () => {
+      const due = [...timers.values()];
+      timers.clear();
+      for (const timer of due) timer.callback();
+    },
+  };
+};
+
+const WILD = rule(40, 'domain', '*.corp.local', 'ethernet');
+const DEEP_WIFI = rule(42, 'domain', '*.a.corp.local', 'wifi');
+const OTHER_WILD_WIFI = rule(43, 'domain', '*.other.local', 'wifi');
+const L1 = '172.16.20.1';
+const L2 = '172.16.20.2';
+const L3 = '172.16.20.3';
+
+interface LearningHarness extends Harness {
+  readonly timers: FakeTimers;
+  readonly resolved: Rule[];
+  /** Moves the wall clock and the monotonic clock forward. */
+  advance(seconds: number): void;
+  learn(n: number, addresses: readonly string[], ttlSec?: number): Promise<Awaited<ReturnType<Engine['learn']>>>;
+}
+
+const learning = (
+  rules: readonly Rule[],
+  options: { netinfo?: FakeNetInfo; deps?: Partial<EngineDeps>; extra?: Partial<Config> } = {},
+): LearningHarness => {
+  let wallMs = NOW.getTime();
+  let monoMs = 0;
+  const timers = createFakeTimers();
+  const resolved: Rule[] = [];
+  const h = setup(config(rules, options.extra), {
+    ...(options.netinfo === undefined ? {} : { netinfo: options.netinfo }),
+    deps: {
+      now: () => new Date(wallMs),
+      monotonicNow: () => monoMs,
+      setTimer: timers.set,
+      clearTimer: timers.clear,
+      resolveDomain: (resolvedRule) => {
+        resolved.push(resolvedRule);
+        return domainAnswer(['172.16.12.40']);
+      },
+      ...options.deps,
+    },
+  });
+  return {
+    ...h,
+    timers,
+    resolved,
+    advance: (seconds) => {
+      wallMs += seconds * 1000;
+      monoMs += seconds * 1000;
+    },
+    learn: async (n, addresses, ttlSec = 300) => {
+      const result = await h.engine.learn(ruleId(n), addresses, ttlSec);
+      expectValid(h.engine.getState());
+      return result;
+    },
+  };
+};
+
+const stateOf = (engine: Engine, n: number) => {
+  const found = engine.getState().rules.find((entry) => entry.ruleId === ruleId(n));
+  if (found === undefined) throw new Error(`no state for rule ${String(n)}`);
+  return found;
+};
+
+describe('wildcard rules: learn', () => {
+  it('is active with nothing routed before an answer, and is never resolved', async () => {
+    const h = learning([WILD]);
+
+    const outcome = await h.run('startup');
+
+    expect(h.take()).toEqual([]);
+    expect(h.resolved).toEqual([]);
+    expect(ruleState(outcome, 40)).toEqual({
+      ruleId: ruleId(40),
+      status: 'active',
+      reasonCode: null,
+      reason: null,
+      appliedDestinations: [],
+      lastResolvedAt: null,
+    });
+  });
+
+  it('routes new addresses in a light dns-learned pass and resolves when they are in place', async () => {
+    const syncs: Config[] = [];
+    const h = learning([WILD, DOMAIN_RULE], {
+      deps: {
+        syncResolvers: (snapshot) => {
+          syncs.push(snapshot);
+          return { issues: new Map() };
+        },
+      },
+    });
+    await h.run('startup');
+    h.take();
+    const detections = h.netinfo.calls.length;
+    const resolutions = h.resolved.length;
+
+    const result = await h.learn(40, [L1, L2]);
+
+    expect(result).toEqual({ outcome: 'applied', reason: null, accepted: 2, rejected: 0, routed: 2 });
+    expect(h.take()).toEqual([add(L1, ETH_GW), add(L2, ETH_GW)]);
+    // Light: no detection, no resolver-file sync; the exact rule keeps its cached answer.
+    expect(h.netinfo.calls).toHaveLength(detections);
+    expect(syncs).toHaveLength(1);
+    expect(h.resolved.length).toBe(resolutions + 1);
+    const state = h.engine.getState();
+    expect(state.lastReconcileReason).toBe('dns-learned');
+    expect(stateOf(h.engine, 40)).toMatchObject({
+      status: 'active',
+      reasonCode: null,
+      appliedDestinations: [L1, L2],
+      lastResolvedAt: NOW.toISOString(),
+    });
+    expect(stateOf(h.engine, 5)).toMatchObject({ status: 'active', appliedDestinations: ['172.16.12.40'] });
+    expect(h.engine.getApplied()).toContainEqual({ dst: L1, gateway: ETH_GW, ruleIds: [ruleId(40)] });
+    expect(engineLogs(h.entries, 'debug', 'reconcile finished').at(-1)?.context).toMatchObject({ reason: 'dns-learned', added: 2, light: true });
+    // Log hygiene: no address of a learned name above `debug`.
+    for (const entry of h.entries.filter((candidate) => candidate.level !== 'debug')) {
+      expect(JSON.stringify(entry)).not.toContain(L1);
+    }
+  });
+
+  it('renews known addresses without a pass', async () => {
+    const h = learning([WILD]);
+    await h.run('startup');
+    await h.learn(40, [L1]);
+    h.take();
+    const seq = h.engine.getState().seq;
+
+    h.advance(60);
+    const result = await h.learn(40, [L1]);
+
+    expect(result).toEqual({ outcome: 'refreshed', reason: null, accepted: 1, rejected: 0, routed: 1 });
+    expect(h.take()).toEqual([]);
+    expect(h.engine.getState().seq).toBe(seq);
+  });
+
+  it('does not work the DNS-server warnings out again in a light pass', async () => {
+    // The ethernet DNS server sits in the wifi subnet: a warning every full pass reports.
+    const reporting = (): DetectedInterfaces => ({ ...network(), dnsServers: { ethernet: ['192.168.1.53'], wifi: [] } });
+    const h = learning([WILD], { netinfo: createFakeNetInfo(reporting) });
+    await h.run('startup');
+    const said = (): number =>
+      h.entries.filter((entry) => entry.msg === 'a DNS server is reached through the other interface; add an `ip` rule for it').length;
+    expect(said()).toBe(1);
+    expect(h.engine.getState().dnsWarnings).toHaveLength(1);
+
+    await h.learn(40, [L1]);
+
+    expect(said()).toBe(1);
+    expect(h.engine.getState().dnsWarnings).toHaveLength(1);
+    await h.run('drift-check');
+    expect(said()).toBe(2);
+  });
+
+  it('runs a full pass for an answer that comes before the pass of a config change', async () => {
+    const h = learning([WILD]);
+    await h.run('startup');
+    const detections = h.netinfo.calls.length;
+    h.engine.setConfig(config([WILD, HOST]));
+
+    await h.learn(40, [L1]);
+
+    expect(h.netinfo.calls).toHaveLength(detections + 1);
+    expect(h.take()).toEqual([add('172.16.12.40', ETH_GW), add(L1, ETH_GW)]);
+    expect(engineLogs(h.entries, 'info', 'reconcile finished').at(-1)?.context).toMatchObject({ reason: 'dns-learned' });
+  });
+
+  it.each([
+    ['an unknown rule', [WILD], 99, 'not-learning'],
+    ['an exact domain rule under no wildcard base', [WILD, rule(6, 'domain', 'corp.example', 'ethernet')], 6, 'not-learning'],
+    ['an exact domain rule whose wildcard is disabled', [{ ...WILD, enabled: false }, rule(7, 'domain', 'www.corp.local', 'wifi')], 7, 'not-learning'],
+    ['a disabled exact domain rule under a wildcard base', [WILD, { ...rule(7, 'domain', 'www.corp.local', 'wifi'), enabled: false }], 7, 'not-learning'],
+    ['an ip rule', [WILD, HOST], 1, 'not-learning'],
+    ['a disabled wildcard rule', [{ ...WILD, enabled: false }], 40, 'not-learning'],
+  ] as const)('ignores %s', async (_name, rules, n, reason) => {
+    const h = learning(rules);
+    await h.run('startup');
+    h.take();
+
+    expect(await h.learn(n, [L1])).toEqual({ outcome: 'ignored', reason, accepted: 0, rejected: 0, routed: 0 });
+    expect(h.take()).toEqual([]);
+  });
+
+  it('ignores everything while routing is off', async () => {
+    const h = learning([WILD], { extra: { enabled: false } });
+    await h.run('startup');
+
+    expect((await h.learn(40, [L1])).reason).toBe('not-learning');
+    expect(h.take()).toEqual([]);
+  });
+
+  it('ignores an answer before the first pass, and while the interface is down or has no gateway', async () => {
+    const h = learning([WILD], { netinfo: createFakeNetInfo(network({ ethernet: down('ethernet') }), network({ ethernet: noGateway('ethernet') })) });
+    expect((await h.learn(40, [L1])).reason).toBe('interface-down');
+
+    await h.run('startup');
+    expect((await h.learn(40, [L1])).reason).toBe('interface-down');
+    await h.run('network-change');
+    expect((await h.learn(40, [L1])).reason).toBe('interface-down');
+    expect(h.take()).toEqual([]);
+  });
+
+  it('ignores an answer while the last detection was not trusted', async () => {
+    const h = learning([WILD], { netinfo: createFakeNetInfo(network(), network({ degraded: true })) });
+    await h.run('startup');
+    await h.run('network-change');
+
+    expect((await h.learn(40, [L1])).reason).toBe('interface-down');
+  });
+
+  it('ignores everything after the final cleanup', async () => {
+    const h = learning([WILD]);
+    await h.run('startup');
+    await h.engine.clear({ final: true });
+
+    expect((await h.learn(40, [L1])).reason).toBe('shut-down');
+  });
+
+  it('refuses every address that is not a strict, routable, non-DNS, non-connected IPv4 address', async () => {
+    const withDns = (): DetectedInterfaces => ({ ...network(), dnsServers: { ethernet: ['10.20.0.10'], wifi: ['192.168.1.1'] } });
+    const ownDns = rule(40, 'domain', '*.corp.local', 'ethernet', { dns: '10.30.0.53' });
+    const h = learning([ownDns], { netinfo: createFakeNetInfo(withDns) });
+    await h.run('startup');
+    h.take();
+    const refused: unknown[] = [
+      '010.1.2.3',
+      '172.16.20',
+      '0x0a.0.0.1',
+      ' 172.16.20.1',
+      'corp.local',
+      '::1',
+      '127.0.0.1',
+      '0.0.0.0',
+      '224.0.0.1',
+      '169.254.1.1',
+      '255.255.255.255',
+      '10.20.0.10',
+      '192.168.1.1',
+      '10.30.0.53',
+      ETH_GW,
+      '10.20.4.23',
+      WIFI_GW,
+      42,
+      null,
+    ];
+
+    expect(await h.learn(40, refused as string[])).toEqual({
+      outcome: 'ignored',
+      reason: 'no-usable-address',
+      accepted: 0,
+      rejected: refused.length,
+      routed: 0,
+    });
+    const mixed = await h.learn(40, ['127.0.0.1', L1, 'x']);
+    expect(mixed).toEqual({ outcome: 'applied', reason: null, accepted: 1, rejected: 2, routed: 1 });
+    expect(h.take()).toEqual([add(L1, ETH_GW)]);
+  });
+
+  it('reads an answer that is not a list as empty', async () => {
+    const h = learning([WILD]);
+    await h.run('startup');
+
+    expect((await h.engine.learn(ruleId(40), 'x' as unknown as string[], 300)).reason).toBe('no-usable-address');
+  });
+
+  it('reads at most perRule addresses of one answer', async () => {
+    const h = learning([WILD]);
+    await h.run('startup');
+    const many = Array.from({ length: LEARNED_ROUTE_LIMITS.perRule + 5 }, (_unused, index) => `172.17.${String(Math.floor(index / 200))}.${String((index % 200) + 1)}`);
+
+    const result = await h.learn(40, many);
+
+    expect(result.accepted).toBe(LEARNED_ROUTE_LIMITS.perRule);
+    expect(stateOf(h.engine, 40).appliedDestinations).toHaveLength(LEARNED_ROUTE_LIMITS.perRule);
+    expect(stateOf(h.engine, 40).reasonCode).toBeNull();
+  });
+
+  it('leaves an address out that is a DNS server reported after it was learned, without failing the rule', async () => {
+    const plain = network();
+    const reporting = (): DetectedInterfaces => ({ ...network(), dnsServers: { ethernet: [L1], wifi: [] } });
+    const h = learning([WILD], { netinfo: createFakeNetInfo(plain, reporting) });
+    await h.run('startup');
+    await h.learn(40, [L1, L2]);
+    h.take();
+
+    const outcome = await h.run('network-change');
+
+    expect(h.take()).toEqual([del(L1, ETH_GW)]);
+    expect(ruleState(outcome, 40)).toMatchObject({ status: 'active', reasonCode: null, appliedDestinations: [L2] });
+  });
+
+  it('leaves an address out that has become the gateway, without failing the rule', async () => {
+    const h = learning([WILD], { netinfo: createFakeNetInfo(network(), network({ ethernet: iface('ethernet', { gateway: L1 }) })) });
+    await h.run('startup');
+    await h.learn(40, [L1, L2]);
+    h.take();
+
+    const outcome = await h.run('network-change');
+
+    expect(h.take()).toEqual([del(L1, ETH_GW), del(L2, ETH_GW), add(L2, L1)]);
+    expect(ruleState(outcome, 40)).toMatchObject({ status: 'active', reasonCode: null, appliedDestinations: [L2] });
+  });
+
+  it('routes the dns server of a wildcard rule like that of any domain rule, and never resolves the rule (TASK-DELTA-24 QA)', async () => {
+    const outside = rule(40, 'domain', '*.corp.local', 'ethernet', { dns: '10.30.0.53' });
+    const onLink = rule(41, 'domain', '*.lan.local', 'ethernet', { dns: '10.20.4.53' });
+    const h = learning([outside, onLink]);
+
+    const outcome = await h.run('startup');
+
+    expect(h.take()).toEqual([add('10.30.0.53', ETH_GW)]);
+    expect(h.resolved).toEqual([]);
+    expect(ruleState(outcome, 40)).toMatchObject({ status: 'active', appliedDestinations: ['10.30.0.53'] });
+    expect(ruleState(outcome, 41)).toMatchObject({ status: 'active', appliedDestinations: [] });
+
+    await h.learn(40, [L1]);
+    expect(stateOf(h.engine, 40).appliedDestinations).toEqual(['10.30.0.53', L1]);
+  });
+
+  it('reports what is routed when the wait runs out, and the pass goes on', async () => {
+    const h = learning([WILD]);
+    await h.run('startup');
+    const gate = deferred();
+    h.routes.onAdd = async (request) => {
+      await gate.promise;
+      return added(request);
+    };
+
+    const pending = h.engine.learn(ruleId(40), [L1], 300, { waitMs: 50 });
+    await vi.waitFor(() => {
+      expect(h.timers.pending()).toEqual([50]);
+    });
+    h.timers.fireAll();
+
+    expect(await pending).toEqual({ outcome: 'timed-out', reason: null, accepted: 1, rejected: 0, routed: 0 });
+    gate.open();
+    await vi.waitFor(() => {
+      expect(stateOf(h.engine, 40).appliedDestinations).toEqual([L1]);
+    });
+  });
+
+  it(`waits ${String(LEARN_WAIT_MAX_MS)} ms by default and clears its timer once the routes are in place`, async () => {
+    const h = learning([WILD]);
+    await h.run('startup');
+    const gate = deferred();
+    h.routes.onAdd = async (request) => {
+      await gate.promise;
+      return added(request);
+    };
+
+    const pending = h.engine.learn(ruleId(40), [L1], 300);
+    await vi.waitFor(() => {
+      expect(h.timers.pending()).toEqual([LEARN_WAIT_MAX_MS]);
+    });
+    gate.open();
+
+    expect((await pending).outcome).toBe('applied');
+    // What is left is the coalesced announcement of the pass, not the wait.
+    expect(h.timers.pending()).not.toContain(LEARN_WAIT_MAX_MS);
+  });
+
+  it('reports a learned address whose add failed as not routed, and the rule as failing', async () => {
+    const h = learning([WILD]);
+    await h.run('startup');
+    h.routes.onAdd = () => addFailed('add');
+
+    expect(await h.learn(40, [L1])).toEqual({ outcome: 'applied', reason: null, accepted: 1, rejected: 0, routed: 0 });
+    expect(stateOf(h.engine, 40)).toMatchObject({ status: 'error', reasonCode: 'route-failed' });
+  });
+
+  it('never rejects, even when its own bookkeeping throws', async () => {
+    const h = learning([WILD]);
+    await h.run('startup');
+    const hostile = new Proxy([L1], {
+      get: () => {
+        throw new Error('hostile list');
+      },
+    });
+
+    expect(await h.engine.learn(ruleId(40), hostile, 300)).toMatchObject({ outcome: 'ignored', reason: 'no-usable-address' });
+    expect(engineLogs(h.entries, 'error', 'learning addresses failed')).toHaveLength(1);
+  });
+});
+
+describe('wildcard rules: precedence of learned addresses (shared compareClaim)', () => {
+  it('leaves an address to an explicit rule on the other interface: active + overridden-by-rule', async () => {
+    const wifiIp = rule(3, 'ip', L1, 'wifi');
+    const h = learning([WILD, wifiIp]);
+    await h.run('startup');
+    h.take();
+
+    await h.learn(40, [L1, L2]);
+
+    expect(h.take()).toEqual([add(L2, ETH_GW)]);
+    expect(stateOf(h.engine, 40)).toEqual({
+      ruleId: ruleId(40),
+      status: 'active',
+      reasonCode: 'overridden-by-rule',
+      reason: '1 learned address is routed by another rule, which takes precedence',
+      appliedDestinations: [L2],
+      lastResolvedAt: NOW.toISOString(),
+    });
+    expect(engineLogs(h.entries, 'info', 'rule partly applied').at(-1)?.context).toMatchObject({ reasonCode: 'overridden-by-rule', overridden: 1, routed: 1 });
+  });
+
+  it('leaves an address to an exact domain rule on the other interface: active + shared-address', async () => {
+    const exactWifi = rule(5, 'domain', 'corp.local', 'wifi');
+    const h = learning([WILD, exactWifi], { deps: { resolveDomain: () => domainAnswer([L1]) } });
+    await h.run('startup');
+    h.take();
+
+    await h.learn(40, [L1, L2]);
+
+    expect(h.take()).toEqual([add(L2, ETH_GW)]);
+    expect(stateOf(h.engine, 40)).toMatchObject({
+      status: 'active',
+      reasonCode: 'shared-address',
+      reason: '1 learned address is routed through the other interface for another domain rule, which takes precedence',
+      appliedDestinations: [L2],
+    });
+    expect(stateOf(h.engine, 5)).toMatchObject({ status: 'active', reasonCode: null, appliedDestinations: [L1] });
+    expect(engineLogs(h.entries, 'info', 'rule partly applied').at(-1)?.context).toMatchObject({ reasonCode: 'shared-address', overridden: 0, shared: 1 });
+  });
+
+  it('puts overridden-by-rule before shared-address and counts both', async () => {
+    const wifiIp = rule(3, 'ip', L1, 'wifi');
+    const exactWifi = rule(5, 'domain', 'corp.local', 'wifi');
+    const h = learning([WILD, wifiIp, exactWifi], { deps: { resolveDomain: () => domainAnswer([L2]) } });
+    await h.run('startup');
+
+    await h.learn(40, [L1, L2, L3]);
+
+    expect(stateOf(h.engine, 40)).toMatchObject({
+      status: 'active',
+      reasonCode: 'overridden-by-rule',
+      reason:
+        '1 learned address is routed by another rule, which takes precedence; 1 learned address is routed through the other interface for another domain rule, which takes precedence',
+      appliedDestinations: [L3],
+    });
+  });
+
+  it('gives a deeper wildcard the address, whatever the config order; the shallower one gets shared-address', async () => {
+    const h = learning([WILD, DEEP_WIFI]);
+    await h.run('startup');
+
+    await h.learn(40, [L1, L2]);
+    expect(h.take()).toEqual([add(L1, ETH_GW), add(L2, ETH_GW)]);
+    // The deeper rule learns L1 later: the route moves to its interface.
+    await h.learn(42, [L1]);
+
+    expect(h.take()).toEqual([del(L1, ETH_GW), add(L1, WIFI_GW)]);
+    expect(stateOf(h.engine, 42)).toMatchObject({ status: 'active', reasonCode: null, appliedDestinations: [L1] });
+    expect(stateOf(h.engine, 40)).toMatchObject({ status: 'active', reasonCode: 'shared-address', appliedDestinations: [L2] });
+  });
+
+  it('gives the address to the earlier of two equally deep wildcards', async () => {
+    const h = learning([OTHER_WILD_WIFI, WILD]);
+    await h.run('startup');
+
+    await h.learn(40, [L1, L2]);
+    await h.learn(43, [L1]);
+
+    expect(h.take()).toEqual([add(L1, ETH_GW), add(L2, ETH_GW), del(L1, ETH_GW), add(L1, WIFI_GW)]);
+    expect(stateOf(h.engine, 43).appliedDestinations).toEqual([L1]);
+    expect(stateOf(h.engine, 40)).toMatchObject({ reasonCode: 'shared-address', appliedDestinations: [L2] });
+  });
+
+  it('shares one route with a rule on the same interface, without a warning', async () => {
+    const exactEth = rule(5, 'domain', 'corp.local', 'ethernet');
+    const h = learning([WILD, exactEth], { deps: { resolveDomain: () => domainAnswer([L1]) } });
+    await h.run('startup');
+    h.take();
+
+    await h.learn(40, [L1]);
+
+    expect(h.take()).toEqual([]);
+    expect(h.engine.getApplied()).toEqual([{ dst: L1, gateway: ETH_GW, ruleIds: [ruleId(5), ruleId(40)] }]);
+    expect(stateOf(h.engine, 40)).toMatchObject({ status: 'active', reasonCode: null, appliedDestinations: [L1] });
+  });
+
+  it('loses an address to the DNS server of another domain rule: overridden-by-rule', async () => {
+    const serverRule = rule(5, 'domain', 'corp.local', 'wifi', { dns: L1 });
+    const h = learning([WILD, serverRule], { deps: { resolveDomain: () => domainAnswer([]) } });
+    await h.run('startup');
+
+    await h.learn(40, [L1, L2]);
+
+    expect(stateOf(h.engine, 40)).toMatchObject({ status: 'active', reasonCode: 'overridden-by-rule', appliedDestinations: [L2] });
+    expect(h.engine.getApplied()).toContainEqual({ dst: L1, gateway: WIFI_GW, ruleIds: [ruleId(5)] });
+  });
+
+  it('is error / route-failed when every learned address is left to other rules (TASK-DELTA-07 rule)', async () => {
+    const wifiIp = rule(3, 'ip', L1, 'wifi');
+    const exactWifi = rule(5, 'domain', 'corp.local', 'wifi');
+    const h = learning([WILD, wifiIp, exactWifi], { deps: { resolveDomain: () => domainAnswer([L2]) } });
+    await h.run('startup');
+
+    await h.learn(40, [L2]);
+    expect(stateOf(h.engine, 40)).toMatchObject({
+      status: 'error',
+      reasonCode: 'route-failed',
+      reason: `${L2} is routed through the wifi interface for another domain rule, which takes precedence over a learned address`,
+      appliedDestinations: [],
+    });
+
+    await h.learn(40, [L1]);
+    expect(stateOf(h.engine, 40)).toMatchObject({
+      status: 'error',
+      reasonCode: 'route-failed',
+      reason: `${L1} is routed through the wifi interface by an explicit rule, which takes precedence over a resolved address`,
+    });
+  });
+
+  it('leaves the clash of two exact domain rules as it was: route-failed for the later one (regression)', async () => {
+    const first = rule(5, 'domain', 'corp.local', 'ethernet');
+    const second = rule(6, 'domain', 'other.local', 'wifi');
+    const h = learning([first, second, WILD], { deps: { resolveDomain: () => domainAnswer([L1]) } });
+
+    const outcome = await h.run('startup');
+
+    expect(h.take()).toEqual([add(L1, ETH_GW)]);
+    expect(ruleState(outcome, 6)).toMatchObject({
+      status: 'error',
+      reasonCode: 'route-failed',
+      reason: `${L1} is already routed through the ethernet interface by another rule`,
+    });
+  });
+
+  it('keeps a subnet rule and a learned host route inside it apart (longest prefix)', async () => {
+    const wifiNet = rule(2, 'subnet', '172.16.0.0/12', 'wifi');
+    const h = learning([WILD, wifiNet]);
+    await h.run('startup');
+    h.take();
+
+    await h.learn(40, [L1]);
+
+    expect(h.take()).toEqual([add(L1, ETH_GW)]);
+    expect(stateOf(h.engine, 40)).toMatchObject({ status: 'active', reasonCode: null });
+  });
+});
+
+// TASK-DELTA-30: split horizon. `*.corp.local` → ethernet, `www.corp.local` → wifi without `dns`.
+// The engine resolves the exact name through the wifi role's DNS (P1), but clients ask the DNS
+// proxy, which now forwards the exact name to the same servers and learns what it gave them for
+// the exact rule: whatever the clients connect to is routed through the exact rule's interface.
+describe('exact domain rules under a wildcard base: learn (split horizon)', () => {
+  const EXACT_WIFI = rule(7, 'domain', 'www.corp.local', 'wifi');
+  const P1 = '203.0.113.10';
+  const P2 = L1;
+  const exactLearning = (rules: readonly Rule[] = [WILD, EXACT_WIFI]): LearningHarness =>
+    learning(rules, { deps: { resolveDomain: (resolvedRule) => domainAnswer(resolvedRule.id === ruleId(7) ? [P1] : ['172.16.12.40']) } });
+
+  it('routes what the proxy learned for the exact rule through its interface, with its resolved addresses', async () => {
+    const h = exactLearning();
+    await h.run('startup');
+    expect(h.take()).toEqual([add(P1, WIFI_GW)]);
+
+    const result = await h.learn(7, [P2]);
+
+    expect(result).toEqual({ outcome: 'applied', reason: null, accepted: 1, rejected: 0, routed: 1 });
+    expect(h.take()).toEqual([add(P2, WIFI_GW)]);
+    expect(stateOf(h.engine, 7)).toMatchObject({ status: 'active', reasonCode: null, appliedDestinations: [P1, P2] });
+    // An address the resolver also returns is not routed twice.
+    expect((await h.learn(7, [P1])).outcome).toBe('applied');
+    expect(h.take()).toEqual([]);
+  });
+
+  it('keeps the exact-domain claim: the wildcard loses the same learned address (shared-address)', async () => {
+    const h = exactLearning();
+    await h.run('startup');
+    await h.learn(7, [P2]);
+    h.take();
+
+    await h.learn(40, [P2, L2]);
+
+    expect(h.take()).toEqual([add(L2, ETH_GW)]);
+    expect(stateOf(h.engine, 40)).toMatchObject({ status: 'active', reasonCode: 'shared-address', appliedDestinations: [L2] });
+    expect(stateOf(h.engine, 7)).toMatchObject({ status: 'active', reasonCode: null, appliedDestinations: [P1, P2] });
+  });
+
+  it('takes an address over from the wildcard when the exact rule learns it later', async () => {
+    const h = exactLearning();
+    await h.run('startup');
+    await h.learn(40, [P2]);
+    expect(h.take()).toEqual([add(P1, WIFI_GW), add(P2, ETH_GW)]);
+
+    await h.learn(7, [P2]);
+
+    expect(h.take()).toEqual([del(P2, ETH_GW), add(P2, WIFI_GW)]);
+  });
+
+  it('leaves a learned address to an explicit rule without failing the exact rule (overridden-by-rule)', async () => {
+    const ethIp = rule(1, 'ip', P2, 'ethernet');
+    const h = exactLearning([ethIp, WILD, EXACT_WIFI]);
+    await h.run('startup');
+    h.take();
+
+    await h.learn(7, [P2, L2]);
+
+    expect(h.take()).toEqual([add(L2, WIFI_GW)]);
+    expect(stateOf(h.engine, 7)).toMatchObject({ status: 'active', reasonCode: 'overridden-by-rule', appliedDestinations: [P1, L2] });
+  });
+
+  it('checks learned addresses like a wildcard does', async () => {
+    const h = exactLearning();
+    await h.run('startup');
+    h.take();
+
+    const result = await h.learn(7, ['127.0.0.1', '224.0.0.1', WIFI_GW, 'nonsense', P2]);
+
+    expect(result).toMatchObject({ outcome: 'applied', accepted: 1, rejected: 4 });
+    expect(h.take()).toEqual([add(P2, WIFI_GW)]);
+  });
+
+  it('expires learned addresses like a wildcard does; the resolved ones stay', async () => {
+    const h = exactLearning();
+    await h.run('startup');
+    await h.learn(7, [P2], 5);
+    h.take();
+
+    h.advance(LEARNED_ROUTE_LIMITS.minTtlSec);
+    expect(h.engine.getRetryNeeds().learnedExpired).toBe(1);
+    await h.run('drift-check');
+
+    expect(h.take()).toEqual([del(P2, WIFI_GW)]);
+    expect(stateOf(h.engine, 7)).toMatchObject({ status: 'active', appliedDestinations: [P1] });
+  });
+
+  it('forgets what the exact rule learned once no enabled wildcard covers it any more', async () => {
+    const h = exactLearning();
+    await h.run('startup');
+    await h.learn(7, [P2]);
+    h.take();
+
+    h.engine.setConfig(config([{ ...WILD, enabled: false }, EXACT_WIFI]));
+    await h.run('config-change');
+
+    expect(h.take()).toEqual([del(P2, WIFI_GW)]);
+    expect(stateOf(h.engine, 7)).toMatchObject({ appliedDestinations: [P1] });
+    expect((await h.learn(7, [P2])).reason).toBe('not-learning');
+  });
+});
+
+describe('wildcard rules: lifetime and bounds', () => {
+  it('removes a route when its clamped lifetime is over; the monitor learns of it from getRetryNeeds', async () => {
+    const h = learning([WILD]);
+    await h.run('startup');
+    await h.learn(40, [L1], 5);
+    h.take();
+
+    h.advance(LEARNED_ROUTE_LIMITS.minTtlSec - 1);
+    expect(h.engine.getRetryNeeds().learnedExpired).toBe(0);
+    h.advance(1);
+    expect(h.engine.getRetryNeeds().learnedExpired).toBe(1);
+
+    const outcome = await h.run('drift-check');
+
+    expect(h.take()).toEqual([del(L1, ETH_GW)]);
+    expect(outcome.summary.removed).toBe(1);
+    expect(ruleState(outcome, 40)).toMatchObject({ status: 'active', appliedDestinations: [], lastResolvedAt: null });
+    expect(h.engine.getRetryNeeds().learnedExpired).toBe(0);
+  });
+
+  it('keeps a route while answers renew it, up to the longest lifetime', async () => {
+    const h = learning([WILD]);
+    await h.run('startup');
+    await h.learn(40, [L1], 10 ** 9);
+    h.take();
+
+    h.advance(LEARNED_ROUTE_LIMITS.maxTtlSec - 10);
+    expect((await h.learn(40, [L1], 900)).outcome).toBe('refreshed');
+    h.advance(20);
+    await h.run('drift-check');
+    expect(h.take()).toEqual([]);
+    expect(stateOf(h.engine, 40).lastResolvedAt).toBe(new Date(NOW.getTime() + (LEARNED_ROUTE_LIMITS.maxTtlSec - 10) * 1000).toISOString());
+
+    h.advance(900);
+    await h.run('drift-check');
+    expect(h.take()).toEqual([del(L1, ETH_GW)]);
+  });
+
+  it('removes an expired address in a light pass too', async () => {
+    const h = learning([WILD]);
+    await h.run('startup');
+    await h.learn(40, [L1], 900);
+    h.advance(900);
+
+    await h.learn(40, [L2], 900);
+
+    expect(h.take()).toEqual([add(L1, ETH_GW), del(L1, ETH_GW), add(L2, ETH_GW)]);
+  });
+
+  it('keeps an expired route while a degraded detection holds deletions back? No: it is not wanted by the config any more', async () => {
+    const h = learning([WILD], { netinfo: createFakeNetInfo(network(), network({ degraded: true })) });
+    await h.run('startup');
+    await h.learn(40, [L1, L2], 900);
+    h.take();
+    await h.learn(40, [L2], 3600);
+    h.advance(900);
+
+    const outcome = await h.run('network-change');
+
+    expect(h.take()).toEqual([del(L1, ETH_GW)]);
+    expect(outcome.summary.kept).toBe(0);
+    expect(h.engine.getApplied().map((route) => route.dst)).toEqual([L2]);
+  });
+
+  it(`drops the address seen longest ago beyond ${String(LEARNED_ROUTE_LIMITS.perRule)} per rule: addresses-truncated until it would have expired`, async () => {
+    const h = learning([WILD]);
+    await h.run('startup');
+    const full = Array.from({ length: LEARNED_ROUTE_LIMITS.perRule }, (_unused, index) => `172.17.${String(Math.floor(index / 200))}.${String((index % 200) + 1)}`);
+    await h.learn(40, full, 900);
+    h.take();
+
+    h.advance(10);
+    await h.learn(40, [L1], 3600);
+
+    expect(h.take()).toEqual([del(full[0] ?? '', ETH_GW), add(L1, ETH_GW)]);
+    expect(stateOf(h.engine, 40)).toMatchObject({
+      status: 'active',
+      reasonCode: 'addresses-truncated',
+      reason: `Learned addresses are limited to ${String(LEARNED_ROUTE_LIMITS.perRule)} per rule and ${String(LEARNED_ROUTE_LIMITS.total)} in all; the ones seen longest ago were dropped`,
+    });
+    expect(stateOf(h.engine, 40).appliedDestinations).toHaveLength(LEARNED_ROUTE_LIMITS.perRule);
+    expect(engineLogs(h.entries, 'info', 'learned addresses reached their limit; the ones seen longest ago are dropped')).toHaveLength(1);
+
+    h.advance(890);
+    const after = await h.run('drift-check');
+    expect(ruleState(after, 40)).toMatchObject({ status: 'active', reasonCode: null, appliedDestinations: [L1] });
+  });
+
+  it(`drops the address seen longest ago of all wildcard rules beyond ${String(LEARNED_ROUTE_LIMITS.total)} in all`, async () => {
+    const count = LEARNED_ROUTE_LIMITS.total / LEARNED_ROUTE_LIMITS.perRule;
+    const wildcards = Array.from({ length: count + 1 }, (_unused, index) => rule(100 + index, 'domain', `*.w${String(index)}.local`, 'ethernet'));
+    const h = learning(wildcards);
+    await h.run('startup');
+    for (let index = 0; index < count; index += 1) {
+      h.advance(1);
+      await h.learn(
+        100 + index,
+        Array.from({ length: LEARNED_ROUTE_LIMITS.perRule }, (_unused, host) => `172.${String(17 + index)}.${String(Math.floor(host / 200))}.${String((host % 200) + 1)}`),
+      );
+    }
+    expect(h.engine.getApplied()).toHaveLength(LEARNED_ROUTE_LIMITS.total);
+    h.take();
+
+    h.advance(1);
+    await h.learn(100 + count, [L1]);
+
+    expect(h.take()).toEqual([del('172.17.0.1', ETH_GW), add(L1, ETH_GW)]);
+    expect(h.engine.getApplied()).toHaveLength(LEARNED_ROUTE_LIMITS.total);
+    expect(stateOf(h.engine, 100).reasonCode).toBe('addresses-truncated');
+    expect(stateOf(h.engine, 100 + count).reasonCode).toBeNull();
+    expect(h.engine.getApplied().length).toBeLessThanOrEqual(MAX_APPLIED_ROUTES);
+  });
+});
+
+describe('wildcard rules: cleanup', () => {
+  it('forgets what a rule learned at once when it is removed, disabled or retargeted; keeps it when only the interface changes', async () => {
+    const h = learning([WILD, OTHER_WILD_WIFI]);
+    await h.run('startup');
+    await h.learn(40, [L1]);
+    await h.learn(43, [L2]);
+    h.take();
+
+    h.engine.setConfig(config([{ ...WILD, iface: 'wifi' }, OTHER_WILD_WIFI]));
+    expect((await h.learn(40, [L1])).outcome).toBe('refreshed');
+    await h.run('config-change');
+    expect(h.take()).toEqual([del(L1, ETH_GW), add(L1, WIFI_GW)]);
+
+    h.engine.setConfig(config([{ ...WILD, iface: 'wifi', target: '*.new.local' }, { ...OTHER_WILD_WIFI, enabled: false }]));
+    expect(engineLogs(h.entries, 'info', 'learned addresses forgotten after a config change').at(-1)?.context).toMatchObject({ dropped: 2 });
+    const outcome = await h.run('config-change');
+    expect(h.take()).toEqual([del(L2, WIFI_GW), del(L1, WIFI_GW)]);
+    expect(ruleState(outcome, 40)).toMatchObject({ appliedDestinations: [], lastResolvedAt: null });
+
+    // Enabled again: nothing comes back until the next answer.
+    h.engine.setConfig(config([WILD, OTHER_WILD_WIFI]));
+    await h.run('config-change');
+    expect(h.take()).toEqual([]);
+  });
+
+  it('forgets everything when routing is turned off; clear() removes the routes and the pass counts them', async () => {
+    const h = learning([WILD, HOST]);
+    await h.run('startup');
+    await h.learn(40, [L1, L2]);
+    h.take();
+
+    h.engine.setEnabled(false);
+    expect(await h.engine.clear()).toEqual({ removed: 3, forgotten: 0, failed: 0 });
+    const off = await h.run('enabled-change');
+    expect(off.summary.removed).toBe(3);
+    expect(engineLogs(h.entries, 'info', 'reconcile finished').at(-1)?.context).toMatchObject({ reason: 'enabled-change', removed: 3 });
+
+    h.engine.setEnabled(true);
+    const on = await h.run('enabled-change');
+    expect(h.take()).toEqual([del('172.16.12.40', ETH_GW), del(L1, ETH_GW), del(L2, ETH_GW), add('172.16.12.40', ETH_GW)]);
+    expect(on.summary.removed).toBe(0);
+    expect(ruleState(on, 40).appliedDestinations).toEqual([]);
+  });
+
+  it('forgets everything as soon as routing is turned off, even before any cleanup', async () => {
+    const h = learning([WILD]);
+    await h.run('startup');
+    await h.learn(40, [L1]);
+    h.take();
+
+    h.engine.setEnabled(false);
+    h.engine.setEnabled(true);
+    await h.run('enabled-change');
+
+    expect(h.take()).toEqual([del(L1, ETH_GW)]);
+    expect(engineLogs(h.entries, 'info', 'learned addresses forgotten after a config change').at(-1)?.context).toMatchObject({ dropped: 1 });
+  });
+
+  it('keeps a learned route while a degraded detection shows its interface differently (held, like any wanted route)', async () => {
+    const moved = network({ ethernet: iface('ethernet', { gateway: '10.20.4.254' }), degraded: true });
+    const h = learning([WILD], { netinfo: createFakeNetInfo(network(), moved) });
+    await h.run('startup');
+    await h.learn(40, [L1]);
+    h.take();
+
+    const outcome = await h.run('network-change');
+
+    expect(h.take()).toEqual([]);
+    expect(outcome.summary.kept).toBe(1);
+    expect(h.engine.getApplied()).toEqual([{ dst: L1, gateway: ETH_GW, ruleIds: [ruleId(40)] }]);
+  });
+
+  it('clear() forgets every learned address, so nothing is added again after it', async () => {
+    const snapshots: (readonly AppliedRoute[])[] = [];
+    const h = learning([WILD], { deps: { onApplied: (routes) => void snapshots.push(routes) } });
+    await h.run('startup');
+    await h.learn(40, [L1]);
+    expect(snapshots.at(-1)).toEqual([{ dst: L1, gateway: ETH_GW, ruleIds: [ruleId(40)] }]);
+
+    await h.engine.clear();
+    expect(snapshots.at(-1)).toEqual([]);
+    expect(engineLogs(h.entries, 'info', 'learned addresses forgotten').at(-1)?.context).toMatchObject({ reason: 'cleanup', dropped: 1 });
+    await h.run('drift-check');
+
+    expect(h.take()).toEqual([add(L1, ETH_GW), del(L1, ETH_GW)]);
+    expect(h.engine.getApplied()).toEqual([]);
+  });
+
+  it('removes a learned route a previous process left in state.json and does not learn it again', async () => {
+    const h = learning([WILD]);
+    h.engine.restoreApplied([{ dst: L1, gateway: ETH_GW, ruleIds: [ruleId(40)] }]);
+
+    const outcome = await h.run('startup');
+
+    expect(h.take()).toEqual([del(L1, ETH_GW)]);
+    expect(ruleState(outcome, 40).appliedDestinations).toEqual([]);
+  });
+
+  it('a summary counts the routes a clear() removed only once', async () => {
+    const h = learning([HOST]);
+    await h.run('startup');
+    await h.engine.clear();
+
+    expect((await h.run('drift-check')).summary.removed).toBe(1);
+    expect((await h.run('drift-check')).summary.removed).toBe(0);
+  });
+});
+
+describe('dns-learned passes: queueing and announcements', () => {
+  it('never turns a queued full pass into a light one, and a later full reason replaces a queued light one', async () => {
+    const h = learning([WILD]);
+    await h.run('startup');
+    const gate = deferred();
+    h.netinfo.gate = gate;
+
+    const running = h.engine.reconcile('drift-check');
+    const config1 = h.engine.reconcile('config-change');
+    const learned = h.engine.learn(ruleId(40), [L1], 300);
+    gate.open();
+    await Promise.all([running, config1, learned]);
+    const reasons = engineLogs(h.entries, 'info', 'reconcile finished').map((entry) => entry.context?.['reason']);
+    expect(reasons.slice(-2)).toEqual(['drift-check', 'config-change']);
+
+    const gate2 = deferred();
+    h.netinfo.gate = gate2;
+    const busy = h.engine.reconcile('drift-check');
+    const light = h.engine.learn(ruleId(40), [L2], 300);
+    const full = h.engine.reconcile('network-change');
+    gate2.open();
+    await Promise.all([busy, light, full]);
+    const after = engineLogs(h.entries, 'info', 'reconcile finished').map((entry) => entry.context?.['reason']);
+    expect(after.slice(-2)).toEqual(['drift-check', 'network-change']);
+    expect(h.engine.getApplied().map((route) => route.dst)).toEqual([L1, L2]);
+  });
+
+  it('announces the state of dns-learned passes at most once a second, always the latest; every-pass listeners hear each', async () => {
+    const h = learning([WILD]);
+    await h.run('startup');
+    const announced: number[] = [];
+    const everyPass: number[] = [];
+    h.engine.subscribe((state) => announced.push(state.seq));
+    h.engine.subscribe((state) => everyPass.push(state.seq), { everyPass: true });
+
+    h.advance(1);
+    await h.learn(40, [L1]);
+    const first = h.engine.getState().seq;
+    expect(announced).toEqual([first]);
+
+    h.advance(0.2);
+    await h.learn(40, [L2]);
+    await h.learn(40, [L3]);
+    expect(everyPass).toEqual([first, first + 1, first + 2]);
+    expect(announced).toEqual([first]);
+    expect(h.timers.pending()).toEqual([STATE_ANNOUNCE_MIN_INTERVAL_MS - 200]);
+
+    h.timers.fireAll();
+    expect(announced).toEqual([first, first + 2]);
+
+    // Another reason is announced at once and takes a pending announcement with it.
+    h.advance(0.1);
+    await h.learn(40, ['172.16.20.4']);
+    expect(h.timers.pending()).toHaveLength(1);
+    await h.run('drift-check');
+    expect(h.timers.pending()).toEqual([]);
+    expect(announced.at(-1)).toBe(h.engine.getState().seq);
+    expect(announced).toHaveLength(3);
+
+    // A second later the next light pass is announced at once again.
+    h.advance(1);
+    await h.learn(40, ['172.16.20.5']);
+    expect(announced.at(-1)).toBe(h.engine.getState().seq);
+  });
+
+  it('stops telling a listener that unsubscribed, either kind', async () => {
+    const h = learning([WILD]);
+    const seen: string[] = [];
+    const offA = h.engine.subscribe(() => seen.push('a'));
+    const offB = h.engine.subscribe(() => seen.push('b'), { everyPass: true });
+    await h.run('startup');
+    offA();
+    offB();
+    await h.run('startup');
+
+    expect(seen.sort()).toEqual(['a', 'b']);
+  });
+
+  it('announces at once when the monotonic clock went back', async () => {
+    let mono = 10_000;
+    const timers = createFakeTimers();
+    const h = setup(config([WILD]), { deps: { monotonicNow: () => mono, setTimer: timers.set, clearTimer: timers.clear } });
+    await h.run('startup');
+    const announced: number[] = [];
+    h.engine.subscribe((state) => announced.push(state.seq));
+    mono = 5_000;
+
+    await h.engine.learn(ruleId(40), [L1], 300);
+
+    expect(announced).toEqual([h.engine.getState().seq]);
+    expect(timers.pending()).toEqual([]);
+  });
+});
+
+describe('wildcard rules: model-based (random learn / expire / config sequences)', () => {
+  const POOL = ['172.16.30.1', '172.16.30.2', '172.16.30.3', '172.16.30.4', '172.16.30.5', '172.16.30.6'];
+  const WILDS = [
+    rule(50, 'domain', '*.m.local', 'ethernet'),
+    rule(51, 'domain', '*.x.m.local', 'wifi'),
+    rule(52, 'domain', '*.n.local', 'wifi', { dns: '10.40.0.53' }),
+  ];
+  const EXPLICIT = rule(53, 'ip', '172.16.30.1', 'wifi');
+  const EXACT = rule(54, 'domain', 'exact.m.local', 'wifi');
+
+  it('keeps applied within what the rules want, and never breaks the bounds (3000 random steps)', async () => {
+    let seed = 2026;
+    const random = (n: number): number => {
+      seed = (seed * 1_103_515_245 + 12_345) % 2 ** 31;
+      return seed % n;
+    };
+    const pick = <T>(items: readonly T[]): T => items[random(items.length)] as T;
+
+    const h = learning([...WILDS, EXPLICIT, EXACT], { deps: { resolveDomain: () => domainAnswer(['172.16.30.2']) } });
+    await h.run('startup');
+    let rules: Rule[] = [...WILDS, EXPLICIT, EXACT];
+    let enabled = true;
+    /** Rule id -> address -> when it expires (ms), as far as the test knows (never evicted: the pool is small). */
+    const model = new Map<string, Map<string, number>>();
+    let nowMs = NOW.getTime();
+
+    for (let step = 0; step < 3000; step += 1) {
+      const op = random(10);
+      if (op < 5) {
+        const target = pick(WILDS);
+        const addresses = Array.from({ length: 1 + random(3) }, () => pick(POOL));
+        const ttl = pick([1, 900, 1800, 5000, 100_000]);
+        const result = await h.engine.learn(target.id, addresses, ttl);
+        const current = rules.find((candidate) => candidate.id === target.id);
+        if (result.outcome !== 'ignored' && current !== undefined) {
+          const known = model.get(target.id) ?? new Map<string, number>();
+          const expires = nowMs + Math.min(Math.max(ttl, 900), 86_400) * 1000;
+          for (const address of new Set(addresses)) known.set(address, Math.max(known.get(address) ?? 0, expires));
+          model.set(target.id, known);
+        } else {
+          expect(result.accepted).toBe(0);
+        }
+      } else if (op < 7) {
+        const seconds = pick([30, 600, 900, 3600]);
+        h.advance(seconds);
+        nowMs += seconds * 1000;
+        await h.run('drift-check');
+      } else if (op < 9) {
+        const changed = pick(WILDS);
+        const variant = random(3);
+        rules = rules.map((candidate) =>
+          candidate.id !== changed.id
+            ? candidate
+            : variant === 0
+              ? { ...candidate, enabled: !candidate.enabled }
+              : variant === 1
+                ? { ...candidate, iface: candidate.iface === 'wifi' ? 'ethernet' : 'wifi' }
+                : candidate,
+        );
+        const before = h.engine.getConfig().rules.find((candidate) => candidate.id === changed.id);
+        const after = rules.find((candidate) => candidate.id === changed.id);
+        if (before?.enabled === true && after?.enabled === false) model.delete(changed.id);
+        h.engine.setConfig(config(rules, { enabled }));
+        await h.run('config-change');
+      } else {
+        enabled = !enabled;
+        h.engine.setEnabled(enabled);
+        if (!enabled) {
+          model.clear();
+          await h.engine.clear();
+        }
+        await h.run('enabled-change');
+      }
+
+      // Invariants after every step.
+      const state = h.engine.getState();
+      expectValid(state);
+      const applied = h.engine.getApplied();
+      expect(new Set(applied.map((route) => route.dst)).size).toBe(applied.length);
+      for (const known of model.values()) for (const [address, expires] of known) if (expires <= nowMs) known.delete(address);
+      const wantedBy = (route: AppliedRoute): boolean =>
+        route.ruleIds.some((owner) => {
+          const owning = rules.find((candidate) => candidate.id === owner);
+          if (owning === undefined || !owning.enabled || !enabled) return false;
+          if (owning.kind === 'ip') return owning.target === route.dst;
+          if (!isWildcardTarget(owning.target)) return route.dst === '172.16.30.2';
+          return route.dst === owning.dns || (model.get(owner)?.has(route.dst) ?? false);
+        });
+      // Right after a pass: applied ⊆ desired (only a light learn can leave the expired ones for the next pass).
+      if (op >= 5) for (const route of applied) expect(wantedBy(route)).toBe(true);
+      // Precedence: the explicit rule's address is never routed for a wildcard rule.
+      const explicitRoute = applied.find((route) => route.dst === EXPLICIT.target);
+      if (enabled) expect(explicitRoute?.gateway).toBe(WIFI_GW);
+      for (const entry of state.rules) {
+        expect(entry.appliedDestinations.length).toBeLessThanOrEqual(LEARNED_ROUTE_LIMITS.perRule + 1);
+        if (!enabled) expect(entry.appliedDestinations).toEqual([]);
+      }
+      expect(applied.length).toBeLessThanOrEqual(MAX_APPLIED_ROUTES);
+    }
+  });
+});
+
+const isWildcardTarget = (target: string): boolean => target.startsWith('*.');
+
+describe('wildcard rules: configs without them behave as before', () => {
+  it('learn calls between the passes change nothing for configs without wildcard rules (differential, 300 random scenarios)', async () => {
+    const HOSTS = ['172.16.12.40', '172.16.12.41', '10.30.0.53', '10.20.4.53', '203.0.113.7'];
+    const REASONS: ReconcileReason[] = ['startup', 'config-change', 'manual', 'network-change', 'dns-refresh', 'drift-check'];
+    for (let scenario = 1; scenario <= 300; scenario += 1) {
+      let seed = scenario;
+      const random = (n: number): number => {
+        seed = (seed * 1_103_515_245 + 12_345) % 2 ** 31;
+        return seed % n;
+      };
+      const rules: Rule[] = Array.from({ length: 1 + random(5) }, (_unused, index) => {
+        const kind = (['ip', 'subnet', 'domain'] as const)[random(3)] ?? 'ip';
+        const target = kind === 'ip' ? (HOSTS[random(HOSTS.length)] ?? '') : kind === 'subnet' ? '172.16.0.0/12' : `d${String(index)}.corp.local`;
+        return rule(60 + index, kind, target, random(2) === 0 ? 'ethernet' : 'wifi', kind === 'domain' && random(2) === 0 ? { dns: HOSTS[random(HOSTS.length)] ?? '' } : {});
+      });
+      const parsed = Config.safeParse({ version: 1, enabled: true, rules });
+      if (!parsed.success) continue;
+      const answers = Array.from({ length: 12 }, () => HOSTS.filter(() => random(2) === 0));
+      const detections = Array.from({ length: 12 }, () => (random(5) === 0 ? network({ degraded: true }) : random(6) === 0 ? network({ wifi: down('wifi') }) : network()));
+      const reasons = Array.from({ length: 12 }, () => REASONS[random(REASONS.length)] ?? 'manual');
+      const make = () => {
+        let call = 0;
+        return setup(parsed.data, {
+          netinfo: createFakeNetInfo(...detections),
+          deps: { resolveDomain: () => domainAnswer(answers[call++ % answers.length] ?? []) },
+        });
+      };
+      const plain = make();
+      const noisy = make();
+      for (const reason of reasons) {
+        const expected = await plain.engine.reconcile(reason);
+        for (const each of rules) await noisy.engine.learn(each.id, ['172.16.12.40', '172.16.50.1'], 300);
+        const actual = await noisy.engine.reconcile(reason);
+        expect(actual.summary).toEqual(expected.summary);
+        expect(actual.state).toEqual(expected.state);
+      }
+      expect(noisy.routes.calls).toEqual(plain.routes.calls);
+    }
+  });
+
+  it('learn is ignored for every rule of a config without wildcard rules and changes nothing', async () => {
+    const rules = [HOST, NET, WIFI_HOST, DOMAIN_RULE];
+    const h = learning(rules);
+    const first = await h.run('startup');
+    const calls = h.take();
+
+    for (const each of rules) expect((await h.learn(Number(each.id.slice(-12)), ['172.16.40.1'])).reason).toBe('not-learning');
+
+    const second = await h.run('drift-check');
+    expect(h.take()).toEqual([]);
+    expect(calls.length).toBeGreaterThan(0);
+    expect(second.state.rules).toEqual(first.state.rules);
+    expect(h.engine.getRetryNeeds()).toEqual({ deferred: 0, refused: 0, failing: 0, learnedExpired: 0 });
   });
 });

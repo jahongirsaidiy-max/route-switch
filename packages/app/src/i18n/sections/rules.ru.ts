@@ -30,10 +30,11 @@ export const rulesRu: Shape<typeof rulesUz> = {
   exportOff: (reason) => `Экспорт конфигурации — ${reason}`,
 
   columns: { status: 'Статус', target: 'Адрес', kind: 'Тип', iface: 'Интерфейс', note: 'Заметка' },
-  kinds: { ip: 'IP', subnet: 'Подсеть', domain: 'Домен', domainDns: 'Домен + DNS' },
+  kinds: { ip: 'IP', subnet: 'Подсеть', domain: 'Домен', domainDns: 'Домен + DNS', wildcard: 'Wildcard', wildcardDns: 'Wildcard + DNS' },
   detailDns: (dns) => `DNS: ${dns}`,
   detailEvery: (minutes) => `${plural('ru', minutes, ruForms('каждую', 'каждые', 'каждые'))} ${String(minutes)} мин`,
   detailCount: (count, every) => `${String(count)} IP · ${every}`,
+  detailLearned: (count) => `${String(count)} ${plural('ru', count, ruForms('найденный IP', 'найденных IP', 'найденных IP'))}`,
   warningMark: 'Предупреждение',
   toggleLabel: (target) => `Правило ${target}`,
   editLabel: (target) => `Изменить правило ${target}`,

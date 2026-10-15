@@ -1,10 +1,17 @@
 import {
+  LEARNED_ROUTE_LIMITS,
+  LIMITS,
   PROTOCOL_LIMITS,
   cidrContains,
+  claimOf,
+  compareClaim,
   forbiddenDestinationReason,
+  isWildcardDomain,
   normalizeHostAddress,
   parseIpv4Destination,
+  wildcardBase,
   type AdapterInfo,
+  type AddressClaim,
   type Config,
   type Destination,
   type DnsWarning,
@@ -25,6 +32,8 @@ import {
   type DnsWarningInput,
   type ServerRoute,
 } from './dns-warnings';
+import type { ClearTimer, SetTimer } from './dns';
+import { createLearnedRoutes } from './learned';
 import type { Logger } from './logger';
 import { toWireInterfaces, type DetectedInterfaces, type InterfaceInfo, type NetInfo } from './netinfo';
 import { isExplicitTarget, planningOrder } from './precedence';
@@ -69,6 +78,28 @@ import type { RouteAddResult, RouteDeleteResult, RouteGetResult, RouteOperations
  *   interfaces (shutdown, uninstall, global toggle off, recovery at start).
  * - socket server: `subscribe`, `getState`, `getConfig`, `setConfig`,
  *   `setEnabled`.
+ * - DNS proxy (wildcard domain rules, ADR-002): `learn` records the addresses
+ *   of an answer and resolves once their routes are in place (or refused).
+ *
+ * An exact domain rule whose name lies under the base of an enabled wildcard
+ * rule (`www.corp.local` under `*.corp.local`, or the base itself) learns too
+ * (ADR-002 §3, TASK-DELTA-30): clients ask the proxy for that name, so the
+ * addresses they get are recorded for the exact rule and routed with its
+ * resolved ones, through its interface, with the same checks, bounds and
+ * lifetimes. Planned with the other exact domain rules, they keep the
+ * `exact-domain` claim; one another rule already routes through another
+ * interface is a `shared-address` warning, never an error.
+ *
+ * Wildcard domain rules (`*.corp.local`) are never resolved: their
+ * destinations are the rule's `dns` server and the addresses `learn` was
+ * given for it (`learned.ts`: lifetime, bounds, least-recently-seen eviction).
+ * They are planned after every other rule, the deeper base first, and lose
+ * every address another rule claims through another interface (shared
+ * `compareClaim`): `overridden-by-rule` against an explicit target or DNS
+ * server, `shared-address` against another domain rule. A `learn` call runs a
+ * light `dns-learned` pass: the interfaces of the last pass, no detection, no
+ * resolver-file sync and no DNS-server lookups; the states of such passes are
+ * announced at most once per `STATE_ANNOUNCE_MIN_INTERVAL_MS`.
  */
 
 /** A route the engine added and has not removed since. */
@@ -161,6 +192,8 @@ export interface RetryNeeds {
   readonly refused: number;
   /** Routes whose last add or delete failed (and that are still wanted, or still applied). */
   readonly failing: number;
+  /** Learned addresses (wildcard rules) whose lifetime is over: the next pass removes their routes. */
+  readonly learnedExpired: number;
 }
 
 /** A route the drift check found missing from the table, or no longer through our gateway. */
@@ -177,7 +210,9 @@ export interface ReconcileSummary {
   /**
    * Routes of ours that are gone from the table: deleted, or already absent.
    * A route that was forgotten because the entry at its destination is no
-   * longer ours is not counted here (nothing was removed).
+   * longer ours is not counted here (nothing was removed). Includes the routes
+   * a `clear()` removed since the previous pass (the global toggle turned off
+   * clears first and then reconciles with `enabled-change`).
    */
   readonly removed: number;
   /** Route commands that failed, were refused or threw. */
@@ -228,6 +263,13 @@ export interface ClearOptions {
    * at once with the current state, so nothing adds a route after the cleanup.
    */
   readonly final?: boolean | undefined;
+  /**
+   * Runs inside the clear's exclusive slot (no pass runs or can start), before
+   * the first route is deleted: what must go before the routes, such as the
+   * resolver files and the DNS proxy (a pass could otherwise write a file
+   * back in between). A rejection is logged; the routes are removed anyway.
+   */
+  readonly beforeRoutes?: (() => Promise<void>) | undefined;
 }
 
 export interface RestoreResult {
@@ -270,14 +312,77 @@ export interface EngineDeps {
    * config, once per pass, before the plan; the result's problems make the
    * rules `error`. The daemon passes `resolverFiles.sync`. A throw or a
    * rejection is logged and makes every rule that needs a file `error` /
-   * `resolver-failed`.
+   * `resolver-failed`. The second argument tells the daemon the DNS servers
+   * the pass knows for each role, which its DNS proxy forwards wildcard names
+   * to (ADR-002 §2); the state of that proxy is the daemon's own.
    */
-  readonly syncResolvers?: ((config: Config) => ResolverSync | Promise<ResolverSync>) | undefined;
+  readonly syncResolvers?: ((config: Config, context: ResolverSyncContext) => ResolverSync | Promise<ResolverSync>) | undefined;
+  /** Monotonic clock (ms) for the state announcements of `dns-learned` passes; defaults to `performance.now`. */
+  readonly monotonicNow?: (() => number) | undefined;
+  /** Timers for the coalesced announcements and the wait bound of `learn`; default to `setTimeout` / `clearTimeout`. */
+  readonly setTimer?: SetTimer | undefined;
+  readonly clearTimer?: ClearTimer | undefined;
 }
 
-/** What `EngineDeps.syncResolvers` reports: rule id -> why its resolver file is not in place. */
+export interface SubscribeOptions {
+  /**
+   * Be told about every pass at once. Without it the states of `dns-learned`
+   * passes are coalesced: at most one per `STATE_ANNOUNCE_MIN_INTERVAL_MS`,
+   * always the latest. The network monitor needs every pass end.
+   */
+  readonly everyPass?: boolean | undefined;
+}
+
+export interface LearnOptions {
+  /** How long `learn` waits for the routes at most (ms); defaults to `LEARN_WAIT_MAX_MS`. */
+  readonly waitMs?: number | undefined;
+}
+
+/**
+ * Why `learn` recorded nothing:
+ * - `not-learning`      — no enabled rule with that id that learns (a wildcard rule, or an exact
+ *                         domain rule under an enabled wildcard's base), or routing is off;
+ * - `interface-down`    — the rule's interface was not routable in the last trusted detection
+ *                         (or there was none yet);
+ * - `no-usable-address` — every address was refused by the checks;
+ * - `shut-down`         — the engine has shut down.
+ */
+export type LearnIgnoredReason = 'not-learning' | 'interface-down' | 'no-usable-address' | 'shut-down';
+
+export interface LearnResult {
+  /**
+   * - `ignored`   — nothing was recorded (`reason` says why);
+   * - `refreshed` — every usable address was known already: lifetimes renewed, no pass ran;
+   * - `applied`   — a pass ran for the new addresses and has finished;
+   * - `timed-out` — that pass did not finish within the wait; it goes on.
+   */
+  readonly outcome: 'ignored' | 'refreshed' | 'applied' | 'timed-out';
+  readonly reason: LearnIgnoredReason | null;
+  /** Addresses that passed the checks and were recorded. */
+  readonly accepted: number;
+  /** Addresses refused: not a strict IPv4 address, forbidden (ADR-001), a DNS server, or in the way of a connected network. */
+  readonly rejected: number;
+  /** Accepted addresses that are routed on behalf of the rule when `learn` resolves. */
+  readonly routed: number;
+}
+
+/**
+ * What `EngineDeps.syncResolvers` reports: rule id -> why its resolver file is
+ * not in place. A `pending` issue makes the rule `pending` (it waits, e.g. for
+ * the DNS proxy to start); any other makes it `error`.
+ */
 export interface ResolverSync {
-  readonly issues: ReadonlyMap<string, { readonly reasonCode: RuleReasonCode; readonly reason: string }>;
+  readonly issues: ReadonlyMap<string, { readonly reasonCode: RuleReasonCode; readonly reason: string; readonly pending?: boolean | undefined }>;
+}
+
+/** What a pass knows when it syncs the resolver files. */
+export interface ResolverSyncContext {
+  /**
+   * DNS servers of each role's interface from the last trusted detection
+   * (the servers a domain rule without `dns` asks); a role is missing while
+   * they are not known.
+   */
+  readonly roleDnsServers: Readonly<Partial<Record<IfaceRole, readonly string[]>>>;
 }
 
 export interface Engine {
@@ -308,8 +413,11 @@ export interface Engine {
   setConfig(config: Config): boolean;
   /** Sets the global toggle; same contract as `setConfig`, followed by `reconcile('enabled-change')`. */
   setEnabled(enabled: boolean): boolean;
-  /** Registers a listener for every computed state; returns the function that removes it. */
-  subscribe(listener: StateListener): () => void;
+  /**
+   * Registers a listener for the computed states (see `SubscribeOptions` for
+   * `dns-learned` passes); returns the function that removes it.
+   */
+  subscribe(listener: StateListener, options?: SubscribeOptions): () => void;
   getApplied(): readonly AppliedRoute[];
   /**
    * Forgets applied routes the routing table no longer has as we added them
@@ -325,9 +433,23 @@ export interface Engine {
   /** What a periodic pass could make progress on; the monitor reads it every drift check. */
   getRetryNeeds(): RetryNeeds;
   /**
+   * Records the addresses a DNS answer gave for a name that rule `ruleId`
+   * owns (the proxy has matched it: a wildcard rule, or an exact domain rule
+   * under an enabled wildcard's base) and routes the new ones. Each
+   * address passes the strict IPv4 parse, ADR-001, the DNS-server exclusion
+   * and the connected-subnet guard first; it then lives for `ttlSec` clamped
+   * to `LEARNED_ROUTE_LIMITS`. Nothing happens for a rule that does not
+   * learn (`learnsFromProxy`) or is disabled, while routing is off, or while the rule's interface
+   * is not routable. When something new is to be routed a `dns-learned` pass
+   * runs (queued like any `reconcile`) and the promise resolves when it has
+   * finished, or after `waitMs` at the latest (`timed-out`; the pass goes on).
+   * Never rejects.
+   */
+  learn(ruleId: string, addresses: readonly string[], ttlSec: number, options?: LearnOptions): Promise<LearnResult>;
+  /**
    * Removes every applied route through `routes.routeDelete` (which checks the
    * table entry first and deletes only our own route), at most
-   * `CLEAR_CONCURRENCY` at a time. Runs no interface detection and never
+   * `CLEAR_CONCURRENCY` at a time, and forgets every learned address. Runs no interface detection and never
    * adds. Waits for a running pass and keeps the next one waiting until it is
    * done. Routes whose delete fails stay applied. Publishes a state and tells
    * `onApplied` when something changed. Never rejects.
@@ -406,7 +528,16 @@ export const DNS_LOOKUP_CONCURRENCY = 4;
 export const FAILURE_BACKOFF_AFTER = 3;
 export const FAILURE_BACKOFF_BASE_MS = 60_000;
 export const FAILURE_BACKOFF_MAX_MS = 15 * 60_000;
-const MAX_RESTORED_ROUTES = 500 * PROTOCOL_LIMITS.maxAppliedDestinationsPerRule;
+/**
+ * Every route the engine can hold: each rule with its DNS server and the
+ * addresses of a domain, plus every learned address of the wildcard rules.
+ * Bounds what `restoreApplied` and `state.json` accept.
+ */
+export const MAX_APPLIED_ROUTES = LIMITS.maxRules * (LIMITS.maxIpsPerDomain + 1) + LEARNED_ROUTE_LIMITS.total;
+/** `dns-learned` passes announce their state at most this often (ADR-002 §4). */
+export const STATE_ANNOUNCE_MIN_INTERVAL_MS = 1000;
+/** How long `learn` waits for its routes by default: what the DNS proxy holds an answer back for (ADR-002 §4). */
+export const LEARN_WAIT_MAX_MS = 1500;
 const MAX_RULE_IDS_PER_ROUTE = 500;
 
 const DOWN: InterfaceState = { device: null, ip: null, gateway: null, up: false };
@@ -422,6 +553,8 @@ const NO_INTERFACES: WireInterfaces = { interfaces: { ethernet: DOWN, wifi: DOWN
 interface Issue {
   readonly reasonCode: RuleReasonCode;
   readonly reason: string;
+  /** The rule waits rather than fails (a resolver issue such as a DNS proxy still starting): `pending`, not `error`. */
+  readonly pending?: boolean | undefined;
 }
 
 interface Verdict {
@@ -448,6 +581,13 @@ interface Draft {
    * address of the rule is routed (`overridden-by-rule`).
    */
   readonly overridden: Map<string, string>;
+  /**
+   * Learned addresses (wildcard rule) left to another domain rule on another
+   * interface: the same kind of warning (`shared-address`).
+   */
+  readonly shared: Map<string, string>;
+  /** A wildcard rule: its addresses were learned, not resolved. */
+  readonly learning: boolean;
 }
 
 interface DesiredRoute {
@@ -457,6 +597,8 @@ interface DesiredRoute {
   readonly role: IfaceRole;
   /** Wanted by an `ip` / `subnet` rule, as opposed to only by addresses a domain resolved to. */
   readonly explicit: boolean;
+  /** The claim of the rule that planned it first, the one that owns it (shared `compareClaim`). */
+  readonly claim: AddressClaim;
   readonly ruleIds: string[];
 }
 
@@ -489,6 +631,28 @@ const wireDestination = (destination: Destination): string =>
   destination.isHost ? destination.address : destination.cidr;
 
 const routeKey = (destination: Destination): string => `net:${destination.cidr}`;
+
+/** A wildcard domain rule (`*.corp.local`): its addresses are learned from DNS answers, never resolved. */
+const isWildcardRule = (rule: Pick<Rule, 'kind' | 'target'>): boolean => rule.kind === 'domain' && isWildcardDomain(rule.target);
+
+/**
+ * True when the DNS proxy answers clients for `rule`'s name: a wildcard rule,
+ * or an exact domain rule whose name is the base of an enabled wildcard rule
+ * or lies under it (the proxy's resolver file covers it). Only such a rule
+ * accepts `learn`.
+ */
+const learnsFromProxy = (rule: Pick<Rule, 'kind' | 'target'>, rules: readonly Pick<Rule, 'kind' | 'target' | 'enabled'>[]): boolean => {
+  if (rule.kind !== 'domain') return false;
+  if (isWildcardDomain(rule.target)) return true;
+  return rules.some((other) => {
+    if (!other.enabled || other.kind !== 'domain') return false;
+    const base = wildcardBase(other.target);
+    return base !== null && (rule.target === base || rule.target.endsWith(`.${base}`));
+  });
+};
+
+/** Who owns learned addresses: the rule and its target, so a rule whose target changes starts with none. */
+const learnedOwner = (rule: Pick<Rule, 'id' | 'target'>): string => `${rule.id} ${rule.target}`;
 
 export interface ConnectedConflict {
   readonly role: IfaceRole;
@@ -576,8 +740,17 @@ export const buildEngineState = (input: EngineStateInput): EngineState => {
     }
   }
 
+  // A rule that learns (a wildcard, or an exact name the DNS proxy answers for) lists up to its
+  // learned (and resolved) addresses and DNS server, any other rule up to a domain's worth; all
+  // together never more than the protocol allows (restored routes can name any rule).
+  let room: number = PROTOCOL_LIMITS.maxAppliedDestinations;
   const rules: RuleState[] = input.config.rules.map((rule) => {
     const verdict = input.verdicts.get(rule.id);
+    const cap = learnsFromProxy(rule, input.config.rules)
+      ? PROTOCOL_LIMITS.maxAppliedDestinationsPerRule
+      : LIMITS.maxIpsPerDomain + 1;
+    const appliedDestinations = (owned.get(rule.id) ?? []).slice(0, Math.min(cap, room));
+    room -= appliedDestinations.length;
     return {
       ruleId: rule.id,
       status: verdict?.status ?? 'error',
@@ -588,7 +761,7 @@ export const buildEngineState = (input: EngineStateInput): EngineState => {
           : verdict.reason === null
             ? null
             : clamp(verdict.reason, PROTOCOL_LIMITS.reasonMaxLength),
-      appliedDestinations: owned.get(rule.id) ?? [],
+      appliedDestinations,
       lastResolvedAt: verdict?.lastResolvedAt ?? null,
     };
   });
@@ -666,18 +839,57 @@ const connectedRouteText = (dst: string): string =>
 
 const errorVerdict = (reasonCode: RuleReasonCode, reason: string): Verdict => ({ status: 'error', reasonCode, reason });
 
+const TRUNCATED: Verdict = {
+  status: 'active',
+  reasonCode: 'addresses-truncated',
+  reason: `Learned addresses are limited to ${String(LEARNED_ROUTE_LIMITS.perRule)} per rule and ${String(
+    LEARNED_ROUTE_LIMITS.total,
+  )} in all; the ones seen longest ago were dropped`,
+};
+
+/**
+ * The order rules are planned in: `planningOrder` (explicit rules, then
+ * domain rules, each in config order), with the wildcard rules moved to the
+ * end, strongest claim first (`compareClaim`: deeper base, then config order).
+ * Every address claim a wildcard address loses is then already planned when
+ * it comes. Without wildcard rules this is `planningOrder` itself.
+ */
+const planWithWildcardsLast = (rules: readonly Rule[]): Rule[] => {
+  const order = new Map(rules.map((rule, index) => [rule.id, index]));
+  const claim = (rule: Rule): AddressClaim => claimOf(rule, false, order.get(rule.id) ?? 0);
+  const planned = planningOrder(rules);
+  const wildcards = planned.filter(isWildcardRule).sort((a, b) => compareClaim(claim(a), claim(b)));
+  return [...planned.filter((rule) => !isWildcardRule(rule)), ...wildcards];
+};
+
 export const createEngine = (deps: EngineDeps): Engine => {
   const { netinfo, routes, helperVersion } = deps;
   const logger = deps.logger.child({ component: 'engine' });
   const now = deps.now ?? (() => new Date());
   const resolveDomain = deps.resolveDomain ?? unresolvedDomain;
+  const clock = deps.monotonicNow ?? (() => performance.now());
+  const setTimer: SetTimer = deps.setTimer ?? ((callback, delayMs) => setTimeout(callback, delayMs));
+  const clearTimer: ClearTimer =
+    deps.clearTimer ??
+    ((handle) => {
+      clearTimeout(handle as ReturnType<typeof setTimeout>);
+    });
 
   let config = deps.initialConfig;
   let configRevision = 0;
   let seq = 0;
 
   const applied = new Map<string, AppliedEntry>();
+  /** Told about every state at once (`SubscribeOptions.everyPass`). */
+  const passListeners = new Set<StateListener>();
+  /** Told about every state, those of `dns-learned` passes coalesced. */
   const listeners = new Set<StateListener>();
+  let lastAnnouncedAt: number | null = null;
+  let announceTimer: unknown = null;
+  /** Addresses learned for the wildcard rules (`learn`). */
+  const learned = createLearnedRoutes();
+  /** Routes a `clear()` removed since the last pass: that pass's summary reports them. */
+  let removedOutsidePass = 0;
 
   let wire: WireInterfaces = NO_INTERFACES;
   let degradedStreak = 0;
@@ -774,15 +986,48 @@ export const createEngine = (deps: EngineDeps): Engine => {
     lastReconcileReason: null,
   });
 
-  const publish = (next: EngineState): void => {
-    state = next;
-    for (const listener of listeners) {
+  const deliver = (targets: ReadonlySet<StateListener>, next: EngineState): void => {
+    for (const listener of targets) {
       try {
         listener(next);
       } catch (error) {
         logger.error('state listener failed', { error: describeThrown(error) });
       }
     }
+  };
+
+  const announce = (): void => {
+    if (announceTimer !== null) {
+      clearTimer(announceTimer);
+      announceTimer = null;
+    }
+    lastAnnouncedAt = clock();
+    deliver(listeners, state);
+  };
+
+  /**
+   * Makes `next` the current state. `coalesce` (a `dns-learned` pass): the
+   * coalesced listeners hear of it at most once per
+   * `STATE_ANNOUNCE_MIN_INTERVAL_MS`, then with the latest state; any other
+   * state is announced at once and takes a pending announcement with it.
+   */
+  const publish = (next: EngineState, coalesce = false): void => {
+    state = next;
+    deliver(passListeners, next);
+    if (!coalesce) {
+      announce();
+      return;
+    }
+    if (announceTimer !== null) return;
+    const since = lastAnnouncedAt === null ? Infinity : clock() - lastAnnouncedAt;
+    if (since < 0 || since >= STATE_ANNOUNCE_MIN_INTERVAL_MS) {
+      announce();
+      return;
+    }
+    announceTimer = setTimer(() => {
+      announceTimer = null;
+      announce();
+    }, STATE_ANNOUNCE_MIN_INTERVAL_MS - since);
   };
 
   // -------------------------------------------------------------------------
@@ -855,13 +1100,16 @@ export const createEngine = (deps: EngineDeps): Engine => {
   const safeSyncResolvers = async (snapshot: Config): Promise<ResolverSync['issues']> => {
     if (deps.syncResolvers === undefined) return new Map();
     try {
-      return (await deps.syncResolvers(snapshot)).issues;
+      return (await deps.syncResolvers(snapshot, { roleDnsServers: { ...trustedDns } })).issues;
     } catch (error) {
       const thrown = describeThrown(error);
       logger.error('resolver file sync threw', { error: thrown });
       const failed = { reasonCode: 'resolver-failed' as const, reason: `Resolver files could not be synced: ${thrown}` };
       return new Map(
-        snapshot.rules.filter((rule) => rule.kind === 'domain' && rule.dns !== undefined).map((rule) => [rule.id, failed]),
+        // Every rule that needs a file: an exact one with its own `dns`, and every wildcard one (the proxy's file).
+        snapshot.rules
+          .filter((rule) => rule.kind === 'domain' && (rule.dns !== undefined || isWildcardRule(rule)))
+          .map((rule) => [rule.id, failed]),
       );
     }
   };
@@ -927,8 +1175,12 @@ export const createEngine = (deps: EngineDeps): Engine => {
     detected: DetectedInterfaces | null,
     interfaces: readonly GuardFacts[],
     resolverIssues: ResolverSync['issues'],
+    nowMs: number,
   ): Promise<Plan> => {
     const drafts = new Map<string, Draft>();
+    const order = new Map(snapshot.rules.map((rule, index) => [rule.id, index]));
+    /** Computed once per pass, and only when a wildcard rule needs it. */
+    let excludedForLearned: ReadonlySet<string> | null = null;
     const desired = new Map<string, DesiredRoute>();
     let anyDestination = false;
     const wantedKeys = new Set<string>();
@@ -943,6 +1195,8 @@ export const createEngine = (deps: EngineDeps): Engine => {
         deferred: false,
         routedAnswers: new Set(),
         overridden: new Map(),
+        shared: new Map(),
+        learning: isWildcardRule(rule),
       };
       drafts.set(rule.id, draft);
       return draft;
@@ -952,14 +1206,21 @@ export const createEngine = (deps: EngineDeps): Engine => {
     // destination the user named in an `ip` / `subnet` rule belongs to that
     // rule, and an address a domain happens to resolve to never takes it over.
     // Among themselves, rules keep the config order (the first one wins).
-    const planned = planningOrder(snapshot.rules);
+    // Wildcard rules come last, strongest claim first (`planWithWildcardsLast`).
+    const planned = planWithWildcardsLast(snapshot.rules);
     for (const rule of planned) {
       const disabled = disabledVerdict(snapshot, rule);
       if (disabled !== null) {
         draftOf(rule, disabled);
         continue;
       }
-      if (rule.kind === 'domain') {
+      if (isWildcardRule(rule)) {
+        // Its routes depend on the config and on what was learned, never on the interfaces.
+        for (const target of [...(rule.dns === undefined ? [] : [rule.dns]), ...learned.addressesOf(learnedOwner(rule))]) {
+          const wantedDestination = parseIpv4Destination(target);
+          if (wantedDestination !== null) wantedKeys.add(routeKey(wantedDestination));
+        }
+      } else if (rule.kind === 'domain') {
         wantedDomainRuleIds.add(rule.id);
       } else {
         const wantedDestination = parseIpv4Destination(rule.target);
@@ -990,22 +1251,52 @@ export const createEngine = (deps: EngineDeps): Engine => {
       const { gateway } = info;
 
       let targets: readonly string[] = [rule.target];
+      /** Addresses of an exact domain rule that were learned (from the DNS proxy), not resolved. */
+      let learnedTargets: ReadonlySet<string> = new Set();
       let draft: Draft;
       /** The destination that is the rule's own DNS server: routed like an explicit rule. */
       let serverTarget: string | null = null;
-      if (rule.kind === 'domain') {
+      if (isWildcardRule(rule)) {
+        const owner = learnedOwner(rule);
+        const learnedAt = learned.lastLearnedAt(owner);
+        draft = draftOf(
+          rule,
+          learned.isTruncated(owner, nowMs) ? TRUNCATED : ACTIVE,
+          learnedAt === null ? null : new Date(learnedAt).toISOString(),
+        );
+        serverTarget = rule.dns ?? null;
+        // Checked again here: the DNS servers known now may differ from those when the address was learned.
+        excludedForLearned ??= new Set(excludedServers());
+        const excluded = excludedForLearned;
+        const answers = learned.addressesOf(owner).filter((target) => target !== serverTarget && !excluded.has(target));
+        targets = [...(serverTarget === null ? [] : [serverTarget]), ...answers];
+      } else if (rule.kind === 'domain') {
         if (rule.dns === undefined) noteOutsideDns(rule.iface, info);
         const resolved = await safeResolve(rule);
         const reasonCode = resolved.reasonCode ?? (resolved.status === 'active' ? null : 'internal');
-        draft = draftOf(rule, { status: resolved.status, reasonCode, reason: resolved.reason }, resolved.lastResolvedAt);
+        const owner = learnedOwner(rule);
+        const learning = learnsFromProxy(rule, snapshot.rules);
+        const truncated = learning && resolved.status === 'active' && reasonCode === null && learned.isTruncated(owner, nowMs);
+        draft = draftOf(
+          rule,
+          truncated ? TRUNCATED : { status: resolved.status, reasonCode, reason: resolved.reason },
+          resolved.lastResolvedAt,
+        );
         // The rule's own server goes first: its route is what lets the lookups (and the
         // resolver file) reach it. The resolver never returns it among the destinations.
         serverTarget = rule.dns ?? null;
         const answers = resolved.destinations.filter((target) => target !== serverTarget);
-        targets = [...(serverTarget === null ? [] : [serverTarget]), ...answers].slice(
-          0,
-          PROTOCOL_LIMITS.maxAppliedDestinationsPerRule,
-        );
+        targets = [...(serverTarget === null ? [] : [serverTarget]), ...answers].slice(0, LIMITS.maxIpsPerDomain + 1);
+        if (learning) {
+          // What the DNS proxy gave clients for this name (ADR-002 §3): routed with the resolved
+          // addresses, checked again like a wildcard's (the DNS servers known now may differ).
+          excludedForLearned ??= new Set(excludedServers());
+          const excluded = excludedForLearned;
+          const planned = new Set(targets);
+          const extra = learned.addressesOf(owner).filter((target) => !planned.has(target) && target !== serverTarget && !excluded.has(target));
+          learnedTargets = new Set(extra);
+          targets = [...targets, ...extra];
+        }
       } else {
         draft = draftOf(rule, ACTIVE);
       }
@@ -1025,6 +1316,10 @@ export const createEngine = (deps: EngineDeps): Engine => {
         anyDestination = true;
         const conflict = findConnectedConflict(destination, interfaces);
         if (conflict !== null && target === serverTarget && conflict.role === rule.iface) continue;
+        // A learned address is one of many, refused when it was learned with the facts of then:
+        // one that is in the way now is left out without failing the rule.
+        const isLearned = draft.learning ? target !== serverTarget : learnedTargets.has(target);
+        if (conflict !== null && isLearned) continue;
         if (conflict !== null) {
           recordIssue(draft, 'connected-network', `${dst} ${CONFLICT_TEXT[conflict.kind]} (${conflict.role})`);
           continue;
@@ -1032,9 +1327,10 @@ export const createEngine = (deps: EngineDeps): Engine => {
         const key = routeKey(destination);
         const existing = desired.get(key);
         const explicit = isExplicitTarget(rule, target);
+        const claim = claimOf(rule, explicit, order.get(rule.id) ?? 0);
         const isAnswer = rule.kind === 'domain' && target !== serverTarget;
         if (existing === undefined) {
-          desired.set(key, { key, dst, gateway, role: rule.iface, explicit, ruleIds: [rule.id] });
+          desired.set(key, { key, dst, gateway, role: rule.iface, explicit, claim, ruleIds: [rule.id] });
           if (isAnswer) draft.routedAnswers.add(key);
         } else if (existing.gateway === gateway) {
           if (!existing.ruleIds.includes(rule.id)) existing.ruleIds.push(rule.id);
@@ -1042,7 +1338,7 @@ export const createEngine = (deps: EngineDeps): Engine => {
         } else if (explicit && !existing.explicit) {
           // Only a rule's own DNS server gets here (explicit rules are planned before every domain
           // rule): it takes the destination over from the addresses other domains resolved to.
-          desired.set(key, { key, dst, gateway, role: rule.iface, explicit, ruleIds: [rule.id] });
+          desired.set(key, { key, dst, gateway, role: rule.iface, explicit, claim, ruleIds: [rule.id] });
           for (const ruleId of existing.ruleIds) {
             const owner = drafts.get(ruleId);
             owner?.routedAnswers.delete(key);
@@ -1056,6 +1352,14 @@ export const createEngine = (deps: EngineDeps): Engine => {
             key,
             `${dst} is routed through the ${existing.role} interface by an explicit rule, which takes precedence over a resolved address`,
           );
+        } else if (isLearned && compareClaim(existing.claim, claim) < 0) {
+          // A learned address another domain rule claims through another interface. Wildcard rules
+          // are planned last, deeper first, so the claim already planned is always the stronger one;
+          // an exact rule's learned address loses only to an exact rule planned before it.
+          draft.shared.set(
+            key,
+            `${dst} is routed through the ${existing.role} interface for another domain rule, which takes precedence over a learned address`,
+          );
         } else {
           recordIssue(draft, 'route-failed', `${dst} is already routed through the ${existing.role} interface by another rule`);
         }
@@ -1066,7 +1370,9 @@ export const createEngine = (deps: EngineDeps): Engine => {
     // and also while its interface is down: the file does not depend on the interface.
     for (const [ruleId, issue] of resolverIssues) {
       const draft = drafts.get(ruleId);
-      if (draft !== undefined && draft.base.status !== 'disabled') draft.issue = { reasonCode: issue.reasonCode, reason: issue.reason };
+      if (draft !== undefined && draft.base.status !== 'disabled') {
+        draft.issue = { reasonCode: issue.reasonCode, reason: issue.reason, ...(issue.pending === true ? { pending: true } : {}) };
+      }
     }
 
     // Only a clean detection can say "this interface really has no known subnet".
@@ -1344,7 +1650,7 @@ export const createEngine = (deps: EngineDeps): Engine => {
       if (issue === null) continue;
       const signature = `${issue.reasonCode}|${issue.reason}`;
       next.set(ruleId, signature);
-      logger.log(reportedIssues.get(ruleId) === signature ? 'debug' : 'warn', 'rule cannot be applied', {
+      logger.log(reportedIssues.get(ruleId) === signature ? 'debug' : issue.pending === true ? 'info' : 'warn', 'rule cannot be applied', {
         reason,
         ruleId,
         target: rule.target,
@@ -1358,19 +1664,30 @@ export const createEngine = (deps: EngineDeps): Engine => {
 
   /**
    * `active` + `overridden-by-rule` for a working domain rule some of whose
-   * resolved addresses another rule routes; `null` when that does not apply.
+   * resolved (or learned) addresses an explicit rule or a DNS server route,
+   * `active` + `shared-address` for a working wildcard rule some of whose
+   * learned addresses another domain rule routes; `null` when neither applies.
    * Its warnings keep their order of precedence: `overridden-by-rule` first,
-   * then what the resolver reported (`dns-server-excluded`,
-   * `addresses-truncated`), all counted in `reason`.
+   * then `shared-address`, then what the resolver reported
+   * (`dns-server-excluded`, `addresses-truncated`), all counted in `reason`.
    */
   const partlyApplied = (draft: Draft): Verdict | null => {
-    if (draft.base.status !== 'active' || draft.overridden.size === 0 || draft.routedAnswers.size === 0) return null;
-    const count = draft.overridden.size;
-    const own = `${String(count)} resolved ${count === 1 ? 'address is' : 'addresses are'} routed by another rule, which takes precedence`;
+    if (draft.base.status !== 'active' || draft.routedAnswers.size === 0) return null;
+    if (draft.overridden.size === 0 && draft.shared.size === 0) return null;
+    const noun = draft.learning ? 'learned' : 'resolved';
+    const counted = (count: number, text: string): string =>
+      `${String(count)} ${noun} ${count === 1 ? 'address is' : 'addresses are'} ${text}`;
+    const parts = [
+      ...(draft.overridden.size === 0 ? [] : [counted(draft.overridden.size, 'routed by another rule, which takes precedence')]),
+      ...(draft.shared.size === 0
+        ? []
+        : [counted(draft.shared.size, 'routed through the other interface for another domain rule, which takes precedence')]),
+      ...(draft.base.reason === null ? [] : [draft.base.reason]),
+    ];
     return {
       status: 'active',
-      reasonCode: 'overridden-by-rule',
-      reason: draft.base.reason === null ? own : `${own}; ${draft.base.reason}`,
+      reasonCode: draft.overridden.size > 0 ? 'overridden-by-rule' : 'shared-address',
+      reason: parts.join('; '),
     };
   };
 
@@ -1384,8 +1701,8 @@ export const createEngine = (deps: EngineDeps): Engine => {
     const next = new Map<string, string>();
     for (const [ruleId, draft] of drafts) {
       const verdict = published(draft);
-      // Only an `active` verdict carries this code (`partlyApplied`).
-      if (verdict.reasonCode !== 'overridden-by-rule') continue;
+      // Only an `active` verdict carries these codes (`partlyApplied`).
+      if (verdict.reasonCode !== 'overridden-by-rule' && verdict.reasonCode !== 'shared-address') continue;
       const signature = `${verdict.reasonCode}|${String(verdict.reason)}`;
       next.set(ruleId, signature);
       logger.log(reportedWarnings.get(ruleId) === signature ? 'debug' : 'info', 'rule partly applied', {
@@ -1395,6 +1712,7 @@ export const createEngine = (deps: EngineDeps): Engine => {
         iface: draft.rule.iface,
         reasonCode: verdict.reasonCode,
         overridden: draft.overridden.size,
+        ...(draft.shared.size === 0 ? {} : { shared: draft.shared.size }),
         routed: draft.routedAnswers.size,
         detail: verdict.reason,
       });
@@ -1571,12 +1889,29 @@ export const createEngine = (deps: EngineDeps): Engine => {
     return { mode: 'hold', retry: degradedStreak };
   };
 
-  const pass = async (reason: ReconcileReason, force: boolean, retryRefused: boolean): Promise<ReconcileOutcome> => {
-    const startedAt = now().getTime();
-    // One consistent view for the whole pass: `setConfig` replaces the object, it never mutates it.
-    const snapshot = config;
-    const revision = configRevision;
+  /** What a full pass found out about the interfaces and the resolver files; a light pass reuses it. */
+  interface PassView {
+    readonly detected: DetectedInterfaces | null;
+    readonly mode: PassMode;
+    readonly allowAdds: boolean;
+    readonly guardInterfaces: readonly GuardFacts[];
+    /** The guard-relevant facts of the detection, as one comparable string (`applyDiff`). */
+    readonly facts: string;
+    readonly resolverIssues: ResolverSync['issues'];
+    /** `configRevision` the pass ran with. */
+    readonly revision: number;
+  }
 
+  /** The view of the last full pass. */
+  let lastView: PassView | null = null;
+
+  /** Detection, its classification and the resolver files: the part of a pass a `dns-learned` pass skips. */
+  const fullView = async (
+    snapshot: Config,
+    revision: number,
+    reason: ReconcileReason,
+    force: boolean,
+  ): Promise<{ view: PassView; retry: number | null }> => {
     // Wanted for every enabled domain rule, also one with its own `dns`: the
     // servers of the interfaces must be known to keep them out of its answers.
     const wantDns = snapshot.enabled && snapshot.rules.some((rule) => rule.enabled && rule.kind === 'domain');
@@ -1597,22 +1932,53 @@ export const createEngine = (deps: EngineDeps): Engine => {
 
     // The files depend on the config only, so they are kept in line whatever the detection is like.
     const resolverIssues = await safeSyncResolvers(snapshot);
-    const plan = await buildPlan(snapshot, detected, guardInterfaces, resolverIssues);
-    const counters = await applyDiff(plan, mode, allowAdds, reason, JSON.stringify(current), retryRefused);
+    const view: PassView = {
+      detected,
+      mode,
+      allowAdds,
+      guardInterfaces,
+      facts: JSON.stringify(current),
+      resolverIssues,
+      revision,
+    };
+    lastView = view;
+    return { view, retry };
+  };
+
+  const pass = async (reason: ReconcileReason, force: boolean, retryRefused: boolean): Promise<ReconcileOutcome> => {
+    const startedAt = now().getTime();
+    // One consistent view for the whole pass: `setConfig` replaces the object, it never mutates it.
+    const snapshot = config;
+    const revision = configRevision;
+
+    // A `dns-learned` pass is light: it plans with the interfaces and resolver files of the last
+    // full pass, as long as that pass ran with this very config. Otherwise it is a full pass.
+    const reused = reason === 'dns-learned' && lastView !== null && lastView.revision === revision ? lastView : null;
+    const { view, retry } = reused === null ? await fullView(snapshot, revision, reason, force) : { view: reused, retry: null };
+    const { detected, mode } = view;
+
+    const expired = learned.expire(startedAt);
+    if (expired.length > 0) logger.debug('learned addresses expired', { reason, expired: expired.length });
+    const plan = await buildPlan(snapshot, detected, view.guardInterfaces, view.resolverIssues, startedAt);
+    const counters = await applyDiff(plan, mode, view.allowAdds, reason, view.facts, reused === null && retryRefused);
     lastDeferred = counters.deferred;
     const owning = new Set([...applied.values()].flatMap((entry) => entry.ruleIds));
     const verdictOf = (draft: Draft): Verdict => {
-      if (draft.issue !== null) return errorVerdict(draft.issue.reasonCode, draft.issue.reason);
+      if (draft.issue !== null) {
+        return draft.issue.pending === true
+          ? { status: 'pending', reasonCode: draft.issue.reasonCode, reason: draft.issue.reason }
+          : errorVerdict(draft.issue.reasonCode, draft.issue.reason);
+      }
       // A rule that already has routes keeps its status; one with nothing applied waits.
       // A rule that is waiting anyway (a domain still resolving) keeps its own reason.
       if (draft.deferred && !owning.has(draft.rule.id) && draft.base.status !== 'pending') return DEFERRED;
       return partlyApplied(draft) ?? draft.base;
     };
 
-    // Resolved addresses left to other rules are a warning only while some address of the rule is
-    // routed; with none left the rule does not work at all, as before.
+    // Resolved (or learned) addresses left to other rules are a warning only while some address of
+    // the rule is routed; with none left the rule does not work at all, as before.
     for (const draft of plan.drafts.values()) {
-      const [first] = draft.overridden.values();
+      const [first] = [...draft.overridden.values(), ...draft.shared.values()];
       if (first !== undefined && draft.routedAnswers.size === 0) recordIssue(draft, 'route-failed', first);
     }
     logRuleIssues(plan.drafts, reason);
@@ -1622,7 +1988,7 @@ export const createEngine = (deps: EngineDeps): Engine => {
       await notifyApplied();
     }
     if (retry !== null) requestRetry(reason, retry);
-    if (mode === 'normal' && detected !== null) await updateDnsWarnings(detected, snapshot, reason);
+    if (reused === null && mode === 'normal' && detected !== null) await updateDnsWarnings(detected, snapshot, reason);
 
     const finishedAt = now();
     seq += 1;
@@ -1649,22 +2015,25 @@ export const createEngine = (deps: EngineDeps): Engine => {
 
     const summary: ReconcileSummary = {
       added: counters.added,
-      removed: counters.removed,
+      removed: counters.removed + removedOutsidePass,
       failed: counters.failed,
       kept: counters.kept,
       deferred: counters.deferred,
     };
-    logger.info('reconcile finished', {
+    removedOutsidePass = 0;
+    // A light pass runs for every DNS answer with something new: said at `debug`.
+    logger.log(reused === null ? 'info' : 'debug', 'reconcile finished', {
       reason,
       ...summary,
       mode,
+      ...(reused === null ? {} : { light: true }),
       rules: snapshot.rules.length,
       applied: applied.size,
       retryRequested: retry !== null,
       seq,
       durationMs: Math.max(0, finishedAt.getTime() - startedAt),
     });
-    publish(next);
+    publish(next, reason === 'dns-learned');
     return { state: next, retryRequested: retry !== null, summary };
   };
 
@@ -1789,6 +2158,10 @@ export const createEngine = (deps: EngineDeps): Engine => {
     }
     if (queued === null) {
       queued = newPending(reason, force, retryRefused);
+    } else if (reason === 'dns-learned') {
+      // Any queued pass plans the learned addresses too; a light reason never replaces a full one.
+      queued.retryRefused = queued.retryRefused || retryRefused;
+      queued.force = queued.force || force;
     } else {
       // The merged pass runs with the latest reason; an event reason it replaces keeps its
       // urgency: refused and backed-off commands are still tried in that pass.
@@ -1812,11 +2185,28 @@ export const createEngine = (deps: EngineDeps): Engine => {
     }
   };
 
+  /**
+   * Forgets at once what was learned for a rule that is gone, disabled, no
+   * longer learns (`learnsFromProxy`: no wildcard, or no enabled wildcard
+   * base over an exact name any more) or has another target, and everything
+   * while routing is off; the pass that follows the change removes the routes.
+   */
+  const pruneLearned = (): void => {
+    const owners = new Set(
+      config.enabled
+        ? config.rules.filter((rule) => rule.enabled && learnsFromProxy(rule, config.rules)).map(learnedOwner)
+        : [],
+    );
+    const dropped = learned.retain((owner) => owners.has(owner));
+    if (dropped > 0) logger.info('learned addresses forgotten after a config change', { dropped });
+  };
+
   const setConfig = (next: Config): boolean => {
     if (JSON.stringify(next) === JSON.stringify(config)) return false;
     config = next;
     configRevision += 1;
     logger.info('config replaced', { configRevision, rules: next.rules.length, enabled: next.enabled });
+    pruneLearned();
     notifyConfigChanged();
     return true;
   };
@@ -1826,6 +2216,7 @@ export const createEngine = (deps: EngineDeps): Engine => {
     config = { ...config, enabled };
     configRevision += 1;
     logger.info('global toggle changed', { configRevision, enabled });
+    pruneLearned();
     notifyConfigChanged();
     return true;
   };
@@ -1895,6 +2286,9 @@ export const createEngine = (deps: EngineDeps): Engine => {
   const runClear = async (): Promise<ClearResult> => {
     const startedAt = now().getTime();
     const counts = { removed: 0, forgotten: 0, failed: 0 };
+    // Nothing learned outlives a cleanup: the next query teaches it again (ADR-002 §4).
+    const forgottenLearned = learned.clear();
+    if (forgottenLearned > 0) logger.info('learned addresses forgotten', { reason: 'cleanup', dropped: forgottenLearned });
     const work = [...applied];
     let next = 0;
     const worker = async (): Promise<void> => {
@@ -1908,6 +2302,7 @@ export const createEngine = (deps: EngineDeps): Engine => {
     await Promise.all(Array.from({ length: Math.min(CLEAR_CONCURRENCY, work.length) }, worker));
     refusedAdds.clear();
     failing.clear();
+    removedOutsidePass += counts.removed;
     if (counts.removed + counts.forgotten > 0 || appliedDirty) {
       appliedDirty = false;
       await notifyApplied();
@@ -1957,6 +2352,13 @@ export const createEngine = (deps: EngineDeps): Engine => {
     }
     running = true;
     try {
+      if (options?.beforeRoutes !== undefined) {
+        try {
+          await options.beforeRoutes();
+        } catch (error) {
+          logger.error('the step before clearing the routes failed', { error: describeThrown(error) });
+        }
+      }
       return await runClear();
     } catch (error) {
       logger.error('clearing the applied routes failed unexpectedly', { error: describeThrown(error) });
@@ -1992,7 +2394,7 @@ export const createEngine = (deps: EngineDeps): Engine => {
         hop === null ||
         !hop.ok ||
         applied.has(key) ||
-        applied.size >= MAX_RESTORED_ROUTES
+        applied.size >= MAX_APPLIED_ROUTES
       ) {
         dropped += 1;
         continue;
@@ -2011,23 +2413,147 @@ export const createEngine = (deps: EngineDeps): Engine => {
     return { restored: accepted, dropped };
   };
 
+  // -------------------------------------------------------------------------
+  // Learned addresses (wildcard rules, ADR-002 §4)
+  // -------------------------------------------------------------------------
+
+  const ignored = (reason: LearnIgnoredReason, rejected = 0): LearnResult => ({
+    outcome: 'ignored',
+    reason,
+    accepted: 0,
+    rejected,
+    routed: 0,
+  });
+
+  /** Accepted addresses routed on behalf of the rule right now. */
+  const routedFor = (ruleId: string, addresses: readonly string[]): number =>
+    addresses.filter((address) => {
+      const destination = parseIpv4Destination(address);
+      return destination !== null && (applied.get(routeKey(destination))?.ruleIds.includes(ruleId) ?? false);
+    }).length;
+
+  /** The synchronous part of `learn`: checks, records, and says whether a pass has to run. */
+  const record = (
+    ruleId: string,
+    addresses: readonly string[],
+    ttlSec: number,
+  ): { readonly result: LearnResult } | { readonly ruleId: string; readonly accepted: readonly string[]; readonly rejected: number } => {
+    if (shutDown) return { result: ignored('shut-down') };
+    const rule = config.enabled ? config.rules.find((candidate) => candidate.id === ruleId) : undefined;
+    if (rule === undefined || !rule.enabled || !learnsFromProxy(rule, config.rules)) return { result: ignored('not-learning') };
+    // The last trusted detection decides: an interface that is not routable gets nothing.
+    const view = lastView;
+    const info = view !== null && view.mode === 'normal' && view.detected !== null ? view.detected[rule.iface] : null;
+    if (info === null || !info.routable || info.gateway === null) return { result: ignored('interface-down') };
+
+    // Read as untrusted: bounded, every address checked like a resolved one.
+    const candidates: readonly unknown[] = Array.isArray(addresses) ? addresses.slice(0, LEARNED_ROUTE_LIMITS.perRule) : [];
+    const excluded = new Set(excludedServers());
+    const accepted: string[] = [];
+    let rejected = 0;
+    for (const candidate of candidates) {
+      const normalised = typeof candidate === 'string' ? normalizeHostAddress(candidate) : null;
+      const destination = normalised?.ok === true && normalised.value === candidate ? parseIpv4Destination(candidate) : null;
+      if (
+        destination === null ||
+        typeof candidate !== 'string' ||
+        candidate === rule.dns ||
+        excluded.has(candidate) ||
+        findConnectedConflict(destination, view?.guardInterfaces ?? []) !== null
+      ) {
+        rejected += 1;
+        continue;
+      }
+      accepted.push(candidate);
+    }
+    if (accepted.length === 0) return { result: ignored('no-usable-address', rejected) };
+
+    const owner = learnedOwner(rule);
+    const nowMs = now().getTime();
+    const wasTruncated = learned.isTruncated(owner, nowMs);
+    const outcome = learned.learn(owner, accepted, ttlSec, nowMs);
+    // Names and addresses stay at `debug` (log hygiene, ADR-002 §5).
+    logger.debug('addresses learned', {
+      ruleId,
+      added: outcome.added.length,
+      renewed: outcome.renewed.length,
+      rejected,
+      evicted: outcome.evicted.length,
+    });
+    if (!wasTruncated && learned.isTruncated(owner, nowMs)) {
+      logger.info('learned addresses reached their limit; the ones seen longest ago are dropped', {
+        ruleId,
+        perRule: LEARNED_ROUTE_LIMITS.perRule,
+        total: LEARNED_ROUTE_LIMITS.total,
+      });
+    }
+    // Room is only ever made for a new address: nothing added, nothing dropped, nothing to route.
+    if (outcome.added.length === 0) {
+      return { result: { outcome: 'refreshed', reason: null, accepted: accepted.length, rejected, routed: routedFor(ruleId, accepted) } };
+    }
+    return { ruleId, accepted, rejected };
+  };
+
+  const learn = async (
+    ruleId: string,
+    addresses: readonly string[],
+    ttlSec: number,
+    options?: LearnOptions,
+  ): Promise<LearnResult> => {
+    let recorded: ReturnType<typeof record>;
+    try {
+      recorded = record(ruleId, addresses, ttlSec);
+    } catch (error) {
+      logger.error('learning addresses failed', { ruleId, error: describeThrown(error) });
+      return ignored('no-usable-address');
+    }
+    if ('result' in recorded) return recorded.result;
+    const { accepted, rejected } = recorded;
+    const settled = (outcome: 'applied' | 'timed-out'): LearnResult => ({
+      outcome,
+      reason: null,
+      accepted: accepted.length,
+      rejected,
+      routed: routedFor(ruleId, accepted),
+    });
+    const waitMs = Math.max(0, options?.waitMs ?? LEARN_WAIT_MAX_MS);
+    const passDone = reconcile('dns-learned');
+    let timer: unknown = null;
+    const timedOut = new Promise<'timed-out'>((resolve) => {
+      timer = setTimer(() => {
+        resolve('timed-out');
+      }, waitMs);
+    });
+    const winner = await Promise.race([passDone.then(() => 'applied' as const), timedOut]);
+    if (timer !== null) clearTimer(timer);
+    if (winner === 'timed-out') logger.debug('learned routes not in place within the wait', { ruleId, waitMs });
+    return settled(winner);
+  };
+
   return {
     reconcile,
+    learn,
     getState: () => state,
     getConfig: () => config,
     getConfigRevision: () => configRevision,
     setConfig,
     setEnabled,
-    subscribe: (listener) => {
-      listeners.add(listener);
+    subscribe: (listener, options) => {
+      const target = options?.everyPass === true ? passListeners : listeners;
+      target.add(listener);
       return () => {
-        listeners.delete(listener);
+        target.delete(listener);
       };
     },
     getApplied: appliedSnapshot,
     forgetApplied,
     isReconciling: () => running,
-    getRetryNeeds: () => ({ deferred: lastDeferred, refused: refusedAdds.size, failing: failing.size }),
+    getRetryNeeds: () => ({
+      deferred: lastDeferred,
+      refused: refusedAdds.size,
+      failing: failing.size,
+      learnedExpired: learned.countExpired(now().getTime()),
+    }),
     clear,
     restoreApplied,
   };

@@ -52,9 +52,28 @@ import { Config, DEVICE_NAME, IfaceRole, LIMITS, findDuplicateIds } from './sche
  * codes (TASK-DELTA-07). `3` — the read-only `diagnose` method,
  * `EngineState.dnsWarnings` (TASK-DELTA-17) and the `rate-limited` / `busy`
  * error codes of `diagnose`'s limits (TASK-DELTA-21; added before 0.2.0
- * shipped, so still `3`) — release 0.2.0.
+ * shipped, so still `3`) — release 0.2.0. `4` — wildcard domain rules
+ * (`*.corp.local`, ADR-002): the `shared-address` and `dns-proxy-unavailable`
+ * rule reason codes and the `dns-learned` reconcile reason
+ * (TASK-DELTA-24) — release 0.3.0.
  */
-export const PROTOCOL_VERSION = 3;
+export const PROTOCOL_VERSION = 4;
+
+/**
+ * Bounds of the routes the helper learns for wildcard domain rules from the
+ * DNS answers its proxy forwards (ADR-002 §4):
+ * - `perRule` / `total` — learned addresses kept per wildcard rule and for all
+ *   of them together; when full, the one seen longest ago is dropped and the
+ *   rule reports `addresses-truncated`;
+ * - `minTtlSec` / `maxTtlSec` — a learned address lives for the answer's TTL
+ *   clamped to this range, renewed by every answer that carries it again.
+ */
+export const LEARNED_ROUTE_LIMITS = {
+  perRule: 256,
+  total: 4096,
+  minTtlSec: 900,
+  maxTtlSec: 86_400,
+} as const;
 
 /** Size bounds that keep every message serialisable within `MAX_LINE_BYTES`. */
 export const PROTOCOL_LIMITS = {
@@ -64,8 +83,17 @@ export const PROTOCOL_LIMITS = {
   logMessageMaxLength: 2000,
   /** Human-readable `reason` of a rule state. */
   reasonMaxLength: 300,
-  /** `route(8)` destinations reported for one rule: the resolved IPs plus the DNS server route. */
-  maxAppliedDestinationsPerRule: LIMITS.maxIpsPerDomain + 1,
+  /**
+   * `route(8)` destinations reported for one rule: the resolved (or, for a
+   * wildcard rule, learned) IPs plus the DNS server route.
+   */
+  maxAppliedDestinationsPerRule: Math.max(LIMITS.maxIpsPerDomain, LEARNED_ROUTE_LIMITS.perRule) + 1,
+  /**
+   * `appliedDestinations` of all rules of one state together: every rule with
+   * its DNS server and the addresses of a domain, plus every learned address.
+   * Keeps the largest state far below `STRUCTURE_LIMITS.maxNodes`.
+   */
+  maxAppliedDestinations: LIMITS.maxRules * (LIMITS.maxIpsPerDomain + 1) + LEARNED_ROUTE_LIMITS.total,
   /** Network adapters listed in `EngineState.adapters`. */
   maxAdapters: 32,
   /** Hardware port name of an adapter, e.g. `USB 10/100/1000 LAN`. */
@@ -201,13 +229,17 @@ export type RuleStatus = z.infer<typeof RuleStatus>;
  *           gateway or the own address of an interface, so no route is added),
  *           `route-failed` (`route add` failed), `resolver-conflict` (an
  *           `/etc/resolver` file exists that is not ours), `resolver-failed`
- *           (writing the resolver file failed), `internal`.
+ *           (writing the resolver file failed), `dns-proxy-unavailable` (a
+ *           wildcard rule: the helper's DNS proxy cannot listen, so its
+ *           resolver file is not written), `internal`.
  * active:   warnings on a domain rule that works but not for every resolved
  *           address, in this order of precedence (the first that applies is
  *           the code, `reason` counts them all): `overridden-by-rule` (an
  *           address is routed by an explicit `ip` / `/32` rule or as the DNS
  *           server of another rule, through another interface),
- *           `dns-server-excluded` (an address is a DNS server and never
+ *           `shared-address` (a wildcard rule: an address it learned is
+ *           routed for an exact domain rule or a deeper wildcard, through
+ *           another interface; ADR-002 §3), `dns-server-excluded` (an address is a DNS server and never
  *           routed), `addresses-truncated` (more A records than the
  *           per-domain limit). With no address routed at all the rule is
  *           `error`, and any real error wins over a warning.
@@ -229,6 +261,8 @@ export const RULE_REASON_CODES = [
   'addresses-truncated',
   'overridden-by-rule',
   'dns-server-excluded',
+  'shared-address',
+  'dns-proxy-unavailable',
 ] as const;
 export const RuleReasonCode = z.enum(RULE_REASON_CODES);
 export type RuleReasonCode = z.infer<typeof RuleReasonCode>;
@@ -277,6 +311,8 @@ export const RECONCILE_REASONS = [
   'network-change',
   'dns-refresh',
   'drift-check',
+  /** The DNS proxy saw an answer for a wildcard rule and its addresses are being routed (ADR-002 §4). */
+  'dns-learned',
 ] as const;
 export const ReconcileReason = z.enum(RECONCILE_REASONS);
 export type ReconcileReason = z.infer<typeof ReconcileReason>;
@@ -397,6 +433,15 @@ export const EngineState = z
       }
       seenDevices.add(adapter.device);
     });
+    const listed = rules.reduce((sum, rule) => sum + rule.appliedDestinations.length, 0);
+    if (listed > PROTOCOL_LIMITS.maxAppliedDestinations) {
+      ctx.issues.push({
+        code: 'custom',
+        message: `The rules list ${String(listed)} applied destinations, more than ${String(PROTOCOL_LIMITS.maxAppliedDestinations)}`,
+        input: listed,
+        path: ['rules'],
+      });
+    }
     for (const { first, second } of findDuplicateIds(rules.map((rule) => ({ id: rule.ruleId })))) {
       const ruleId = rules[second]?.ruleId ?? '';
       ctx.issues.push({
@@ -1134,6 +1179,7 @@ const VALIDATION_CODES: Readonly<Record<ValidationCode | 'duplicate-id' | 'iface
   'prefix-too-wide': true,
   'invalid-domain': true,
   'invalid-wildcard': true,
+  'invalid-wildcard-domain': true,
   'invalid-destination': true,
   'default-route': true,
   'this-network': true,

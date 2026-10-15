@@ -12,7 +12,6 @@ import {
   NEW_RULE_FORM,
   ruleInputOf,
   testAddressOf,
-  WILDCARD_TEXT,
   type RuleForm,
 } from './model';
 import { VALIDATION_TEXT } from '../../text';
@@ -48,7 +47,8 @@ describe('checkForm — the rule (shared Rule schema)', () => {
     ['ip', '010.1.1.1', VALIDATION_TEXT['invalid-ipv4']],
     ['domain', '../etc', VALIDATION_TEXT['invalid-domain']],
     ['domain', 'corp.local/x', VALIDATION_TEXT['invalid-domain']],
-    ['domain', '*.corp.local', WILDCARD_TEXT],
+    ['domain', '*.com', VALIDATION_TEXT['invalid-wildcard-domain']],
+    ['domain', 'a.*.corp.local', VALIDATION_TEXT['invalid-wildcard-domain']],
     ['domain', 'Corp.Local', 'Domenni kichik harflarda yozing, masalan corp.local.'],
     ['ip', '', 'Manzilni kiriting.'],
   ] as const)('%s %s is refused and not saved', (kind, target, text) => {
@@ -81,8 +81,8 @@ describe('checkForm — the rule (shared Rule schema)', () => {
   });
 
   it('reports the target even when another field is refused (zod stops before the rule check)', () => {
-    const result = check({ kind: 'domain', target: '*.corp.local', useDns: true, dns: 'x' });
-    expect(result.errors).toEqual({ target: WILDCARD_TEXT, dns: VALIDATION_TEXT['invalid-ipv4'] });
+    const result = check({ kind: 'domain', target: '*.com', useDns: true, dns: 'x' });
+    expect(result.errors).toEqual({ target: VALIDATION_TEXT['invalid-wildcard-domain'], dns: VALIDATION_TEXT['invalid-ipv4'] });
     expect(firstErrorField(result.errors)).toBe('target');
     expect(firstErrorField(check({ kind: 'domain', target: 'corp.local', useDns: true, dns: 'x' }).errors)).toBe('dns');
     expect(firstErrorField({})).toBeNull();
@@ -221,9 +221,41 @@ describe('IP wildcard (TASK-DELTA-15) — the shared normaliser decides, the for
     expect(acceptedValues(form({ kind: 'ip', target: '10.*.1.*' }))).toEqual({ kind: 'ip', target: null, dns: null });
   });
 
-  it('a domain with a * is still the wildcard-domain refusal, not an IP wildcard', () => {
-    expect(check({ kind: 'domain', target: '*.corp.local' }).errors.target).toBe(WILDCARD_TEXT);
-    expect(acceptedValues(form({ kind: 'domain', target: '*.corp.local' })).kind).toBe('domain');
+  it('a domain with a * is a wildcard domain, not an IP wildcard', () => {
+    expect(acceptedValues(form({ kind: 'domain', target: '*.corp.local' }))).toEqual({ kind: 'domain', target: '*.corp.local', dns: null });
+    expect(check({ kind: 'domain', target: '*.corp.local' }).wildcardCidr).toBeNull();
+  });
+
+  it('accepts a wildcard domain (ADR-002): saved as typed, its base named for the hint (TASK-DELTA-29)', () => {
+    for (const [target, base] of [['*.corp.local', 'corp.local'], ['*.a.corp.local', 'a.corp.local'], [' *.corp.local ', 'corp.local']] as const) {
+      const result = check({ kind: 'domain', target, useDns: true, dns: '10.20.0.10' });
+      expect(result.errors, target).toEqual({});
+      expect(result.rule).toMatchObject({ kind: 'domain', target: target.trim(), dns: '10.20.0.10' });
+      expect(result.wildcardBase).toBe(base);
+      expect(result.normalisedTarget).toBeNull();
+    }
+    expect(check({ kind: 'domain', target: 'corp.local' }).wildcardBase).toBeNull();
+    // The base is named only for a valid wildcard, and only under "Domen".
+    expect(check({ kind: 'domain', target: '*.com' }).wildcardBase).toBeNull();
+    expect(check({ kind: 'ip', target: '10.*.*.*' }).wildcardBase).toBeNull();
+  });
+
+  it('refuses every malformed domain wildcard with the shared code, never rewriting it', () => {
+    for (const target of ['*.com', 'a.*.corp.local', '*', '*.', '**.corp.local', '*corp.local', '*.Corp.local', '*.corp.local.', '*.*.corp.local']) {
+      const result = check({ kind: 'domain', target });
+      expect(result.errors.target, target).toBe(VALIDATION_TEXT['invalid-wildcard-domain']);
+      expect(result.rule).toBeNull();
+      expect(result.wildcardBase).toBeNull();
+    }
+  });
+
+  it('a wildcard bound to the other interface by the same wildcard is refused; the exact base is a different rule', () => {
+    const wildcard = { id: '88888888-8888-4888-8888-888888888888', enabled: true, kind: 'domain', target: '*.corp.local', iface: 'wifi', refreshSec: 600 } as const;
+    const config: Config = { ...CONFIG, rules: [...CONFIG.rules, wildcard] };
+    expect(check({ kind: 'domain', target: '*.corp.local', iface: 'ethernet' }, config).errors.target).toContain('*.corp.local');
+    expect(check({ kind: 'domain', target: '*.corp.local', iface: 'wifi' }, config).sameAs).toBe('*.corp.local');
+    const exact = check({ kind: 'domain', target: 'corp.local', iface: 'ethernet' }, config);
+    expect(exact.errors.target === undefined || !exact.errors.target.includes('*.corp.local')).toBe(true);
   });
 });
 
@@ -247,6 +279,17 @@ describe('commandPreview', () => {
     expect(commandPreview('domain', 'corp.local', '10.20.0.10', 'ethernet', interfaces)).toEqual({
       lines: ['$ route -n add -host <resolve(corp.local)> 10.20.4.1', '$ route -n add -host 10.20.0.10 10.20.4.1'],
       note: "Har bir resolve qilingan IP uchun; DNS server — o'z tarmog'ida bo'lmasa.",
+    });
+  });
+
+  it('a wildcard domain: no route ahead, a note instead; its DNS server is still routed (ADR-002)', () => {
+    expect(commandPreview('domain', '*.corp.local', null, 'ethernet', interfaces)).toEqual({
+      lines: [],
+      note: "Route'lar oldindan qo'yilmaydi: subdomen so'ralganda javobdagi har IP uchun qo'yiladi.",
+    });
+    expect(commandPreview('domain', '*.corp.local', '10.20.0.10', 'wifi', interfaces)).toEqual({
+      lines: ['$ route -n add -host 10.20.0.10 192.168.0.1'],
+      note: "Subdomenlar route'i so'rov bo'yicha qo'yiladi; DNS server route'i — darhol.",
     });
   });
 
