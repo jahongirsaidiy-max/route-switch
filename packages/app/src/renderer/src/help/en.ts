@@ -124,16 +124,14 @@ export const helpEn: HelpDoc = {
           ' itself — add a separate rule for that.',
         ),
         p(
-          'Subdomains are not known in advance, so routes are added on lookup: a DNS proxy inside the helper (loopback, port ',
-          code('954'),
-          ') sees the answer and adds a route for each of its IPs before the answer reaches the app. The ',
+          'Subdomains are not known in advance, so routes are added on lookup: a DNS proxy inside the helper (on loopback) sees the answer and adds a route for each of its IPs before the answer reaches the app. The ',
           code('/etc/resolver/corp.local'),
           ' file points lookups at that proxy. With ',
           ui(m.addRule.useDns),
           ' set, lookups are forwarded to that server.',
         ),
         p(
-          'The rules table and the menu bar show how many IPs each wildcard rule has learned. A learned route lives at least 15 minutes and at most a day; up to 256 IPs per rule.',
+          'The rules table and the menu bar show how many IPs each wildcard rule has learned. A learned route lives at least 15 minutes and at most a day; up to 256 IPs per rule and 4096 for all wildcard rules together — when full, the oldest learned IP makes room.',
         ),
         note(
           'Limits: with “Secure DNS” (DNS over HTTPS) turned on in a browser, the browser resolves names itself and the wildcard rule does not apply to it — turn Secure DNS off or add an exception for corp.local. No routes are added for IPv6 addresses.',
@@ -169,7 +167,7 @@ export const helpEn: HelpDoc = {
             code('app.corp.local'),
             ') beats a wildcard (',
             code('*.corp.local'),
-            '); of two wildcards, the deeper one wins. The losing wildcard rule then shows “',
+            '); of two wildcards, the deeper one wins — a name is answered by one rule only. When one IP falls under two rules with different interfaces (two names resolve to the same address), the losing wildcard rule shows “',
             m.ruleReason['shared-address'],
             '”.',
           ],

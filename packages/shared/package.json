@@ -1,6 +1,6 @@
 {
   "name": "@routeswitch/shared",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "license": "MIT",
   "private": true,
   "description": "Types, schemas and IPC protocol shared by the RouteSwitch app and helper",

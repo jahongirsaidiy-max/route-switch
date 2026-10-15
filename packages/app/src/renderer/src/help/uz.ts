@@ -124,16 +124,14 @@ export const helpUz: HelpDoc = {
           " ning o'ziga tegmaydi — u uchun alohida qoida qo'shing.",
         ),
         p(
-          "Subdomenlar oldindan ma'lum emas, shuning uchun route'lar so'rov bo'yicha qo'yiladi: helper ichidagi DNS proxy (loopback, port ",
-          code('954'),
-          ") javobni ko'radi va javobdagi har IP uchun route'ni javob ilovaga qaytishidan oldin qo'yadi. ",
+          "Subdomenlar oldindan ma'lum emas, shuning uchun route'lar so'rov bo'yicha qo'yiladi: helper ichidagi DNS proxy (loopback'da) javobni ko'radi va javobdagi har IP uchun route'ni javob ilovaga qaytishidan oldin qo'yadi. ",
           code('/etc/resolver/corp.local'),
           " fayli shu proxy'ga yo'naltiradi. ",
           ui(m.addRule.useDns),
           " ko'rsatilsa, so'rovlar o'sha serverga uzatiladi.",
         ),
         p(
-          "Qoidalar jadvali va menu bar har wildcard qoida uchun o'rganilgan IP'lar sonini ko'rsatadi. O'rganilgan route kamida 15 daqiqa, ko'pi bilan bir sutka yashaydi; qoida boshiga 256 tagacha IP.",
+          "Qoidalar jadvali va menu bar har wildcard qoida uchun o'rganilgan IP'lar sonini ko'rsatadi. O'rganilgan route kamida 15 daqiqa, ko'pi bilan bir sutka yashaydi; qoida boshiga 256 tagacha, barcha wildcard qoidalarga jami 4096 tagacha IP — to'lsa, eng eski o'rganilgan IP o'rin bo'shatadi.",
         ),
         note(
           "Cheklovlar: brauzerda «Secure DNS» (DNS over HTTPS) yoqilgan bo'lsa, brauzer nomlarni o'zi resolve qiladi va wildcard qoida unga ishlamaydi — corp.local uchun Secure DNS'ni o'chiring yoki istisno qiling. IPv6 manzillarga route qo'yilmaydi.",
@@ -169,7 +167,7 @@ export const helpUz: HelpDoc = {
             code('app.corp.local'),
             ') wildcard\'dan (',
             code('*.corp.local'),
-            ") ustun; ikki wildcard'dan chuqurrog'i yutadi. Yutqazgan wildcard qoidada «",
+            ") ustun; ikki wildcard'dan chuqurrog'i yutadi — nomga faqat bitta qoida javob beradi. Bitta IP interfeyslari har xil ikki qoidaga tushsa (ikki nom bir manzilga resolve bo'lsa), yutqazgan wildcard qoidada «",
             m.ruleReason['shared-address'],
             '» izohi chiqadi.',
           ],

@@ -21,7 +21,14 @@ import { createCommandRunner, createProcessSpawner, type CommandRunner, type Pro
 import { createJsonLinesFileSink, createJsonLinesSink, createLogger, type LineWritable, type LogSink, type Logger } from './logger';
 import { createNetworkMonitor, type NetworkMonitor } from './monitor';
 import { createNetInfo, type NetInfo } from './netinfo';
-import { NO_WILDCARD_PROXY, createResolverFiles, type ResolverFiles, type ResolverFs, type WildcardProxyStatus } from './resolver';
+import {
+  NO_WILDCARD_PROXY,
+  createResolverFiles,
+  type ResolverFiles,
+  type ResolverFs,
+  type ResolverSyncResult,
+  type WildcardProxyStatus,
+} from './resolver';
 import { createRouteOperations, type RouteOperations } from './route';
 import {
   SOCKET_GROUP_GID,
@@ -55,10 +62,11 @@ import { UNINSTALL_REPLY_TIMEOUT_MS, requestUninstall, type UninstallReply } fro
  *    its first enabled wildcard rule and stops it, after their files are
  *    gone, when it loses the last one (`createWildcardProxyControl`);
  * 4. on SIGTERM or SIGINT: close the socket (no event about the cleanup
- *    reaches a client), stop the DNS module, the monitor, then the DNS proxy
- *    (no answer can teach a route any more), then `cleanupAll` (every applied
- *    route and resolver file), and exit. `uninstall` and the global toggle
- *    off stop the proxy before their `cleanupAll` too.
+ *    reaches a client), stop the DNS module and the monitor, then
+ *    `cleanupAll`: every managed resolver file first (no name under a
+ *    wildcard base points at a proxy that is gone), then the DNS proxy (no
+ *    answer can teach a route any more), then every applied route; and exit.
+ *    `uninstall` and the global toggle off take down in the same order.
  * Every change of the applied routes is written to `state.json`, so a crash
  * at any point is cleaned up by step 2 of the next start.
  * A stored config that cannot be loaded no longer stops the daemon: the
@@ -85,7 +93,7 @@ import { UNINSTALL_REPLY_TIMEOUT_MS, requestUninstall, type UninstallReply } fro
  */
 
 /** Version of the helper, reported in `EngineState.helperVersion`. Kept equal to `package.json` by a test. */
-export const HELPER_VERSION = '0.2.0';
+export const HELPER_VERSION = '0.3.0';
 
 export const EXIT_CODES = {
   ok: 0,
@@ -625,10 +633,21 @@ export const cleanupAll = async (
   core: Pick<HelperCore, 'engine' | 'resolverFiles'>,
   store: StateStore,
   logger: Logger,
-  options: { readonly final?: boolean } = {},
+  options: { readonly final?: boolean; readonly stopProxy?: () => Promise<void> } = {},
 ): Promise<CleanupResult> => {
-  const routes = await core.engine.clear({ final: options.final === true });
-  const files = await core.resolverFiles.removeAll();
+  // Inside the engine's exclusive slot (no pass can write a file back): the resolver files first, so no
+  // name under a wildcard base points at the loopback proxy once it is gone; then the proxy (no answer can
+  // teach a route any more); then the routes.
+  const before: { files: ResolverSyncResult | null } = { files: null };
+  const routes = await core.engine.clear({
+    final: options.final === true,
+    beforeRoutes: async () => {
+      before.files = await core.resolverFiles.removeAll();
+      await options.stopProxy?.();
+    },
+  });
+  // `clear` runs the step unless it failed before it; then the files are removed here.
+  const files = before.files ?? (await core.resolverFiles.removeAll());
   const stateSaved = await store.save(core.engine.getApplied());
   const result: CleanupResult = {
     ...routes,
@@ -794,16 +813,14 @@ const runDaemon = async (configPath: string, deps: RunDeps): Promise<number> => 
     started,
     storedConfigProblem: loaded.ok ? null : loaded.code,
     disableAll: async () => {
-      // The proxy first: no answer may teach a route while everything is being removed.
-      await wildcardProxy.stop();
-      return cleanupAll(helper, store, root);
+      // Files, then the proxy, then the routes: no name points at a dead listener, no answer teaches a route.
+      return cleanupAll(helper, store, root, { stopProxy: () => wildcardProxy.stop() });
     },
     uninstall: async () => {
       // No event about the cleanup reaches a client (TASK-002: a cleanup publishes no state).
       stopEvents();
       stopSources();
-      await wildcardProxy.close();
-      const result = await cleanupAll(helper, store, root, { final: true });
+      const result = await cleanupAll(helper, store, root, { final: true, stopProxy: () => wildcardProxy.close() });
       stopSources();
       logger.info('uninstalled: nothing is applied any more; the helper waits to be stopped', { ...result });
       return result;
@@ -869,9 +886,8 @@ const runDaemon = async (configPath: string, deps: RunDeps): Promise<number> => 
     await startup;
     // DNS first (no lookup asks for a pass any more), then the monitor, then the timers of the retries.
     stopSources();
-    // The DNS proxy before the cleanup: no answer can teach a route any more.
-    await wildcardProxy.close();
-    const result = await cleanupAll(helper, store, root, { final: true });
+    // Resolver files, then the DNS proxy, then the routes (`cleanupAll`).
+    const result = await cleanupAll(helper, store, root, { final: true, stopProxy: () => wildcardProxy.close() });
     // Again: a pass the cleanup waited for may have asked for a retry before `stopping` was seen everywhere.
     stopSources();
     return result.failed > 0 || result.resolverFilesFailed > 0 ? EXIT_CODES.ruleError : EXIT_CODES.ok;

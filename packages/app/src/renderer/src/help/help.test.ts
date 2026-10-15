@@ -45,7 +45,9 @@ describe('the Help documents', () => {
       // Rule types and their examples, the IP wildcard, the DNS server field.
       for (const sample of ['10.20.30.40', '10.0.0.0/8', '10.*.*.*', 'corp.local', '10.0.0.53', '/etc/resolver/corp.local']) expect(text).toContain(sample);
       // Wildcard domains (TASK-DELTA-29): subdomains only, Secure DNS bypasses it, IPv6 is not routed.
-      for (const sample of ['*.corp.local', 'app.corp.local', 'Secure DNS', 'IPv6', '954']) expect(text).toContain(sample);
+      for (const sample of ['*.corp.local', 'app.corp.local', 'Secure DNS', 'IPv6', '256', '4096']) expect(text).toContain(sample);
+      // The loopback port is an implementation detail (DELTA-31): not in user-facing text.
+      expect(text).not.toContain('954');
       expect(text).toContain(MESSAGES[locale].ruleReason['shared-address']);
       // "Default" and the command that puts Wi‑Fi first.
       expect(text).toContain('networksetup -ordernetworkservices');

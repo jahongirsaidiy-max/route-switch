@@ -1847,6 +1847,17 @@ describe('run without --once (daemon): state.json and cleanup', () => {
     const PROXY_FILE = `nameserver 127.0.0.1\nport 954\n${MARKER}\n`;
     const msgIndex = (daemon: Daemon, msg: string, from = 0): number =>
       daemon.h.logs().findIndex((entry, index) => index >= from && entry['msg'] === msg);
+    /** The take-down order (DELTA-31): the proxy file, then the proxy, then the first route; all after `from`. */
+    const expectTakeDownOrder = (daemon: Daemon, from: number): number => {
+      const fileGone = msgIndex(daemon, 'resolver file removed', from);
+      const stopping = msgIndex(daemon, 'stopping the DNS proxy', from);
+      const routeGone = msgIndex(daemon, 'route deleted', from);
+      expect(fileGone).toBeGreaterThan(from);
+      expect(stopping).toBeGreaterThan(fileGone);
+      expect(routeGone).toBeGreaterThan(stopping);
+      expect(msgIndex(daemon, 'cleanup finished', from)).toBeGreaterThan(routeGone);
+      return stopping;
+    };
     const fileOf = (daemon: Daemon): string | null =>
       existsSync(join(daemon.resolverDir, 'corp.local')) ? readFileSync(join(daemon.resolverDir, 'corp.local'), 'utf8') : null;
     const ruleState = async (client: Awaited<ReturnType<typeof connectTestClient>>, id: number): Promise<unknown> => {
@@ -1854,7 +1865,7 @@ describe('run without --once (daemon): state.json and cleanup', () => {
       return response.ok ? EngineState.parse(response.result['state']).rules.find((rule) => rule.ruleId === ID_W) : null;
     };
 
-    it('starts after the leftovers are cleaned up and the first pass ran, writes the proxy file, and stops before the cleanup at SIGTERM', async () => {
+    it('starts after the leftovers are cleaned up and the first pass ran, writes the proxy file; at SIGTERM the file goes first, then the proxy, then the routes', async () => {
       const daemon = startDaemon({ file: WILD_CONFIG });
       await running(daemon);
       await vi.waitFor(() => {
@@ -1879,11 +1890,8 @@ describe('run without --once (daemon): state.json and cleanup', () => {
 
       daemon.signal();
       expect(await daemon.exit).toBe(EXIT_CODES.ok);
-      const stopping = msgIndex(daemon, 'stopping the DNS proxy');
       const shutdown = msgIndex(daemon, 'shutting down');
-      const finalCleanup = msgIndex(daemon, 'cleanup finished', shutdown);
-      expect(stopping).toBeGreaterThan(shutdown);
-      expect(finalCleanup).toBeGreaterThan(stopping);
+      const stopping = expectTakeDownOrder(daemon, shutdown);
       expect(daemon.h.logs()[stopping]).toMatchObject({ why: 'shutting down' });
       expect(network.udpSockets.every((socket) => socket.closed)).toBe(true);
       expect(network.tcpServers.every((server) => server.closed)).toBe(true);
@@ -1968,7 +1976,7 @@ describe('run without --once (daemon): state.json and cleanup', () => {
       expect(network.udpSockets.every((socket) => socket.closed)).toBe(true);
     });
 
-    it('global toggle off: the proxy stops first, then everything is removed; on again starts it again', async () => {
+    it('global toggle off: the file goes first, then the proxy, then the routes; on again starts it again', async () => {
       const dir = newResolverDir();
       const socketPath = join(dir, 's.sock');
       const daemon = startDaemon({ socketPath, file: WILD_CONFIG, argv: ['--config', join(dir, 'config.json')] });
@@ -1980,9 +1988,8 @@ describe('run without --once (daemon): state.json and cleanup', () => {
       const before = daemon.h.logs().length;
 
       expect((await client.request({ id: 1, method: 'setEnabled', enabled: false })).ok).toBe(true);
-      const stopping = msgIndex(daemon, 'stopping the DNS proxy', before);
+      const stopping = expectTakeDownOrder(daemon, before);
       expect(daemon.h.logs()[stopping]).toMatchObject({ why: 'routing turned off' });
-      expect(msgIndex(daemon, 'cleanup finished', before)).toBeGreaterThan(stopping);
       expect(fileOf(daemon)).toBeNull();
       expect(daemon.table.routes.size).toBe(0);
       expect(daemon.h.network.udpSockets.every((socket) => socket.closed)).toBe(true);
@@ -1995,7 +2002,7 @@ describe('run without --once (daemon): state.json and cleanup', () => {
       expect(await daemon.exit).toBe(EXIT_CODES.ok);
     });
 
-    it('uninstall: the proxy stops before the cleanup and never starts again', async () => {
+    it('uninstall: the file goes first, then the proxy, then the routes; the proxy never starts again', async () => {
       const dir = newResolverDir();
       const socketPath = join(dir, 's.sock');
       const daemon = startDaemon({ socketPath, file: WILD_CONFIG, argv: ['--config', join(dir, 'config.json')] });
@@ -2006,9 +2013,7 @@ describe('run without --once (daemon): state.json and cleanup', () => {
       const client = await connectTestClient(socketPath);
       const before = daemon.h.logs().length;
       expect(await client.request({ id: 1, method: 'uninstall' })).toEqual({ id: 1, ok: true, result: {} });
-      const stopping = msgIndex(daemon, 'stopping the DNS proxy', before);
-      expect(stopping).toBeGreaterThanOrEqual(0);
-      expect(msgIndex(daemon, 'cleanup finished', before)).toBeGreaterThan(stopping);
+      expect(daemon.h.logs()[expectTakeDownOrder(daemon, before)]).toMatchObject({ why: 'shutting down' });
       expect(fileOf(daemon)).toBeNull();
       expect(daemon.h.network.udpSockets).toHaveLength(1);
 

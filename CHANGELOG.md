@@ -5,6 +5,54 @@ All notable changes to RouteSwitch are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.0] — 2026-10-15
+
+### Added
+
+- **Wildcard domain rules**: type `*.corp.local` in a Domain rule and every
+  subdomain of `corp.local` (`app.corp.local`, `a.b.corp.local`, …) goes
+  through the rule's interface. Only subdomains are covered — `corp.local`
+  itself needs its own rule. Subdomains are not known in advance, so routes
+  are added on lookup: the helper runs a small DNS proxy on the loopback
+  address (`127.0.0.1`, port 954, only while a wildcard rule is enabled),
+  `/etc/resolver/corp.local` points lookups for the domain at it, and
+  it adds a host route for each IP of an answer before the answer reaches the
+  app. With **Resolve through an internal DNS server** set, lookups are
+  forwarded to that server, otherwise to the DNS servers of the rule's
+  interface.
+- The rules table and the menu bar show how many IPs each wildcard rule has
+  learned; Diagnostics shows which wildcard rule covers a name.
+- Which rule wins among names: an exact domain rule beats a wildcard, a deeper
+  wildcard beats a shallower one. When one IP falls under two rules with
+  different interfaces, the losing wildcard rule says so in its status.
+- A new Help topic, "Wildcard domains", in all three languages.
+
+### Changed
+
+- The IPC protocol is now version 4. **A 0.2 helper is reported as
+  incompatible**: click **Reinstall the helper** once after updating the app
+  (your rules are kept — the installer leaves the helper's config in place).
+- When routing is turned off, the helper is removed or it stops, resolver
+  files go first, then the DNS proxy, then the routes — names under a wildcard
+  domain are never sent to a proxy that is gone.
+
+### Known limitations
+
+- Apps that resolve names themselves bypass the proxy: with **Secure DNS**
+  (DNS over HTTPS) turned on in a browser, wildcard rules do not apply to that
+  browser — turn it off or add an exception for the domain.
+- IPv6 answers (AAAA) are passed through unchanged and get no route; an app
+  that prefers IPv6 may use the default interface.
+- A learned route lives at least 15 minutes and at most a day (the answer's
+  TTL within those bounds). Up to 256 IPs per wildcard rule and 4096 for all
+  of them together; when full, the oldest learned IP makes room.
+- An address an app cached before the proxy started is learned on its next
+  lookup.
+- The builds are still signed ad hoc, not with a Developer ID and not
+  notarized (see README → Download).
+- Not supported: IPv6 routes, VPN (`utun`) interfaces, per-application
+  routing.
+
 ## [0.2.0] — 2026-10-15
 
 ### Added
@@ -98,5 +146,6 @@ The first public release.
   (`utun`) interfaces, per-application routing.
 - The user interface is in Uzbek only.
 
+[0.3.0]: https://github.com/jahongirsaidiy-max/route-switch/releases/tag/v0.3.0
 [0.2.0]: https://github.com/jahongirsaidiy-max/route-switch/releases/tag/v0.2.0
 [0.1.0]: https://github.com/jahongirsaidiy-max/route-switch/releases/tag/v0.1.0

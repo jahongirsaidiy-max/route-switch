@@ -253,6 +253,13 @@ export interface ClearOptions {
    * at once with the current state, so nothing adds a route after the cleanup.
    */
   readonly final?: boolean | undefined;
+  /**
+   * Runs inside the clear's exclusive slot (no pass runs or can start), before
+   * the first route is deleted: what must go before the routes, such as the
+   * resolver files and the DNS proxy (a pass could otherwise write a file
+   * back in between). A rejection is logged; the routes are removed anyway.
+   */
+  readonly beforeRoutes?: (() => Promise<void>) | undefined;
 }
 
 export interface RestoreResult {
@@ -2291,6 +2298,13 @@ export const createEngine = (deps: EngineDeps): Engine => {
     }
     running = true;
     try {
+      if (options?.beforeRoutes !== undefined) {
+        try {
+          await options.beforeRoutes();
+        } catch (error) {
+          logger.error('the step before clearing the routes failed', { error: describeThrown(error) });
+        }
+      }
       return await runClear();
     } catch (error) {
       logger.error('clearing the applied routes failed unexpectedly', { error: describeThrown(error) });

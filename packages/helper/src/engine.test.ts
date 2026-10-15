@@ -4750,6 +4750,32 @@ describe('clear', () => {
     expect(engineLogs(h.entries, 'error', 'route delete failed during cleanup; the route stays applied')).toHaveLength(1);
   });
 
+  it('beforeRoutes (DELTA-31) runs before the first delete; when it rejects, that is logged and the routes go anyway', async () => {
+    const h = setup(config([HOST, NET]));
+    await h.run('startup');
+    h.take();
+    const order: string[] = [];
+    h.routes.onDelete = (request) => {
+      order.push(`delete ${request.dst}`);
+      return deleted(request);
+    };
+    expect(
+      await h.engine.clear({
+        beforeRoutes: () => {
+          order.push('before');
+          return Promise.resolve();
+        },
+      }),
+    ).toEqual({ removed: 2, forgotten: 0, failed: 0 });
+    expect(order[0]).toBe('before');
+    expect(order).toHaveLength(3);
+
+    await h.run('manual');
+    h.take();
+    expect(await h.engine.clear({ beforeRoutes: () => Promise.reject(new Error('boom')) })).toEqual({ removed: 2, forgotten: 0, failed: 0 });
+    expect(engineLogs(h.entries, 'error', 'the step before clearing the routes failed')).toHaveLength(1);
+  });
+
   it('removes routes restored from state.json; one now through another gateway is forgotten, not deleted', async () => {
     const h = setup(config([]));
     h.engine.restoreApplied([
