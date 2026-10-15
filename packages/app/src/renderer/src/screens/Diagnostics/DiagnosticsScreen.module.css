@@ -1,0 +1,306 @@
+/*
+ * Diagnostika (not in the design — derived): laid out like the rules window's other sections
+ * (design "Qoidalar oynasi": page header, toolbar, bordered table); the input is the add-rule
+ * form's address field, the verdict the derived banner's tones, cards the DNS box of that form.
+ */
+.screen {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  min-width: 0;
+  min-height: 0;
+  background: var(--rs-color-surface);
+}
+
+.header {
+  padding: 22px var(--rs-space-12) var(--rs-space-8);
+}
+
+.title {
+  font-size: var(--rs-text-title);
+  font-weight: var(--rs-weight-semibold);
+}
+
+.subtitle {
+  margin-top: var(--rs-space-2);
+  color: var(--rs-color-text-muted);
+  font-size: var(--rs-text-body);
+}
+
+.toolbar {
+  display: flex;
+  flex-direction: column;
+  gap: var(--rs-space-4);
+  padding: 0 var(--rs-space-12) var(--rs-space-7);
+}
+
+/* Field label: 12/600 #3A3E46 (add-rule form). */
+.label {
+  color: var(--rs-color-text-strong-secondary);
+  font-size: var(--rs-text-small);
+  font-weight: var(--rs-weight-semibold);
+}
+
+.inputRow {
+  display: flex;
+  align-items: center;
+  gap: var(--rs-space-5);
+  max-width: 720px;
+}
+
+/* Address input of the add-rule form: 38px, padding 0 12, border, radius 7, white, mono 13. */
+.input {
+  flex: 1;
+  min-width: 0;
+  height: var(--rs-control-input);
+  padding: 0 var(--rs-space-6);
+  border: 1px solid var(--rs-color-border-strong);
+  border-radius: var(--rs-radius-control);
+  outline: none;
+  background: var(--rs-color-raised);
+  color: var(--rs-color-text);
+  font-family: var(--rs-font-mono);
+  font-size: var(--rs-text-body);
+  transition:
+    border-color var(--rs-transition),
+    box-shadow var(--rs-transition);
+}
+
+.input:focus {
+  border-color: var(--rs-color-accent);
+  box-shadow: var(--rs-shadow-focus);
+}
+
+.input::placeholder {
+  color: var(--rs-color-text-disabled);
+}
+
+.input[data-invalid] {
+  border-color: var(--rs-color-danger);
+}
+
+.input[data-invalid]:focus {
+  box-shadow: 0 0 0 3px var(--rs-color-danger-soft);
+}
+
+.hint {
+  color: var(--rs-color-text-muted);
+  font-size: var(--rs-text-small);
+}
+
+.hint[data-tone='danger'] {
+  color: var(--rs-color-danger-soft-text);
+}
+
+.body {
+  display: flex;
+  flex: 1;
+  flex-direction: column;
+  gap: var(--rs-space-6);
+  min-height: 0;
+  padding: 0 var(--rs-space-12) var(--rs-space-12);
+  overflow-y: auto;
+}
+
+.running {
+  color: var(--rs-color-text-muted);
+  font-size: var(--rs-text-body);
+}
+
+.alert {
+  padding: var(--rs-space-5) var(--rs-space-6);
+  border-radius: var(--rs-radius-control);
+  background: var(--rs-color-danger-soft);
+  color: var(--rs-color-danger-soft-text);
+  font-size: var(--rs-text-small);
+}
+
+.notice {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: var(--rs-space-2);
+  padding: var(--rs-space-11);
+  border: 1px dashed var(--rs-color-border);
+  border-radius: var(--rs-radius-table);
+  color: var(--rs-color-text-muted);
+  font-size: var(--rs-text-body);
+  text-align: center;
+}
+
+.noticeTitle {
+  color: var(--rs-color-text);
+  font-weight: var(--rs-weight-medium);
+}
+
+.result {
+  display: flex;
+  flex-direction: column;
+  gap: var(--rs-space-6);
+}
+
+/* Verdict: the derived banner's shape — a 3px bar on the left, the status tone on a soft background. */
+.verdict {
+  display: flex;
+  flex-direction: column;
+  gap: var(--rs-space-1);
+  padding: var(--rs-space-5) var(--rs-space-6);
+  border-left: 3px solid var(--rs-color-border-strong);
+  border-radius: var(--rs-radius-sm);
+  background: var(--rs-color-neutral-soft);
+  color: var(--rs-color-neutral-soft-text);
+  font-size: var(--rs-text-body);
+}
+
+.verdict[data-tone='ok'] {
+  border-left-color: var(--rs-color-success);
+  background: var(--rs-color-success-soft);
+  color: var(--rs-color-success-soft-text);
+}
+
+.verdict[data-tone='warning'] {
+  border-left-color: var(--rs-color-warning);
+  background: var(--rs-color-warning-soft);
+  color: var(--rs-color-warning-soft-text);
+}
+
+.verdict[data-tone='danger'] {
+  border-left-color: var(--rs-color-danger);
+  background: var(--rs-color-danger-soft);
+  color: var(--rs-color-danger-soft-text);
+}
+
+.verdictTitle {
+  font-weight: var(--rs-weight-semibold);
+  overflow-wrap: anywhere;
+}
+
+.verdictText {
+  color: var(--rs-color-text-secondary);
+  font-size: var(--rs-text-small);
+}
+
+/* Card: the add-rule form's DNS box — padding 12, border #E2E4E7, radius 8, white. */
+.card {
+  display: flex;
+  flex-direction: column;
+  gap: var(--rs-space-2);
+  padding: var(--rs-space-6);
+  border: 1px solid var(--rs-color-border);
+  border-radius: var(--rs-radius-card);
+  background: var(--rs-color-raised);
+  font-size: var(--rs-text-body);
+  overflow-wrap: anywhere;
+}
+
+.cardTitle {
+  color: var(--rs-color-text-caption);
+  font-size: var(--rs-text-caption);
+  font-weight: var(--rs-weight-semibold);
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+}
+
+.strong {
+  color: var(--rs-color-text);
+  font-weight: var(--rs-weight-medium);
+}
+
+.muted {
+  color: var(--rs-color-text-muted);
+  font-size: var(--rs-text-small);
+}
+
+.mono {
+  font-family: var(--rs-font-mono);
+  -webkit-user-select: text;
+  user-select: text;
+}
+
+.notes {
+  margin: 0;
+  padding-left: var(--rs-space-8);
+  color: var(--rs-color-text-secondary);
+  font-size: var(--rs-text-small);
+  line-height: var(--rs-line-height);
+}
+
+/* Address table: the rules table's frame and header. */
+.table {
+  overflow: hidden;
+  border: 1px solid var(--rs-color-border);
+  border-radius: var(--rs-radius-table);
+  background: var(--rs-color-raised);
+}
+
+.head,
+.row {
+  display: grid;
+  grid-template-columns: minmax(0, 1.2fr) minmax(0, 1.6fr) minmax(0, 0.8fr) minmax(0, 0.9fr);
+  align-items: baseline;
+  gap: var(--rs-space-6);
+  padding: var(--rs-space-6) var(--rs-space-8);
+}
+
+.head {
+  padding-block: var(--rs-space-5);
+  border-bottom: 1px solid var(--rs-color-border);
+  background: var(--rs-color-muted-surface);
+  color: var(--rs-color-text-caption);
+  font-size: var(--rs-text-caption);
+  font-weight: var(--rs-weight-semibold);
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+}
+
+.rows {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.row {
+  border-bottom: 1px solid var(--rs-color-row-divider);
+  font-size: var(--rs-text-body);
+  overflow-wrap: anywhere;
+}
+
+.row:last-child {
+  border-bottom: none;
+}
+
+.sub {
+  display: block;
+  color: var(--rs-color-text-muted);
+  font-family: var(--rs-font-sans);
+  font-size: var(--rs-text-caption);
+}
+
+.empty {
+  padding: var(--rs-space-8);
+  color: var(--rs-color-text-muted);
+  font-size: var(--rs-text-body);
+  text-align: center;
+}
+
+/* Result tag: the rules table's status colours. */
+.status {
+  font-size: var(--rs-text-small);
+  font-weight: var(--rs-weight-semibold);
+  color: var(--rs-color-text-muted);
+}
+
+.status[data-status='ok'],
+.status[data-tone='ok'] {
+  color: var(--rs-color-success-soft-text);
+}
+
+.status[data-status='mismatch'],
+.status[data-status='unknown'],
+.status[data-tone='danger'] {
+  color: var(--rs-color-danger-soft-text);
+}
+
+.status[data-status='failed'] {
+  color: var(--rs-color-warning-soft-text);
+}

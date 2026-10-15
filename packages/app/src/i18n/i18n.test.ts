@@ -109,6 +109,7 @@ describe('the dictionary', () => {
         ...(locale === 'en' ? ['rules.kinds.subnet'] : []),
         ...(locale === 'en' ? ['addRule.kinds.subnet'] : []),
         ...(locale === 'en' ? ['addRule.targetField.subnet.label'] : []),
+        'diagnostics.dnsTitle',
       ]);
       expect(same.map(([path]) => path).filter((path) => !allowed.has(path))).toEqual([]);
     }

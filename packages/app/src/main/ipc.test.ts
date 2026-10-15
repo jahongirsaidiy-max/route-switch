@@ -5,7 +5,7 @@ import path from 'node:path';
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-import type { RsApi, RsLogEntry, RsResult, RsSnapshot } from '../renderer/src/rs';
+import type { RsApi, RsDiagnosis, RsLogEntry, RsResult, RsSnapshot } from '../renderer/src/rs';
 import { createHelperClient, DEFAULT_TIMEOUTS, type HelperClient } from './helperClient';
 import {
   engineState,
@@ -20,6 +20,7 @@ import {
   statusResult,
 } from './helperClient.fixtures';
 import type { ConfigFileSystem } from './configFile';
+import type { NameLookup } from './diagnose';
 import {
   EMPTY_CONFIG,
   IMPORT_TTL_MS,
@@ -114,6 +115,8 @@ interface FakeHelper {
   readonly silent: Set<string>;
   /** The stored config cannot be loaded (TASK-114): getConfig / setEnabled fail until a setConfig. */
   broken?: boolean;
+  /** The answer to every `diagnose` request (TASK-DELTA-20); `not-implemented` when unset. */
+  diagnose?: (request: { id: number; target: string }) => unknown;
 }
 
 function attachHelper(socket: FakeSocket, helper: FakeHelper): void {
@@ -169,6 +172,13 @@ function attachHelper(socket: FakeSocket, helper: FakeHelper): void {
               ruleId: RULE_ID,
             }),
           );
+          return;
+        case 'diagnose':
+          if (helper.diagnose !== undefined) {
+            socket.receive(helper.diagnose({ id: request.id, target: request['target'] as string }));
+            return;
+          }
+          socket.receive(refused(request.id, 'not here', 'not-implemented'));
           return;
         default:
           socket.receive(refused(request.id, 'not here', 'not-implemented'));
@@ -231,6 +241,8 @@ interface SetupOptions {
   readonly installer?: Installer;
   readonly preferences?: PreferencesStore;
   readonly backup?: Pick<RulesBackupStore, 'read' | 'remove'>;
+  readonly lookupName?: NameLookup;
+  readonly diagnose?: FakeHelper['diagnose'];
 }
 
 /** A backup store in memory (TASK-DELTA-16). */
@@ -266,6 +278,7 @@ async function setup(options: SetupOptions = {}) {
     answerOnce: new Map(),
     silent: new Set(),
     broken: options.brokenConfig === true,
+    ...(options.diagnose === undefined ? {} : { diagnose: options.diagnose }),
   };
   const realClient = createHelperClient({
     socketPath: '/tmp/routeswitch-test/helper.sock',
@@ -296,6 +309,7 @@ async function setup(options: SetupOptions = {}) {
     installer: options.installer ?? UNUSED_INSTALLER,
     ...(options.configFs === undefined ? {} : { configFs: options.configFs }),
     ...(options.now === undefined ? {} : { now: options.now }),
+    ...(options.lookupName === undefined ? {} : { lookupName: options.lookupName }),
   });
 
   if (options.client === undefined) {
@@ -344,10 +358,10 @@ const newRule = (extra: Partial<RuleInput> = {}): RuleInput => ({
 // ---------------------------------------------------------------------------
 
 describe('registration', () => {
-  it('handles exactly the twenty-nine invoke channels of the renderer API', async () => {
+  it('handles exactly the thirty invoke channels of the renderer API', async () => {
     const h = await setup({ connect: false });
     expect([...h.ipcMain.handlers.keys()].sort()).toEqual([...INVOKE_CHANNELS].sort());
-    expect(INVOKE_CHANNELS).toHaveLength(29);
+    expect(INVOKE_CHANNELS).toHaveLength(30);
   });
 
   it('dispose removes every handler and stops the state pushes; a second dispose does nothing', async () => {
@@ -358,7 +372,7 @@ describe('registration', () => {
     h.registration.dispose();
     h.registration.dispose();
     expect(h.ipcMain.handlers.size).toBe(0);
-    expect(h.ipcMain.removeHandler).toHaveBeenCalledTimes(29);
+    expect(h.ipcMain.removeHandler).toHaveBeenCalledTimes(30);
     h.sockets[0]?.emit('connect');
     for (let i = 0; i < 6; i += 1) await flush();
     expect(sent).toEqual([]);
@@ -801,6 +815,15 @@ describe('every argument is checked before anything reaches the helper', () => {
     ['a forbidden address to test', 'rs:test', ['0.0.0.0']],
     ['a domain to test', 'rs:test', ['corp.local']],
     ['a non-canonical address to test', 'rs:test', ['010.1.2.3']],
+    ['a URL to diagnose (the page strips it)', 'rs:diagnose', ['https://corp.local/x']],
+    ['a wildcard to diagnose', 'rs:diagnose', ['*.corp.local']],
+    ['an upper-case name to diagnose', 'rs:diagnose', ['Corp.Local']],
+    ['loopback to diagnose', 'rs:diagnose', ['127.0.0.1']],
+    ['a subnet to diagnose', 'rs:diagnose', ['10.0.0.0/8']],
+    ['IPv6 to diagnose', 'rs:diagnose', ['::1']],
+    ['a path to diagnose', 'rs:diagnose', ['../etc']],
+    ['a number to diagnose', 'rs:diagnose', [1]],
+    ['no target to diagnose', 'rs:diagnose', []],
     ['arguments to a method that takes none', 'rs:apply', [true]],
     ['arguments to getState', 'rs:getState', [{}]],
     ['arguments to getConfig', 'rs:getConfig', ['x']],
@@ -1400,6 +1423,140 @@ describe('settings: uninstall the helper', () => {
   });
 });
 
+describe('rs:diagnose (TASK-DELTA-20)', () => {
+  const ADDRESS_ROUTE = { device: 'en0', gateway: '192.168.1.1', role: 'wifi' } as const;
+  /** The helper's answer for one IPv4 target: no rule, the default route through Wi‑Fi. */
+  const ipAnswer = (id: number, target: string) =>
+    ok(id, {
+      target,
+      targetKind: 'ip',
+      match: null,
+      addresses: [{ address: target, source: 'query', route: ADDRESS_ROUTE, expectedRole: null, matchesExpected: null }],
+      dns: null,
+      notes: ['no-matching-rule'],
+    });
+  const notCovered = (id: number, target: string) =>
+    ok(id, { target, targetKind: 'domain', match: null, addresses: [], dns: null, notes: ['name-not-covered'] });
+  /** A helper that does not resolve names and answers every address. */
+  const answering = (request: { id: number; target: string }) =>
+    /^[\d.]+$/.test(request.target) ? ipAnswer(request.id, request.target) : notCovered(request.id, request.target);
+  const lookupOf = (...addresses: string[]): NameLookup => vi.fn(() => Promise.resolve(addresses.map((address) => ({ address, family: 4 }))));
+  const diagnoseTargets = (h: Awaited<ReturnType<typeof setup>>) =>
+    h.sent().filter((request) => request.method === 'diagnose').map((request) => request['target']);
+
+  it('an address: one helper diagnose, no lookup', async () => {
+    const lookupName = lookupOf('10.9.9.9');
+    const h = await setup({ diagnose: answering, lookupName });
+    const value = valueOf(await h.call('rs:diagnose', '172.16.12.40')) as RsDiagnosis;
+    expect(diagnoseTargets(h)).toEqual(['172.16.12.40']);
+    expect(lookupName).not.toHaveBeenCalled();
+    expect(value.lookup).toBeNull();
+    expect(value.result).toMatchObject({ target: '172.16.12.40', targetKind: 'ip', notes: ['no-matching-rule'] });
+  });
+
+  it('a name the helper resolves (a rule covers it): no lookup in the app', async () => {
+    const lookupName = lookupOf('10.9.9.9');
+    const h = await setup({
+      lookupName,
+      diagnose: (request) =>
+        ok(request.id, { target: request.target, targetKind: 'domain', match: { ruleId: RULE_ID, via: 'domain', precedence: 'only-match' }, addresses: [], dns: null, notes: [] }),
+    });
+    const value = valueOf(await h.call('rs:diagnose', 'corp.local')) as RsDiagnosis;
+    expect(value.lookup).toBeNull();
+    expect(lookupName).not.toHaveBeenCalled();
+    expect(diagnoseTargets(h)).toEqual(['corp.local']);
+  });
+
+  it('name-not-covered: the app resolves the name and diagnoses each address, one after the other', async () => {
+    const lookupName = lookupOf('203.0.113.7', '127.0.0.1', '203.0.113.7', '198.51.100.2');
+    const h = await setup({ diagnose: answering, lookupName });
+    const value = valueOf(await h.call('rs:diagnose', 'example.com')) as RsDiagnosis;
+    expect(lookupName).toHaveBeenCalledWith('example.com');
+    expect(diagnoseTargets(h)).toEqual(['example.com', '203.0.113.7', '198.51.100.2']);
+    expect(value.result.notes).toEqual(['name-not-covered']);
+    expect(value.lookup).toMatchObject({ outcome: 'ok', truncated: false, excluded: 1 });
+    expect(value.lookup?.addresses.map((entry) => [entry.address, entry.ok])).toEqual([
+      ['203.0.113.7', true],
+      ['198.51.100.2', true],
+    ]);
+  });
+
+  it('at most 8 addresses are diagnosed; more are reported as truncated', async () => {
+    const many = Array.from({ length: 12 }, (_, index) => `203.0.113.${String(index + 1)}`);
+    const h = await setup({ diagnose: answering, lookupName: lookupOf(...many) });
+    const value = valueOf(await h.call('rs:diagnose', 'example.com')) as RsDiagnosis;
+    expect(diagnoseTargets(h)).toEqual(['example.com', ...many.slice(0, 8)]);
+    expect(value.lookup).toMatchObject({ truncated: true });
+    expect(value.lookup?.addresses).toHaveLength(8);
+  });
+
+  it('a refused address is a row with its code; the others are still diagnosed', async () => {
+    let calls = 0;
+    const h = await setup({
+      lookupName: lookupOf('203.0.113.7', '198.51.100.2'),
+      diagnose: (request) => {
+        calls += 1;
+        if (calls === 2) return refused(request.id, 'Too many diagnoses on this connection; try again in a minute', 'operation-failed');
+        return answering(request);
+      },
+    });
+    const value = valueOf(await h.call('rs:diagnose', 'example.com')) as RsDiagnosis;
+    expect(value.lookup?.addresses).toEqual([
+      { address: '203.0.113.7', ok: false, code: 'operation-failed' },
+      expect.objectContaining({ address: '198.51.100.2', ok: true }),
+    ]);
+  });
+
+  it('a lookup that finds nothing: no address request', async () => {
+    const lookupName: NameLookup = () => Promise.reject(Object.assign(new Error('queryA ENOTFOUND nope.example'), { code: 'ENOTFOUND' }));
+    const h = await setup({ diagnose: answering, lookupName });
+    const value = valueOf(await h.call('rs:diagnose', 'nope.example')) as RsDiagnosis;
+    expect(value.lookup).toEqual({ outcome: 'not-found', addresses: [], truncated: false, excluded: 0 });
+    expect(diagnoseTargets(h)).toEqual(['nope.example']);
+  });
+
+  it('a helper refusal is passed on; nothing is resolved', async () => {
+    const lookupName = lookupOf('203.0.113.7');
+    const h = await setup({ lookupName, diagnose: (request) => refused(request.id, 'Too many diagnoses are running; try again shortly', 'operation-failed') });
+    expect(await h.call('rs:diagnose', 'example.com')).toMatchObject({ ok: false, code: 'operation-failed' });
+    expect(lookupName).not.toHaveBeenCalled();
+  });
+
+  it('without a helper: not-connected, nothing resolved', async () => {
+    const lookupName = lookupOf('203.0.113.7');
+    const h = await setup({ connect: false, lookupName });
+    expect(await h.call('rs:diagnose', 'example.com')).toMatchObject({ ok: false, code: 'not-connected' });
+    expect(lookupName).not.toHaveBeenCalled();
+  });
+
+  it('one diagnosis at a time: a second call while one runs is busy and sends nothing', async () => {
+    let finish: (addresses: { address: string; family: number }[]) => void = () => undefined;
+    const lookupName: NameLookup = () =>
+      new Promise((resolve) => {
+        finish = resolve;
+      });
+    const h = await setup({ diagnose: answering, lookupName });
+    const handler = h.ipcMain.handlers.get('rs:diagnose');
+    const first = handler?.(TRUSTED, 'example.com');
+    for (let i = 0; i < 8; i += 1) await flush();
+    expect(await h.call('rs:diagnose', '172.16.12.40')).toMatchObject({ ok: false, code: 'busy' });
+    expect(diagnoseTargets(h)).toEqual(['example.com']);
+    finish([{ address: '203.0.113.7', family: 4 }]);
+    expect(await first).toMatchObject({ ok: true });
+    expect((await h.call('rs:diagnose', '172.16.12.40')).ok).toBe(true);
+  });
+
+  it('the name and its addresses are logged at debug only', async () => {
+    const h = await setup({ diagnose: answering, lookupName: lookupOf('203.0.113.7') });
+    valueOf(await h.call('rs:diagnose', 'secret-host.example'));
+    const above = h.entries.filter((entry) => entry.level !== 'debug');
+    expect(JSON.stringify(above)).not.toContain('secret-host');
+    expect(JSON.stringify(above)).not.toContain('203.0.113.7');
+    expect(above.some((entry) => entry.msg === 'Diagnostics made')).toBe(true);
+    expect(JSON.stringify(h.entries.filter((entry) => entry.level === 'debug'))).toContain('secret-host.example');
+  });
+});
+
 describe('rs:openRulesWindow (main process only)', () => {
   it('opens the rules window and sends nothing to the helper', async () => {
     const openRulesWindow = vi.fn();
@@ -1449,7 +1606,7 @@ describe('rs:openRulesWindow (main process only)', () => {
 });
 
 describe('the preload against the main process (window.rs)', () => {
-  it('exposes exactly the thirty-two methods of the renderer API (twenty-nine calls, three subscriptions), each wired to a handled channel', async () => {
+  it('exposes exactly the thirty-three methods of the renderer API (thirty calls, three subscriptions), each wired to a handled channel', async () => {
     const openRulesWindow = vi.fn();
     const h = await setup({ settings: fakeSettings().settings, openRulesWindow });
     bridge.setInvokeTarget((channel, ...args) => {
@@ -1466,6 +1623,7 @@ describe('the preload against the main process (window.rs)', () => {
         'copyServiceOrderCommand',
         'deleteBackup',
         'deleteRule',
+        'diagnose',
         'dismissBackup',
         'exportConfig',
         'getBackup',
@@ -1508,6 +1666,8 @@ describe('the preload against the main process (window.rs)', () => {
     expect((await settle(rs.setEnabled(true))).ok).toBe(true);
     expect((await settle(rs.apply())).ok).toBe(true);
     expect((await settle(rs.test('10.1.2.3'))).ok).toBe(true);
+    // The fake helper does not know `diagnose`: its refusal comes back as a value.
+    expect(await settle(rs.diagnose('10.1.2.3'))).toMatchObject({ ok: false, code: 'not-implemented' });
     // The test's file dialogs are cancelled: nothing is read or written.
     expect(await settle(rs.importConfig())).toEqual({ ok: true, value: null });
     expect(await settle(rs.applyImport(NEW_ID))).toMatchObject({ ok: false, code: 'import-expired' });
@@ -1536,6 +1696,7 @@ describe('the preload against the main process (window.rs)', () => {
       'setEnabled',
       'apply',
       'test',
+      'diagnose',
       'setConfig',
       'uninstall',
     ]);

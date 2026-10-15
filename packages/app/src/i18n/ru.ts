@@ -12,6 +12,7 @@ import { componentsRu } from './sections/components.ru';
 import { logRu } from './sections/log.ru';
 import { settingsRu } from './sections/settings.ru';
 import { backupRu } from './sections/backup.ru';
+import { diagnosticsRu } from './sections/diagnostics.ru';
 
 const unexpected = (code: string): string => `Непредвиденная ошибка (${code}).`;
 
@@ -222,4 +223,6 @@ export const ru: Messages = {
   /** The rules window and the add-rule dialog (TASK-DELTA-13): `sections/rules.*`, `sections/addRule.*`. */
   rules: rulesRu,
   addRule: addRuleRu,
+  /** The "Diagnostika" section of the rules window (TASK-DELTA-20): `sections/diagnostics.*`. */
+  diagnostics: diagnosticsRu,
 };

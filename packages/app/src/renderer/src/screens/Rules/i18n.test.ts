@@ -40,7 +40,7 @@ const configWith = (count: number): Config => ({
 });
 
 /** Some Uzbek words of the rules window that must not be left in another language. */
-const UZBEK_WORDS = ["Qoida qo'shish", 'Qidirish', 'Hammasi', 'Manzil', 'Interfeys', 'Izoh', 'ta qoida faol', "Bo'limlar", 'Jurnal', 'Sozlamalar'];
+const UZBEK_WORDS = ["Qoida qo'shish", 'Qidirish', 'Hammasi', 'Manzil', 'Interfeys', 'Izoh', 'ta qoida faol', "Bo'limlar", 'Jurnal', 'Diagnostika', 'Sozlamalar'];
 
 describe('model in three languages', () => {
   it('kindLabel', () => {

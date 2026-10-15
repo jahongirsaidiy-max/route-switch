@@ -5,6 +5,7 @@
 
 import type {
   Config,
+  DiagnoseResult,
   EngineState,
   ErrorCode,
   EventLogLevel,
@@ -217,6 +218,43 @@ export type RsResult<T> =
       readonly detail?: string;
     };
 
+/**
+ * How the main process resolved a name no enabled domain rule covers (the
+ * helper answered `name-not-covered`): the system resolver, with the user's
+ * rights (`dns.lookup`, IPv4 only, 3 s).
+ * - `ok`        — it gave addresses (some may be `excluded`);
+ * - `not-found` — the name does not exist or has no IPv4 address;
+ * - `timeout`   — no answer within 3 s;
+ * - `failed`    — the lookup failed otherwise.
+ */
+export type RsLookupOutcome = 'ok' | 'not-found' | 'timeout' | 'failed';
+
+/** One address of a resolved name and the helper's `diagnose` of it; `code` when that call failed. */
+export type RsDiagnosedAddress =
+  | { readonly address: string; readonly ok: true; readonly result: DiagnoseResult }
+  | { readonly address: string; readonly ok: false; readonly code: RsErrorCode };
+
+/** The app's own lookup of a name the helper does not resolve. */
+export interface RsNameLookup {
+  readonly outcome: RsLookupOutcome;
+  /** At most 8, in the resolver's order, each diagnosed one after the other. */
+  readonly addresses: readonly RsDiagnosedAddress[];
+  /** The resolver gave more routable addresses than 8; the rest were not diagnosed. */
+  readonly truncated: boolean;
+  /** Addresses that are never routed (loopback, link-local, …) and were left out. */
+  readonly excluded: number;
+}
+
+/**
+ * What `diagnose` returns: the helper's answer for the target as asked and,
+ * only when the helper did not resolve the name (`name-not-covered`), the
+ * app's lookup of it with an answer per address.
+ */
+export interface RsDiagnosis {
+  readonly result: DiagnoseResult;
+  readonly lookup: RsNameLookup | null;
+}
+
 /** Removes the subscription it was returned for. Calling it again does nothing. */
 export type RsUnsubscribe = () => void;
 
@@ -235,6 +273,16 @@ export interface RsApi {
   apply(): Promise<RsResult<StateResult>>;
   /** Which interface the system would use for one IPv4 address (`route -n get`). Read-only. */
   test(target: string): Promise<RsResult<TestResult>>;
+  /**
+   * Explains how traffic to a host or IPv4 address leaves the machine
+   * (read-only): the matching rule and why, the kernel's route for each
+   * address against the rule's interface, the rule's DNS server and whether it
+   * answers. `target` is a bare IPv4 address or domain, as `diagnose` takes it
+   * (the page strips a URL down to its host first). A name no enabled domain
+   * rule covers is resolved by the main process with the user's rights and
+   * each address diagnosed. `busy` while another diagnosis runs.
+   */
+  diagnose(target: string): Promise<RsResult<RsDiagnosis>>;
   /**
    * Asks the user for a config file (system dialog of the main process), reads
    * and checks it with the shared `Config` schema, and returns it for a
@@ -368,6 +416,7 @@ export interface RsInvokeChannels {
   'rs:setEnabled': { readonly args: readonly [on: boolean]; readonly value: StateResult };
   'rs:apply': { readonly args: readonly []; readonly value: StateResult };
   'rs:test': { readonly args: readonly [target: string]; readonly value: TestResult };
+  'rs:diagnose': { readonly args: readonly [target: string]; readonly value: RsDiagnosis };
   'rs:import': { readonly args: readonly []; readonly value: RsImportPreview | null };
   'rs:applyImport': { readonly args: readonly [token: string]; readonly value: SetConfigResult };
   'rs:export': { readonly args: readonly []; readonly value: RsExportResult | null };

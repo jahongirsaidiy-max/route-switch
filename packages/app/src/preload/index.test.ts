@@ -37,6 +37,7 @@ const INVOKES = [
   ['setEnabled', [true], 'rs:setEnabled'],
   ['apply', [], 'rs:apply'],
   ['test', ['10.1.2.3'], 'rs:test'],
+  ['diagnose', ['corp.local'], 'rs:diagnose'],
   ['importConfig', [], 'rs:import'],
   ['applyImport', [RULE.id], 'rs:applyImport'],
   ['exportConfig', [], 'rs:export'],

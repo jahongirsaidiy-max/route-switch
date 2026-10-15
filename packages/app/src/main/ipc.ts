@@ -15,6 +15,7 @@
 
 import {
   Config as ConfigSchema,
+  DiagnoseRequest,
   describeIssues,
   findStructureViolation,
   Language,
@@ -39,6 +40,7 @@ import type {
 } from '../renderer/src/rs';
 import { readConfigFile, writeConfigFile, type ConfigFileSystem } from './configFile';
 import { createConnectionJournal } from './connectionJournal';
+import { createDiagnoser, type NameLookup, type Timers } from './diagnose';
 import type { HelperClient, HelperStatus } from './helperClient';
 import type { Installer } from './installer';
 import { createLogBuffer, type LogBuffer } from './logBuffer';
@@ -66,6 +68,7 @@ export const INVOKE_CHANNELS = [
   'rs:setEnabled',
   'rs:apply',
   'rs:test',
+  'rs:diagnose',
   'rs:import',
   'rs:applyImport',
   'rs:export',
@@ -144,6 +147,10 @@ export interface IpcDeps {
   readonly newToken?: () => string;
   /** Milliseconds since the epoch, for the age of a waiting import and the time of the app's journal lines; `Date.now` by default. */
   readonly now?: () => number;
+  /** "Diagnostika": the system resolver for a name no rule covers, with the user's rights; `dns.lookup` by default. */
+  readonly lookupName?: NameLookup;
+  /** Timers of that lookup's 3 s limit; the real ones by default. */
+  readonly diagnoseTimers?: Timers;
 }
 
 /** `dialog.showOpenDialog` / `dialog.showSaveDialog`, reduced to the chosen path. */
@@ -206,6 +213,8 @@ const RuleId: Schema<string> = Rule.in.shape.id;
 const Flag: Schema<boolean> = SetEnabledRequest.shape.enabled;
 /** One routable IPv4 address, normalised (forbidden destinations refused, ADR-001). */
 const TestTarget: Schema<string> = TestRequest.shape.target;
+/** A routable IPv4 address or a domain, normalised exactly as the helper's `diagnose` takes it (no wildcard, no URL). */
+const DiagnoseTarget: Schema<string> = DiagnoseRequest.shape.target;
 const RuleArgument: Schema<Rule> = Rule;
 /** The token of a waiting import: a UUID, like a rule id. */
 const ImportToken: Schema<string> = Rule.in.shape.id;
@@ -223,6 +232,7 @@ const ARGUMENTS = {
   'rs:setEnabled': argumentsOf(Flag),
   'rs:apply': argumentsOf(),
   'rs:test': argumentsOf(TestTarget),
+  'rs:diagnose': argumentsOf(DiagnoseTarget),
   'rs:import': argumentsOf(),
   'rs:applyImport': argumentsOf(ImportToken),
   'rs:export': argumentsOf(),
@@ -413,6 +423,26 @@ export function registerIpcHandlers(deps: IpcDeps): IpcRegistration {
     return result;
   };
 
+  // -- diagnostics (TASK-DELTA-20) --------------------------------------------
+  // One at a time: a second click while one runs is answered `busy`, so a
+  // page cannot pile up lookups and helper requests.
+  const diagnoser = createDiagnoser({
+    request: helperClient.request,
+    logger,
+    ...(deps.lookupName === undefined ? {} : { lookup: deps.lookupName }),
+    ...(deps.diagnoseTimers === undefined ? {} : { timers: deps.diagnoseTimers }),
+  });
+  let diagnosing = false;
+  const diagnose = async (target: string): Promise<RsResult<RsInvokeChannels['rs:diagnose']['value']>> => {
+    if (diagnosing) return failure('busy', 'A diagnosis is already running');
+    diagnosing = true;
+    try {
+      return await diagnoser(target);
+    } finally {
+      diagnosing = false;
+    }
+  };
+
   const handlers: Handlers = {
     'rs:getState': () => {
       const { status, state } = helperClient.snapshot();
@@ -447,6 +477,8 @@ export function registerIpcHandlers(deps: IpcDeps): IpcRegistration {
       }),
     'rs:apply': () => serially(() => helperClient.request('apply')),
     'rs:test': ([target]) => helperClient.request('test', { target }),
+    // Read-only; the target is logged at debug only (`diagnose.ts`).
+    'rs:diagnose': ([target]) => diagnose(target),
     // The system dialogs of this process choose the file; the page never sends or sees a path.
     'rs:import': () => importConfig(),
     'rs:applyImport': ([token]) => applyImport(token),

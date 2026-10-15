@@ -41,6 +41,7 @@ const api: RsApi = {
   setEnabled: (on) => invoke('rs:setEnabled', on),
   apply: () => invoke('rs:apply'),
   test: (target) => invoke('rs:test', target),
+  diagnose: (target) => invoke('rs:diagnose', target),
   importConfig: () => invoke('rs:import'),
   applyImport: (token) => invoke('rs:applyImport', token),
   exportConfig: () => invoke('rs:export'),

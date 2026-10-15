@@ -20,6 +20,7 @@ import { componentsUz } from './sections/components.uz';
 import { logUz } from './sections/log.uz';
 import { settingsUz } from './sections/settings.uz';
 import { backupUz } from './sections/backup.uz';
+import { diagnosticsUz } from './sections/diagnostics.uz';
 
 /** What the UI shows about the helper: the connection kinds plus the renderer's own two. */
 export type HelperStatusKey = RsConnection['kind'] | 'loading' | 'unavailable';
@@ -262,4 +263,6 @@ export const uz = {
   /** The rules window and the add-rule dialog (TASK-DELTA-13): `sections/rules.*`, `sections/addRule.*`. */
   rules: rulesUz,
   addRule: addRuleUz,
+  /** The "Diagnostika" section of the rules window (TASK-DELTA-20): `sections/diagnostics.*`. */
+  diagnostics: diagnosticsUz,
 };

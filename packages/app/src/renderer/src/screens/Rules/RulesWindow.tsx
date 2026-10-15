@@ -1,5 +1,5 @@
 // The rules window (`?view=rules`, 1040×680): a sidebar with the window's
-// sections — Qoidalar, Jurnal, Sozlamalar — and the helper's status, and the
+// sections — Qoidalar, Jurnal, Diagnostika, Sozlamalar — and the helper's status, and the
 // chosen section beside it. The macOS title bar is the real one, so the
 // design's drawn traffic lights are not repeated. The design's "Interfeyslar"
 // and "DNS resolverlar" items have no screen in the MVP and are left out.
@@ -16,13 +16,14 @@ import { useI18n } from '../../hooks/useI18n';
 import type { RsApi } from '../../rs';
 import { helperNotice, helperStatusText, UZ, type Feedback } from '../../text';
 import { AddRuleDialog, type RuleEditorTarget } from '../AddRule';
+import { DiagnosticsScreen } from '../Diagnostics';
 import { useInstall } from '../Install';
 import { LogScreen } from '../Log';
 import { SettingsScreen } from '../Settings';
 import { RulesScreen } from './RulesScreen';
 import styles from './RulesWindow.module.css';
 
-export type RulesSection = 'rules' | 'log' | 'settings';
+export type RulesSection = 'rules' | 'log' | 'diagnostics' | 'settings';
 
 function Svg({ children }: { readonly children: ReactNode }): ReactElement {
   return (
@@ -52,6 +53,16 @@ function LogIcon(): ReactElement {
   );
 }
 
+/** "Diagnostika" (not in the design): a magnifier, in the stroke of the design's icons. */
+function DiagnosticsIcon(): ReactElement {
+  return (
+    <Svg>
+      <circle cx="11" cy="11" r="6" />
+      <path d="m20 20-4.5-4.5M8.5 11h5" />
+    </Svg>
+  );
+}
+
 /** "Sozlamalar" icon of the design. */
 function SettingsIcon(): ReactElement {
   return (
@@ -66,6 +77,7 @@ function SettingsIcon(): ReactElement {
 export const SECTIONS: readonly { readonly id: RulesSection; readonly icon: () => ReactElement }[] = [
   { id: 'rules', icon: () => <RouteIcon size={16} /> },
   { id: 'log', icon: LogIcon },
+  { id: 'diagnostics', icon: DiagnosticsIcon },
   { id: 'settings', icon: SettingsIcon },
 ];
 
@@ -79,6 +91,7 @@ export interface SectionScreenProps {
 export const SECTION_SCREENS: Readonly<Record<RulesSection, ComponentType<SectionScreenProps>>> = {
   rules: ({ onAddRule, onEditRule }) => <RulesScreen onAddRule={onAddRule} onEditRule={onEditRule} />,
   log: () => <LogScreen />,
+  diagnostics: () => <DiagnosticsScreen />,
   settings: () => <SettingsScreen />,
 };
 

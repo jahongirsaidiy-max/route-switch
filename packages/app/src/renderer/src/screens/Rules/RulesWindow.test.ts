@@ -3,6 +3,7 @@ import { describe, expect, it, vi } from 'vitest';
 
 import { renderMarkup } from '../../components/test-utils';
 import { LOADING_VIEW, type EngineStateView } from '../../hooks/useEngineState';
+import { DiagnosticsScreen } from '../Diagnostics';
 import { LogScreen } from '../Log';
 import { SettingsScreen } from '../Settings';
 import { RulesScreen } from './RulesScreen';
@@ -24,10 +25,10 @@ function elementsOf(node: ReactNode): ReactElement<AnyProps>[] {
 }
 
 describe('RulesWindowFrame', () => {
-  it('a sidebar with Qoidalar, Jurnal and Sozlamalar; the current one is marked', () => {
+  it('a sidebar with Qoidalar, Jurnal, Diagnostika and Sozlamalar; the current one is marked', () => {
     const html = renderMarkup(frame('log'));
-    expect(SECTIONS.map((section) => section.id)).toEqual(['rules', 'log', 'settings']);
-    for (const label of ['Qoidalar', 'Jurnal', 'Sozlamalar']) expect(html).toContain(label);
+    expect(SECTIONS.map((section) => section.id)).toEqual(['rules', 'log', 'diagnostics', 'settings']);
+    for (const label of ['Qoidalar', 'Jurnal', 'Diagnostika', 'Sozlamalar']) expect(html).toContain(label);
     expect(html.match(/aria-current="page"/g)).toHaveLength(1);
     expect(html).toMatch(/aria-current="page"[^>]*>.*Jurnal/);
     expect(html).toContain('data-screen="log"');
@@ -37,9 +38,11 @@ describe('RulesWindowFrame', () => {
   it('choosing an item selects its section', () => {
     const onSelect = vi.fn();
     const buttons = elementsOf(frame('rules', CONNECTED, onSelect)).filter((element) => element.type === 'button');
-    expect(buttons).toHaveLength(3);
+    expect(buttons).toHaveLength(4);
     buttons[2]?.props.onClick?.();
-    expect(onSelect).toHaveBeenCalledWith('settings');
+    expect(onSelect).toHaveBeenCalledWith('diagnostics');
+    buttons[3]?.props.onClick?.();
+    expect(onSelect).toHaveBeenLastCalledWith('settings');
   });
 
   it('the helper box: running with its version, or why not', () => {
@@ -140,9 +143,10 @@ describe('SECTION_SCREENS', () => {
   const screenOf = (section: RulesSection) =>
     (SECTION_SCREENS[section] as (props: { onAddRule: () => void; onEditRule: (id: string) => void }) => ReactElement)({ onAddRule, onEditRule });
 
-  it('wires the rules, journal and settings screens', () => {
+  it('wires the rules, journal, diagnostics and settings screens', () => {
     expect(screenOf('rules').type as ComponentType).toBe(RulesScreen);
     expect(screenOf('log').type as ComponentType).toBe(LogScreen);
+    expect(screenOf('diagnostics').type as ComponentType).toBe(DiagnosticsScreen);
     expect(screenOf('settings').type as ComponentType).toBe(SettingsScreen);
   });
 

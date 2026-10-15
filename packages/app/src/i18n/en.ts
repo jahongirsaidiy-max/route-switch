@@ -12,6 +12,7 @@ import { componentsEn } from './sections/components.en';
 import { logEn } from './sections/log.en';
 import { settingsEn } from './sections/settings.en';
 import { backupEn } from './sections/backup.en';
+import { diagnosticsEn } from './sections/diagnostics.en';
 
 const unexpected = (code: string): string => `Unexpected error (${code}).`;
 
@@ -218,4 +219,6 @@ export const en: Messages = {
   /** The rules window and the add-rule dialog (TASK-DELTA-13): `sections/rules.*`, `sections/addRule.*`. */
   rules: rulesEn,
   addRule: addRuleEn,
+  /** The "Diagnostika" section of the rules window (TASK-DELTA-20): `sections/diagnostics.*`. */
+  diagnostics: diagnosticsEn,
 };

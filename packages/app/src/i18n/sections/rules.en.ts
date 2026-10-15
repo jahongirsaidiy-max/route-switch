@@ -8,7 +8,7 @@ import type { rulesUz } from './rules.uz';
 const rules = (count: number): string => `${String(count)} ${plural('en', count, { one: 'rule', other: 'rules' })}`;
 
 export const rulesEn: Shape<typeof rulesUz> = {
-  sections: { rules: 'Rules', log: 'Log', settings: 'Settings' },
+  sections: { rules: 'Rules', log: 'Log', diagnostics: 'Diagnostics', settings: 'Settings' },
   sectionsNav: 'Sections',
   helperDaemon: (version) => `root daemon · v${version}`,
 
