@@ -295,9 +295,11 @@ export interface EngineDeps {
    * config, once per pass, before the plan; the result's problems make the
    * rules `error`. The daemon passes `resolverFiles.sync`. A throw or a
    * rejection is logged and makes every rule that needs a file `error` /
-   * `resolver-failed`.
+   * `resolver-failed`. The second argument tells the daemon the DNS servers
+   * the pass knows for each role, which its DNS proxy forwards wildcard names
+   * to (ADR-002 §2); the state of that proxy is the daemon's own.
    */
-  readonly syncResolvers?: ((config: Config) => ResolverSync | Promise<ResolverSync>) | undefined;
+  readonly syncResolvers?: ((config: Config, context: ResolverSyncContext) => ResolverSync | Promise<ResolverSync>) | undefined;
   /** Monotonic clock (ms) for the state announcements of `dns-learned` passes; defaults to `performance.now`. */
   readonly monotonicNow?: (() => number) | undefined;
   /** Timers for the coalesced announcements and the wait bound of `learn`; default to `setTimeout` / `clearTimeout`. */
@@ -346,9 +348,23 @@ export interface LearnResult {
   readonly routed: number;
 }
 
-/** What `EngineDeps.syncResolvers` reports: rule id -> why its resolver file is not in place. */
+/**
+ * What `EngineDeps.syncResolvers` reports: rule id -> why its resolver file is
+ * not in place. A `pending` issue makes the rule `pending` (it waits, e.g. for
+ * the DNS proxy to start); any other makes it `error`.
+ */
 export interface ResolverSync {
-  readonly issues: ReadonlyMap<string, { readonly reasonCode: RuleReasonCode; readonly reason: string }>;
+  readonly issues: ReadonlyMap<string, { readonly reasonCode: RuleReasonCode; readonly reason: string; readonly pending?: boolean | undefined }>;
+}
+
+/** What a pass knows when it syncs the resolver files. */
+export interface ResolverSyncContext {
+  /**
+   * DNS servers of each role's interface from the last trusted detection
+   * (the servers a domain rule without `dns` asks); a role is missing while
+   * they are not known.
+   */
+  readonly roleDnsServers: Readonly<Partial<Record<IfaceRole, readonly string[]>>>;
 }
 
 export interface Engine {
@@ -518,6 +534,8 @@ const NO_INTERFACES: WireInterfaces = { interfaces: { ethernet: DOWN, wifi: DOWN
 interface Issue {
   readonly reasonCode: RuleReasonCode;
   readonly reason: string;
+  /** The rule waits rather than fails (a resolver issue such as a DNS proxy still starting): `pending`, not `error`. */
+  readonly pending?: boolean | undefined;
 }
 
 interface Verdict {
@@ -1045,13 +1063,16 @@ export const createEngine = (deps: EngineDeps): Engine => {
   const safeSyncResolvers = async (snapshot: Config): Promise<ResolverSync['issues']> => {
     if (deps.syncResolvers === undefined) return new Map();
     try {
-      return (await deps.syncResolvers(snapshot)).issues;
+      return (await deps.syncResolvers(snapshot, { roleDnsServers: { ...trustedDns } })).issues;
     } catch (error) {
       const thrown = describeThrown(error);
       logger.error('resolver file sync threw', { error: thrown });
       const failed = { reasonCode: 'resolver-failed' as const, reason: `Resolver files could not be synced: ${thrown}` };
       return new Map(
-        snapshot.rules.filter((rule) => rule.kind === 'domain' && rule.dns !== undefined).map((rule) => [rule.id, failed]),
+        // Every rule that needs a file: an exact one with its own `dns`, and every wildcard one (the proxy's file).
+        snapshot.rules
+          .filter((rule) => rule.kind === 'domain' && (rule.dns !== undefined || isWildcardRule(rule)))
+          .map((rule) => [rule.id, failed]),
       );
     }
   };
@@ -1291,7 +1312,9 @@ export const createEngine = (deps: EngineDeps): Engine => {
     // and also while its interface is down: the file does not depend on the interface.
     for (const [ruleId, issue] of resolverIssues) {
       const draft = drafts.get(ruleId);
-      if (draft !== undefined && draft.base.status !== 'disabled') draft.issue = { reasonCode: issue.reasonCode, reason: issue.reason };
+      if (draft !== undefined && draft.base.status !== 'disabled') {
+        draft.issue = { reasonCode: issue.reasonCode, reason: issue.reason, ...(issue.pending === true ? { pending: true } : {}) };
+      }
     }
 
     // Only a clean detection can say "this interface really has no known subnet".
@@ -1569,7 +1592,7 @@ export const createEngine = (deps: EngineDeps): Engine => {
       if (issue === null) continue;
       const signature = `${issue.reasonCode}|${issue.reason}`;
       next.set(ruleId, signature);
-      logger.log(reportedIssues.get(ruleId) === signature ? 'debug' : 'warn', 'rule cannot be applied', {
+      logger.log(reportedIssues.get(ruleId) === signature ? 'debug' : issue.pending === true ? 'info' : 'warn', 'rule cannot be applied', {
         reason,
         ruleId,
         target: rule.target,
@@ -1883,7 +1906,11 @@ export const createEngine = (deps: EngineDeps): Engine => {
     lastDeferred = counters.deferred;
     const owning = new Set([...applied.values()].flatMap((entry) => entry.ruleIds));
     const verdictOf = (draft: Draft): Verdict => {
-      if (draft.issue !== null) return errorVerdict(draft.issue.reasonCode, draft.issue.reason);
+      if (draft.issue !== null) {
+        return draft.issue.pending === true
+          ? { status: 'pending', reasonCode: draft.issue.reasonCode, reason: draft.issue.reason }
+          : errorVerdict(draft.issue.reasonCode, draft.issue.reason);
+      }
       // A rule that already has routes keeps its status; one with nothing applied waits.
       // A rule that is waiting anyway (a domain still resolving) keeps its own reason.
       if (draft.deferred && !owning.has(draft.rule.id) && draft.base.status !== 'pending') return DEFERRED;

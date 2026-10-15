@@ -474,3 +474,146 @@ describe('runDiagnose: a name', () => {
     expect(h.memory.entries.map((entry) => entry.msg)).toEqual(['dns probe', 'diagnosed']);
   });
 });
+
+describe('wildcard rules (TASK-DELTA-28)', () => {
+  const WILD = id(20);
+  const DEEP = id(21);
+  const EXACT = id(22);
+  const wildRules = (extra: ConfigInput['rules'] = []): Config =>
+    config([{ id: WILD, kind: 'domain', target: '*.corp.local', iface: 'wifi' }, ...extra]);
+
+  describe('matchDomain', () => {
+    it('a name under the base falls under the wildcard; the base itself and a look-alike do not', () => {
+      expect(matchDomain('app.corp.local', wildRules()).match).toEqual({ ruleId: WILD, via: 'wildcard', precedence: 'only-match' });
+      expect(matchDomain('a.b.corp.local', wildRules()).match?.ruleId).toBe(WILD);
+      expect(matchDomain('corp.local', wildRules())).toEqual({ match: null, rule: null, disabledCover: false });
+      expect(matchDomain('badcorp.local', wildRules()).match).toBeNull();
+    });
+
+    it('the deepest base wins; an exact rule beats every wildcard', () => {
+      const rules = wildRules([
+        { id: DEEP, kind: 'domain', target: '*.lab.corp.local', iface: 'ethernet' },
+        { id: EXACT, kind: 'domain', target: 'db.lab.corp.local', iface: 'ethernet' },
+      ]);
+      expect(matchDomain('x.lab.corp.local', rules).match).toEqual({ ruleId: DEEP, via: 'wildcard', precedence: 'deeper-wildcard' });
+      expect(matchDomain('db.lab.corp.local', rules).match).toEqual({ ruleId: EXACT, via: 'domain', precedence: 'exact-domain' });
+      expect(matchDomain('app.corp.local', rules).match).toEqual({ ruleId: WILD, via: 'wildcard', precedence: 'only-match' });
+    });
+
+    it('two wildcards with one base: the first in the config, by config order', () => {
+      const rules = config([
+        { id: WILD, kind: 'domain', target: '*.corp.local', iface: 'wifi' },
+        { id: DEEP, kind: 'domain', target: '*.corp.local', iface: 'wifi', dns: '10.30.0.53' },
+      ]);
+      expect(matchDomain('app.corp.local', rules).match).toEqual({ ruleId: WILD, via: 'wildcard', precedence: 'config-order' });
+    });
+
+    it('a disabled wildcard or the toggle off covers nothing, and says a switched-off rule would', () => {
+      const off = config([{ id: WILD, kind: 'domain', target: '*.corp.local', iface: 'wifi', enabled: false }]);
+      expect(matchDomain('app.corp.local', off)).toEqual({ match: null, rule: null, disabledCover: true });
+      expect(matchDomain('app.corp.local', config([{ id: WILD, kind: 'domain', target: '*.corp.local', iface: 'wifi' }], false)).match).toBeNull();
+    });
+  });
+
+  describe('matchAddress', () => {
+    it('a learned address is a host route of the wildcard (`via: wildcard`)', () => {
+      const rules = wildRules([{ id: id(1), kind: 'subnet', target: '10.0.0.0/8', iface: 'ethernet' }]);
+      const cached: CachedAddresses = (ruleId) => (ruleId === WILD ? ['10.30.0.5'] : null);
+      expect(matchAddress('10.30.0.5', rules, cached).match).toEqual({ ruleId: WILD, via: 'wildcard', precedence: 'domain-address' });
+    });
+
+    it('for one address: exact domain > deeper wildcard > shallower wildcard, whatever the config order (ADR-002 §3)', () => {
+      const rules = wildRules([
+        { id: DEEP, kind: 'domain', target: '*.lab.corp.local', iface: 'ethernet' },
+        { id: EXACT, kind: 'domain', target: 'db.example.com', iface: 'ethernet' },
+      ]);
+      const all: CachedAddresses = () => ['10.30.0.5'];
+      expect(matchAddress('10.30.0.5', rules, all).match).toEqual({ ruleId: EXACT, via: 'domain', precedence: 'exact-domain' });
+      const wildcards: CachedAddresses = (ruleId) => (ruleId === EXACT ? null : ['10.30.0.5']);
+      expect(matchAddress('10.30.0.5', rules, wildcards).match).toEqual({ ruleId: DEEP, via: 'wildcard', precedence: 'deeper-wildcard' });
+    });
+  });
+
+  describe('runDiagnose: a name under a wildcard', () => {
+    const NAME = 'app.corp.local';
+    const wildState = (reasonCode: RuleState['reasonCode'] = null): EngineState =>
+      state({
+        rules: [
+          {
+            ruleId: WILD,
+            status: reasonCode === null ? 'active' : 'error',
+            reasonCode,
+            reason: reasonCode === null ? null : 'x',
+            appliedDestinations: [],
+            lastResolvedAt: null,
+          },
+        ],
+      });
+    const PEEK: Record<string, CachedDomain> = { [WILD]: { addresses: null, truncated: false, servers: ['192.168.1.1'], source: 'interface' } };
+
+    it('queries the name itself through the proxy\'s upstream and shows its learned route', async () => {
+      const h = setup({
+        config: wildRules(),
+        state: wildState(),
+        cache: PEEK,
+        applied: [{ dst: '10.30.0.5', gateway: '192.168.1.1', ruleIds: [WILD] }],
+        routes: { '10.30.0.5': found('10.30.0.5', 'en0', '192.168.1.1') },
+      });
+      const result = await h.run(NAME);
+      expect(h.probes).toEqual([`192.168.1.1 ${NAME}`]);
+      expect(result).toEqual({
+        target: NAME,
+        targetKind: 'domain',
+        match: { ruleId: WILD, via: 'wildcard', precedence: 'only-match' },
+        addresses: [
+          {
+            address: '10.30.0.5',
+            source: 'query',
+            route: { device: 'en0', gateway: '192.168.1.1', role: 'wifi' },
+            expectedRole: 'wifi',
+            matchesExpected: true,
+          },
+        ],
+        dns: { server: '192.168.1.1', role: 'wifi', resolverFile: '/etc/resolver/corp.local', outcome: 'ok', ms: 4 },
+        notes: [],
+      });
+    });
+
+    it('an address not learned yet still belongs to the wildcard: `not-applied`, expected on its interface', async () => {
+      const h = setup({ config: wildRules(), state: wildState(), cache: PEEK, applied: [] });
+      const result = await h.run(NAME);
+      expect(result.addresses[0]).toMatchObject({ address: '10.30.0.5', expectedRole: 'wifi', matchesExpected: false });
+      expect(result.notes).toEqual(['not-applied', 'route-mismatch']);
+    });
+
+    it('asks the rule\'s own `dns` when it has one', async () => {
+      const rules = config([{ id: WILD, kind: 'domain', target: '*.corp.local', iface: 'wifi', dns: '10.30.0.53' }]);
+      const h = setup({ config: rules, state: wildState(), applied: [{ dst: '10.30.0.5', gateway: '192.168.1.1', ruleIds: [WILD] }] });
+      await h.run(NAME);
+      expect(h.probes).toEqual([`10.30.0.53 ${NAME}`]);
+    });
+
+    it('has no resolver file while the proxy cannot listen', async () => {
+      const h = setup({ config: wildRules(), state: wildState('dns-proxy-unavailable'), cache: PEEK, applied: [] });
+      expect((await h.run(NAME)).dns).toMatchObject({ server: '192.168.1.1', resolverFile: null });
+    });
+
+    it('the base itself is not covered: nothing is looked up', async () => {
+      const h = setup({ config: wildRules(), state: wildState(), cache: PEEK });
+      expect((await h.run('corp.local')).notes).toEqual(['name-not-covered']);
+      expect(h.probes).toEqual([]);
+    });
+
+    it('an address learned for the wildcard is explained as such when asked for by address', async () => {
+      const h = setup({
+        config: wildRules(),
+        state: wildState(),
+        applied: [{ dst: '10.30.0.5', gateway: '192.168.1.1', ruleIds: [WILD] }],
+        routes: { '10.30.0.5': found('10.30.0.5', 'en0', '192.168.1.1') },
+      });
+      const result = await h.run('10.30.0.5');
+      expect(result.match).toEqual({ ruleId: WILD, via: 'wildcard', precedence: 'only-match' });
+      expect(result.notes).toEqual([]);
+    });
+  });
+});

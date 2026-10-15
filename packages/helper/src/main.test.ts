@@ -8,9 +8,35 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import type { ConfigFileRead, ConfigFileReader } from './config-store';
 import { LOOKUP_TIMEOUT_MS } from './dns';
-import { createFakeDns, createFakeScheduler, dnsError, flush, type FakeDns, type FakeScheduler } from './dns-test-utils';
+import {
+  createFakeDns,
+  createFakeNetwork,
+  createFakeScheduler,
+  dnsError,
+  flush,
+  type FakeDns,
+  type FakeNetwork,
+  type FakeScheduler,
+} from './dns-test-utils';
 import { createLogger } from './logger';
-import { EXIT_CODES, HELPER_VERSION, ONE_SHOT_DNS_WAIT_MS, SHUTDOWN_EXIT_TIMEOUT_SEC, USAGE, cleanupAll, createCore, parseArgs, run, type RunDeps } from './main';
+import {
+  EXIT_CODES,
+  HELPER_VERSION,
+  ONE_SHOT_DNS_WAIT_MS,
+  SHUTDOWN_EXIT_TIMEOUT_SEC,
+  USAGE,
+  cleanupAll,
+  createCore,
+  createWildcardProxyControl,
+  parseArgs,
+  proxyFileStatus,
+  run,
+  systemServerAddresses,
+  wantsWildcardProxy,
+  type RunDeps,
+  type WildcardProxyDeps,
+} from './main';
+import type { DnsProxy, DnsProxyOptions, DnsProxyState } from './dns-proxy/server';
 import type { ProcessSpawner } from './exec';
 import { connectTestClient } from './socket-test-client';
 import { createStateStore } from './state-store';
@@ -19,6 +45,15 @@ import { assertFsGuardInstalled } from './test-fs-guard-check';
 
 // Touches the file system: refuse to run at all without the guard of the test setup.
 assertFsGuardInstalled();
+
+// The DNS proxy (TASK-DELTA-28) must never bind a real port here: every harness passes a fake network,
+// and a UDP socket opened through the default factory would hit this trap instead of the OS.
+vi.mock('node:dgram', () => {
+  const trap = (): never => {
+    throw Object.assign(new Error('ETESTNETGUARD: a test tried to open a real UDP socket'), { code: 'ETESTNETGUARD' });
+  };
+  return { createSocket: trap, default: { createSocket: trap } };
+});
 
 const ROUTE = '/sbin/route';
 const NETWORKSETUP = '/usr/sbin/networksetup';
@@ -104,6 +139,8 @@ interface Harness {
   /** DNS queries never reach the network: they stay open until a test answers them or sets `dns.auto`. */
   readonly dns: FakeDns;
   readonly scheduler: FakeScheduler;
+  /** Sockets of the DNS proxy: nothing is ever bound for real. */
+  readonly network: FakeNetwork;
   readonly out: string[];
   readonly err: string[];
   readonly configPaths: string[];
@@ -116,6 +153,7 @@ const harness = (file: unknown = CONFIG, extra: Partial<RunDeps> = {}): Harness 
   const runner = machine();
   const dns = createFakeDns();
   const scheduler = createFakeScheduler(NOW);
+  const network = createFakeNetwork();
   const out: string[] = [];
   const err: string[] = [];
   const configPaths: string[] = [];
@@ -144,11 +182,13 @@ const harness = (file: unknown = CONFIG, extra: Partial<RunDeps> = {}): Harness 
       // Never the real socket: a path in a temporary directory, left with the owner it was created with.
       socketPath: join(newResolverDir(), 's.sock'),
       socketOwner: null,
+      dnsProxySockets: network.factory,
       ...extra,
     },
     runner,
     dns,
     scheduler,
+    network,
     out,
     err,
     configPaths,
@@ -1799,5 +1839,441 @@ describe('run without --once (daemon): state.json and cleanup', () => {
         });
       });
     }
+  });
+  describe('the DNS proxy of wildcard rules (TASK-DELTA-28)', () => {
+    const ID_W = '00000000-0000-4000-8000-000000000009';
+    const WILD = { id: ID_W, kind: 'domain', target: '*.corp.local', iface: 'ethernet' };
+    const WILD_CONFIG = { version: 1, rules: [...CONFIG.rules, WILD] };
+    const PROXY_FILE = `nameserver 127.0.0.1\nport 954\n${MARKER}\n`;
+    const msgIndex = (daemon: Daemon, msg: string, from = 0): number =>
+      daemon.h.logs().findIndex((entry, index) => index >= from && entry['msg'] === msg);
+    const fileOf = (daemon: Daemon): string | null =>
+      existsSync(join(daemon.resolverDir, 'corp.local')) ? readFileSync(join(daemon.resolverDir, 'corp.local'), 'utf8') : null;
+    const ruleState = async (client: Awaited<ReturnType<typeof connectTestClient>>, id: number): Promise<unknown> => {
+      const response = await client.request({ id, method: 'status' });
+      return response.ok ? EngineState.parse(response.result['state']).rules.find((rule) => rule.ruleId === ID_W) : null;
+    };
+
+    it('starts after the leftovers are cleaned up and the first pass ran, writes the proxy file, and stops before the cleanup at SIGTERM', async () => {
+      const daemon = startDaemon({ file: WILD_CONFIG });
+      await running(daemon);
+      await vi.waitFor(() => {
+        expect(fileOf(daemon)).toBe(PROXY_FILE);
+      });
+      const { network } = daemon.h;
+      // Loopback only, port 954, UDP and TCP.
+      expect(network.udpSockets.map((socket) => socket.bound)).toEqual([{ port: 954, address: '127.0.0.1' }]);
+      expect(network.tcpServers.map((server) => server.listening)).toEqual([{ port: 954, address: '127.0.0.1' }]);
+      const recovered = msgIndex(daemon, 'cleanup finished');
+      const firstPass = msgIndex(daemon, 'reconcile finished');
+      const started = msgIndex(daemon, 'starting the DNS proxy for wildcard rules');
+      expect(recovered).toBeGreaterThanOrEqual(0);
+      expect(firstPass).toBeGreaterThan(recovered);
+      expect(started).toBeGreaterThan(firstPass);
+      // The first pass ran without the proxy: the rule waited, it was not an error, and no file was written then.
+      expect(daemon.h.logs()[firstPass]).toMatchObject({ reason: 'startup' });
+      expect(daemon.h.logs().find((entry) => entry['msg'] === 'rule cannot be applied' && entry['ruleId'] === ID_W)).toMatchObject({
+        level: 'info',
+        reasonCode: 'dns-proxy-unavailable',
+      });
+
+      daemon.signal();
+      expect(await daemon.exit).toBe(EXIT_CODES.ok);
+      const stopping = msgIndex(daemon, 'stopping the DNS proxy');
+      const shutdown = msgIndex(daemon, 'shutting down');
+      const finalCleanup = msgIndex(daemon, 'cleanup finished', shutdown);
+      expect(stopping).toBeGreaterThan(shutdown);
+      expect(finalCleanup).toBeGreaterThan(stopping);
+      expect(daemon.h.logs()[stopping]).toMatchObject({ why: 'shutting down' });
+      expect(network.udpSockets.every((socket) => socket.closed)).toBe(true);
+      expect(network.tcpServers.every((server) => server.closed)).toBe(true);
+      expect(fileOf(daemon)).toBeNull();
+      expect(daemon.h.scheduler.pending()).toBe(0);
+    });
+
+    it('never starts without an enabled wildcard rule; starts with the first one a setConfig brings, stops after the last goes', async () => {
+      const dir = newResolverDir();
+      const socketPath = join(dir, 's.sock');
+      const daemon = startDaemon({ socketPath, argv: ['--config', join(dir, 'config.json')] });
+      await running(daemon);
+      expect(daemon.h.network.udpSockets).toEqual([]);
+      const client = await connectTestClient(socketPath);
+
+      // A switched-off wildcard does not count.
+      await client.request({ id: 1, method: 'setConfig', config: { version: 1, rules: [{ ...WILD, enabled: false }] } });
+      expect(daemon.h.network.udpSockets).toEqual([]);
+
+      // Started inside the pass, before its files: the rule is active at once, never pending or in error.
+      expect((await client.request({ id: 2, method: 'setConfig', config: WILD_CONFIG })).ok).toBe(true);
+      expect(daemon.h.network.udpSockets[0]?.bound).toEqual({ port: 954, address: '127.0.0.1' });
+      expect(fileOf(daemon)).toBe(PROXY_FILE);
+      expect(await ruleState(client, 3)).toMatchObject({ status: 'active', reasonCode: null });
+
+      await client.request({ id: 4, method: 'setConfig', config: CONFIG });
+      expect(fileOf(daemon)).toBeNull();
+      expect(daemon.h.network.udpSockets[0]?.closed).toBe(true);
+      // The file went first, then the proxy (no name is sent to a proxy that is gone).
+      expect(msgIndex(daemon, 'stopping the DNS proxy')).toBeGreaterThan(msgIndex(daemon, 'resolver file removed'));
+
+      daemon.signal();
+      expect(await daemon.exit).toBe(EXIT_CODES.ok);
+    });
+
+    it('port 954 in use: no file (normal DNS keeps working), the rule is `error` / `dns-proxy-unavailable`, and a later retry fixes it', async () => {
+      const dir = newResolverDir();
+      const socketPath = join(dir, 's.sock');
+      const network = createFakeNetwork();
+      network.bindErrors.push('EADDRINUSE');
+      const daemon = startDaemon({ socketPath, file: WILD_CONFIG, argv: ['--config', join(dir, 'config.json')], extra: { dnsProxySockets: network.factory } });
+      await running(daemon);
+      const client = await connectTestClient(socketPath);
+      await vi.waitFor(async () => {
+        expect(await ruleState(client, 1)).toMatchObject({ status: 'error', reasonCode: 'dns-proxy-unavailable' });
+      });
+      expect(((await ruleState(client, 2)) as { reason: string }).reason).toContain('EADDRINUSE');
+      expect(fileOf(daemon)).toBeNull();
+      // The other rules are applied as usual.
+      expect(daemon.table.routes.size).toBe(2);
+
+      // The proxy retries on its own (5 s first); the pass it asks for writes the file.
+      daemon.h.scheduler.advance(5000);
+      await vi.waitFor(() => {
+        expect(fileOf(daemon)).toBe(PROXY_FILE);
+      });
+      await vi.waitFor(async () => {
+        expect(await ruleState(client, 3)).toMatchObject({ status: 'active' });
+      });
+      expect(daemon.h.logs().find((entry) => entry['msg'] === 'DNS proxy state changed; resolver files follow')).toMatchObject({ state: 'running' });
+
+      daemon.signal();
+      expect(await daemon.exit).toBe(EXIT_CODES.ok);
+      expect(daemon.h.scheduler.pending()).toBe(0);
+    });
+
+    it('a shutdown while the bind is being retried cancels the retry: nothing is left pending', async () => {
+      const network = createFakeNetwork();
+      network.bindErrors.push('EADDRINUSE');
+      const daemon = startDaemon({ file: WILD_CONFIG, extra: { dnsProxySockets: network.factory } });
+      await running(daemon);
+      await vi.waitFor(() => {
+        expect(daemon.h.logs().find((entry) => entry['msg'] === 'DNS proxy could not listen; wildcard domains are unavailable')).toMatchObject({
+          code: 'EADDRINUSE',
+          port: 954,
+          retryInMs: 5000,
+        });
+      });
+      daemon.signal();
+      expect(await daemon.exit).toBe(EXIT_CODES.ok);
+      expect(daemon.h.scheduler.pending()).toBe(0);
+      expect(network.udpSockets.every((socket) => socket.closed)).toBe(true);
+    });
+
+    it('global toggle off: the proxy stops first, then everything is removed; on again starts it again', async () => {
+      const dir = newResolverDir();
+      const socketPath = join(dir, 's.sock');
+      const daemon = startDaemon({ socketPath, file: WILD_CONFIG, argv: ['--config', join(dir, 'config.json')] });
+      await running(daemon);
+      await vi.waitFor(() => {
+        expect(fileOf(daemon)).toBe(PROXY_FILE);
+      });
+      const client = await connectTestClient(socketPath);
+      const before = daemon.h.logs().length;
+
+      expect((await client.request({ id: 1, method: 'setEnabled', enabled: false })).ok).toBe(true);
+      const stopping = msgIndex(daemon, 'stopping the DNS proxy', before);
+      expect(daemon.h.logs()[stopping]).toMatchObject({ why: 'routing turned off' });
+      expect(msgIndex(daemon, 'cleanup finished', before)).toBeGreaterThan(stopping);
+      expect(fileOf(daemon)).toBeNull();
+      expect(daemon.table.routes.size).toBe(0);
+      expect(daemon.h.network.udpSockets.every((socket) => socket.closed)).toBe(true);
+
+      expect((await client.request({ id: 2, method: 'setEnabled', enabled: true })).ok).toBe(true);
+      expect(fileOf(daemon)).toBe(PROXY_FILE);
+      expect(daemon.h.network.udpSockets.at(-1)?.closed).toBe(false);
+
+      daemon.signal();
+      expect(await daemon.exit).toBe(EXIT_CODES.ok);
+    });
+
+    it('uninstall: the proxy stops before the cleanup and never starts again', async () => {
+      const dir = newResolverDir();
+      const socketPath = join(dir, 's.sock');
+      const daemon = startDaemon({ socketPath, file: WILD_CONFIG, argv: ['--config', join(dir, 'config.json')] });
+      await running(daemon);
+      await vi.waitFor(() => {
+        expect(fileOf(daemon)).toBe(PROXY_FILE);
+      });
+      const client = await connectTestClient(socketPath);
+      const before = daemon.h.logs().length;
+      expect(await client.request({ id: 1, method: 'uninstall' })).toEqual({ id: 1, ok: true, result: {} });
+      const stopping = msgIndex(daemon, 'stopping the DNS proxy', before);
+      expect(stopping).toBeGreaterThanOrEqual(0);
+      expect(msgIndex(daemon, 'cleanup finished', before)).toBeGreaterThan(stopping);
+      expect(fileOf(daemon)).toBeNull();
+      expect(daemon.h.network.udpSockets).toHaveLength(1);
+
+      daemon.signal();
+      expect(await daemon.exit).toBe(EXIT_CODES.ok);
+      expect(daemon.h.network.udpSockets).toHaveLength(1);
+    });
+
+    it('after a crash: a proxy file left behind is removed at the start, also when no wildcard rule is left', async () => {
+      const resolverDir = newResolverDir();
+      writeFileSync(join(resolverDir, 'corp.local'), PROXY_FILE);
+      writeFileSync(join(resolverDir, '.routeswitch-lab.local.tmp'), 'nameserver 127.0.0.1\nport 9');
+      const daemon = startDaemon({ resolverDir });
+      await running(daemon);
+      expect(readdirSync(resolverDir)).toEqual([]);
+      expect(daemon.h.network.udpSockets).toEqual([]);
+      daemon.signal();
+      expect(await daemon.exit).toBe(EXIT_CODES.ok);
+    });
+
+    it('a signal during the startup: the proxy never starts', async () => {
+      const daemon = startDaemon({ file: WILD_CONFIG, signalAtOnce: 'SIGTERM' });
+      expect(await daemon.exit).toBe(EXIT_CODES.ok);
+      expect(daemon.h.network.udpSockets).toEqual([]);
+      expect(readdirSync(daemon.resolverDir)).toEqual([]);
+    });
+  });
+});
+
+describe('createWildcardProxyControl (TASK-DELTA-28)', () => {
+  const ID_W = '00000000-0000-4000-8000-000000000009';
+  const ID_D = '00000000-0000-4000-8000-000000000008';
+  const WILD = { id: ID_W, enabled: true, kind: 'domain', target: '*.corp.local', iface: 'ethernet', refreshSec: 600 } as const;
+  const parse = (rules: readonly unknown[], enabled = true): Config => Config.parse({ version: 1, enabled, rules });
+  const WITH = parse([WILD]);
+  const WITHOUT = parse([CONFIG.rules[0]]);
+  const CONTEXT = { roleDnsServers: { ethernet: ['10.20.0.53', '127.0.0.1'], wifi: ['192.168.1.1'] } };
+
+  /** A proxy that only records: `start` binds unless `failBind`; its options are kept for the tests. */
+  const setup = (initial: Config = WITH, extra: Partial<WildcardProxyDeps> = {}) => {
+    let config = initial;
+    const calls: string[] = [];
+    const reconciles: number[] = [];
+    let state: DnsProxyState = 'stopped';
+    let failBind = false;
+    let options: DnsProxyOptions | null = null;
+    const setState = (next: DnsProxyState): void => {
+      state = next;
+      options?.onStatus?.({ state, address: '127.0.0.1', port: 954, lastError: next === 'unavailable' ? 'EADDRINUSE' : null, stats: { forwarded: 0, servfail: 0, refused: 0, dropped: 0, learnTimeouts: 0 } });
+    };
+    const proxy: DnsProxy = {
+      start: () => {
+        calls.push('start');
+        setState('starting');
+        setState(failBind ? 'unavailable' : 'running');
+        return Promise.resolve();
+      },
+      stop: () => {
+        calls.push('stop');
+        setState('stopped');
+        return Promise.resolve();
+      },
+      status: () => ({ state, address: '127.0.0.1', port: 954, lastError: state === 'unavailable' ? 'EADDRINUSE' : null, stats: { forwarded: 0, servfail: 0, refused: 0, dropped: 0, learnTimeouts: 0 } }),
+    };
+    const scheduler = createFakeScheduler(NOW);
+    const control = createWildcardProxyControl({
+      logger: createLogger({ sinks: [] }),
+      getConfig: () => config,
+      learn: () => Promise.resolve(null),
+      systemServers: () => ['192.0.2.53', '::1', '198.51.100.53:5353'],
+      requestReconcile: () => {
+        reconciles.push(1);
+      },
+      setTimer: scheduler.setTimer,
+      clearTimer: scheduler.clearTimer,
+      createProxy: (given) => {
+        options = given;
+        return proxy;
+      },
+      ...extra,
+    });
+    return {
+      control,
+      calls,
+      reconciles,
+      options: (): DnsProxyOptions => {
+        if (options === null) throw new Error('no proxy');
+        return options;
+      },
+      setConfig: (next: Config) => {
+        config = next;
+      },
+      failBind: () => {
+        failBind = true;
+      },
+      /** The proxy changes state on its own (a retried bind). */
+      emit: setState,
+    };
+  };
+
+  it('--once runs no proxy: a wildcard rule is `error` / `dns-proxy-unavailable`, gets no file, and no socket is opened', async () => {
+    const h = harness({ version: 1, rules: [WILD] });
+    expect(await run(['--once'], h.deps)).toBe(EXIT_CODES.ruleError);
+    const state = EngineState.parse(JSON.parse(h.out.join('')));
+    expect(state.rules[0]).toMatchObject({ status: 'error', reasonCode: 'dns-proxy-unavailable' });
+    expect(readdirSync(h.deps.resolverDir ?? '')).toEqual([]);
+    expect(h.network.udpSockets).toEqual([]);
+    expect(h.network.tcpServers).toEqual([]);
+  });
+
+  it('decides when it is wanted: an enabled wildcard rule and routing on', () => {
+    expect(wantsWildcardProxy(WITH)).toBe(true);
+    expect(wantsWildcardProxy(WITHOUT)).toBe(false);
+    expect(wantsWildcardProxy(parse([{ ...WILD, enabled: false }]))).toBe(false);
+    expect(wantsWildcardProxy(parse([WILD], false))).toBe(false);
+    expect(wantsWildcardProxy(parse([{ ...WILD, target: 'corp.local' }]))).toBe(false);
+  });
+
+  it('maps the proxy state onto the resolver files', () => {
+    const base = { address: '127.0.0.1', port: 954, stats: { forwarded: 0, servfail: 0, refused: 0, dropped: 0, learnTimeouts: 0 } };
+    expect(proxyFileStatus({ ...base, state: 'running', lastError: null })).toEqual({ state: 'ready' });
+    expect(proxyFileStatus({ ...base, state: 'unavailable', lastError: 'EACCES' })).toEqual({ state: 'unavailable', detail: 'EACCES' });
+    expect(proxyFileStatus({ ...base, state: 'starting', lastError: null })).toEqual({ state: 'starting' });
+    expect(proxyFileStatus({ ...base, state: 'stopped', lastError: null })).toEqual({ state: 'starting' });
+  });
+
+  it('reads only IPv4 system resolvers on port 53', () => {
+    expect(systemServerAddresses(['192.0.2.53', '192.0.2.54:53', '198.51.100.1:5353', '::1', '[::1]:53', 'x'])).toEqual(['192.0.2.53', '192.0.2.54']);
+  });
+
+  it('does not start before `arm` (the startup pass): the rules wait, nothing is bound', async () => {
+    const t = setup();
+    expect(await t.control.beforeSync(WITH, CONTEXT)).toEqual({ state: 'starting' });
+    expect(t.calls).toEqual([]);
+
+    await t.control.arm();
+    expect(t.calls).toEqual(['start']);
+    // The pass that writes the files.
+    expect(t.reconciles).toHaveLength(1);
+    expect(await t.control.beforeSync(WITH, CONTEXT)).toEqual({ state: 'ready' });
+    expect(t.calls).toEqual(['start']);
+  });
+
+  it('`arm` without a wildcard rule starts nothing and asks for no pass', async () => {
+    const t = setup(WITHOUT);
+    await t.control.beforeSync(WITHOUT, CONTEXT);
+    await t.control.arm();
+    expect(t.calls).toEqual([]);
+    expect(t.reconciles).toEqual([]);
+  });
+
+  it('a pass that brings the first wildcard starts it before the files, and asks for no extra pass', async () => {
+    const t = setup(WITHOUT);
+    await t.control.beforeSync(WITHOUT, CONTEXT);
+    await t.control.arm();
+    t.setConfig(WITH);
+    expect(await t.control.beforeSync(WITH, CONTEXT)).toEqual({ state: 'ready' });
+    await t.control.afterSync(WITH);
+    expect(t.calls).toEqual(['start']);
+    expect(t.reconciles).toEqual([]);
+  });
+
+  it('a bind that fails is `unavailable` for the files; the proxy\'s own later success asks for a pass', async () => {
+    const t = setup();
+    t.failBind();
+    await t.control.beforeSync(WITH, CONTEXT);
+    await t.control.arm();
+    expect(t.reconciles).toHaveLength(1);
+    expect(await t.control.beforeSync(WITH, CONTEXT)).toEqual({ state: 'unavailable', detail: 'EADDRINUSE' });
+
+    t.emit('starting');
+    expect(t.reconciles).toHaveLength(1);
+    t.emit('running');
+    expect(t.reconciles).toHaveLength(2);
+    expect(await t.control.beforeSync(WITH, CONTEXT)).toEqual({ state: 'ready' });
+    // Losing it again is told too; the same state twice is not.
+    t.emit('unavailable');
+    t.emit('unavailable');
+    expect(t.reconciles).toHaveLength(3);
+  });
+
+  it('stops after the files when the last wildcard goes, and not while the config still wants it', async () => {
+    const t = setup();
+    await t.control.beforeSync(WITH, CONTEXT);
+    await t.control.arm();
+    await t.control.afterSync(WITH);
+    expect(t.calls).toEqual(['start']);
+    t.setConfig(WITHOUT);
+    await t.control.beforeSync(WITHOUT, CONTEXT);
+    expect(t.calls).toEqual(['start']);
+    await t.control.afterSync(WITHOUT);
+    expect(t.calls).toEqual(['start', 'stop']);
+    // Stopped by the control itself: no pass is asked for.
+    expect(t.reconciles).toHaveLength(1);
+  });
+
+  it('`stop` (toggle off): a pass that started before with the old config does not start it again', async () => {
+    const t = setup();
+    await t.control.arm();
+    t.setConfig(parse([WILD], false));
+    await t.control.stop();
+    // The snapshot of a pass still running still wants it; the config now does not.
+    expect(await t.control.beforeSync(WITH, CONTEXT)).toEqual({ state: 'starting' });
+    expect(t.calls).toEqual(['start', 'stop']);
+
+    t.setConfig(WITH);
+    await t.control.beforeSync(WITH, CONTEXT);
+    expect(t.calls).toEqual(['start', 'stop', 'start']);
+  });
+
+  it('`close` stops it for good: no pass, `arm` or status change starts it or asks for a pass again', async () => {
+    const t = setup();
+    await t.control.arm();
+    await t.control.close();
+    expect(t.calls).toEqual(['start', 'stop']);
+    const passes = t.reconciles.length;
+    await t.control.beforeSync(WITH, CONTEXT);
+    await t.control.arm();
+    t.emit('unavailable');
+    expect(t.calls).toEqual(['start', 'stop']);
+    expect(t.reconciles).toHaveLength(passes);
+  });
+
+  it('answers names by the config now: learn for a wildcard name with the role\'s servers (loopback left out), passthrough for the base, REFUSED (null) outside', async () => {
+    const t = setup(parse([WILD, { id: ID_D, kind: 'domain', target: 'corp.local', iface: 'wifi' }]));
+    await t.control.beforeSync(WITH, CONTEXT);
+    const { resolveRule } = t.options();
+    expect(resolveRule('app.corp.local')).toEqual({ kind: 'learn', ruleId: ID_W, servers: ['10.20.0.53'] });
+    expect(resolveRule('corp.local')).toEqual({ kind: 'passthrough', servers: ['192.0.2.53'] });
+    expect(resolveRule('example.com')).toBeNull();
+    t.setConfig(parse([WILD], false));
+    expect(resolveRule('app.corp.local')).toBeNull();
+    t.setConfig(WITHOUT);
+    expect(resolveRule('app.corp.local')).toBeNull();
+  });
+
+  it('tells `diagnose` the servers of a wildcard rule, and nothing for other rules', async () => {
+    const withDns = parse([{ ...WILD, dns: '10.30.0.53' }, CONFIG.rules[0]]);
+    const t = setup(WITH);
+    await t.control.beforeSync(WITH, CONTEXT);
+    expect(t.control.peekWildcard(ID_W)).toEqual({ addresses: null, truncated: false, servers: ['10.20.0.53'], source: 'interface' });
+    expect(t.control.peekWildcard(ID_A)).toBeNull();
+    t.setConfig(withDns);
+    expect(t.control.peekWildcard(ID_W)).toEqual({ addresses: null, truncated: false, servers: ['10.30.0.53'], source: 'rule' });
+    expect(t.control.peekWildcard('00000000-0000-4000-8000-000000000077')).toBeNull();
+  });
+
+  it('a learn that arrives after its rule went, routing went off or the shutdown is ignored by the engine (QA advisory of DELTA-26)', async () => {
+    const h = harness();
+    const core = createCore(WITH, h.deps, createLogger({ sinks: [] }));
+    const t = setup(WITH, { learn: (ruleId, addresses, ttl) => core.engine.learn(ruleId, addresses, ttl) });
+    await core.engine.reconcile('startup');
+    const { learn } = t.options();
+    expect(await learn(ID_W, ['172.16.40.1'], 600)).toMatchObject({ outcome: 'applied', routed: 1 });
+
+    core.engine.setConfig(WITHOUT);
+    expect(await learn(ID_W, ['172.16.40.2'], 600)).toMatchObject({ outcome: 'ignored', reason: 'not-learning' });
+    core.engine.setConfig(WITH);
+    core.engine.setEnabled(false);
+    expect(await learn(ID_W, ['172.16.40.3'], 600)).toMatchObject({ outcome: 'ignored', reason: 'not-learning' });
+    core.engine.setEnabled(true);
+    await core.engine.clear({ final: true });
+    expect(await learn(ID_W, ['172.16.40.4'], 600)).toMatchObject({ outcome: 'ignored', reason: 'shut-down' });
+    // None of those added a route.
+    expect(h.routeArgv().filter((args) => args[1] === 'add' && String(args[3]).startsWith('172.16.40.'))).toEqual([['-n', 'add', '-host', '172.16.40.1', ETH_GW]]);
+    core.dns.stop();
   });
 });

@@ -11,11 +11,15 @@ import { createLogger, createMemorySink, type LogEntry } from './logger';
 import type { DetectedInterfaces, InterfaceInfo } from './netinfo';
 import {
   MAX_RESOLVER_FILE_BYTES,
+  NO_WILDCARD_PROXY,
   createResolverFiles,
   hasResolverMarker,
+  isCutShortContent,
+  proxyResolverFileContent,
   resolverFileContent,
   resolverFileName,
   type ResolverFs,
+  type WildcardProxyStatus,
 } from './resolver';
 import { createFakeCommandRunner, type FakeCommandRunner } from './test-utils';
 import { assertFsGuardInstalled } from './test-fs-guard-check';
@@ -655,5 +659,297 @@ describe('removeAll: what may be left is counted (TASK-115, fail closed)', () =>
     await writeFile(join(dir, 'user.local'), 'nameserver 10.30.0.54\n');
     expect((await setup().files.removeAll()).notRemoved).toBe(0);
     expect((await setup({ dir: join(root, 'missing') }).files.removeAll()).notRemoved).toBe(0);
+  });
+});
+
+describe('wildcard rules: the files of the DNS proxy (TASK-DELTA-28, ADR-002)', () => {
+  const READY: WildcardProxyStatus = { state: 'ready' };
+  const STARTING: WildcardProxyStatus = { state: 'starting' };
+  const BUSY: WildcardProxyStatus = { state: 'unavailable', detail: 'EADDRINUSE' };
+  const PROXY_FILE = `nameserver 127.0.0.1\nport 954\n${RESOLVER_MARKER}\n`;
+  /** A wildcard rule; without `dns` unless given. */
+  const wildcard = (n: number, target: string, extra: Partial<Rule> = {}): Rule => {
+    const rule: Rule = { id: ruleId(n), enabled: true, kind: 'domain', target, iface: 'ethernet', refreshSec: 600, ...extra };
+    return rule;
+  };
+
+  it('points the base at the proxy: exact content, 0644, the cache flushed once', async () => {
+    const { files, flushes, entries } = setup();
+
+    const result = await files.sync(config([wildcard(1, '*.corp.local')]), READY);
+
+    expect(proxyResolverFileContent()).toBe(PROXY_FILE);
+    expect(result).toEqual({ issues: new Map(), changed: 1, notRemoved: 0 });
+    expect(await list()).toEqual(['corp.local']);
+    expect(await read('corp.local')).toBe(PROXY_FILE);
+    expect((await stat(join(dir, 'corp.local'))).mode & 0o777).toBe(0o644);
+    expect(flushes()).toBe(1);
+    expect(entries.find((entry) => entry.msg === 'resolver file created')?.context).toMatchObject({
+      domain: 'corp.local',
+      server: '127.0.0.1:954',
+      ruleIds: [ruleId(1)],
+    });
+
+    // In place: nothing to do the next time.
+    expect((await files.sync(config([wildcard(1, '*.corp.local')]), READY)).changed).toBe(0);
+    expect(flushes()).toBe(1);
+  });
+
+  it('gives a wildcard with its own `dns` the same proxy file (the proxy forwards to that server)', async () => {
+    const { files } = setup();
+    const result = await files.sync(config([wildcard(1, '*.corp.local', { dns: '10.30.0.53' })]), READY);
+    expect(result.issues).toEqual(new Map());
+    expect(await read('corp.local')).toBe(PROXY_FILE);
+  });
+
+  it('writes one file per base, a deeper wildcard included', async () => {
+    const { files, flushes } = setup();
+    await files.sync(config([wildcard(1, '*.corp.local'), wildcard(2, '*.lab.corp.local', { iface: 'wifi' })]), READY);
+    expect(await list()).toEqual(['corp.local', 'lab.corp.local']);
+    expect(await read('lab.corp.local')).toBe(PROXY_FILE);
+    expect(flushes()).toBe(1);
+  });
+
+  it.each([
+    ['still starting', STARTING, { pending: true, reason: 'The DNS proxy is starting; corp.local is sent to it once it listens' }],
+    [
+      'unable to listen (port in use)',
+      BUSY,
+      {
+        reason:
+          'The DNS proxy cannot listen on 127.0.0.1:954 (EADDRINUSE); names under corp.local use the normal DNS until it can, which is tried again',
+      },
+    ],
+    ['absent (no status given: no proxy in this process)', undefined, { reason: 'Wildcard rules need the DNS proxy of the running helper; this run has none' }],
+  ])('writes no file while the proxy is %s: the names keep the normal DNS, the rule says why', async (_name, proxy, expected) => {
+    const { files, runner } = setup();
+
+    const result = await files.sync(config([wildcard(1, '*.corp.local')]), proxy);
+
+    expect(result.changed).toBe(0);
+    expect(result.issues.get(ruleId(1))).toEqual({ reasonCode: 'dns-proxy-unavailable', ...expected });
+    expect(await list()).toEqual([]);
+    expect(runner.calls).toEqual([]);
+  });
+
+  it('removes the proxy file once the proxy cannot listen any more, and writes it again when it can', async () => {
+    const { files, flushes } = setup();
+    const rules = config([wildcard(1, '*.corp.local')]);
+    await files.sync(rules, READY);
+
+    const down = await files.sync(rules, BUSY);
+    expect(down.changed).toBe(1);
+    expect(await list()).toEqual([]);
+    expect(flushes()).toBe(2);
+
+    await files.sync(rules, READY);
+    expect(await read('corp.local')).toBe(PROXY_FILE);
+    expect(flushes()).toBe(3);
+  });
+
+  it('turns a file of an exact rule into the proxy file when a wildcard for the same server joins, and back when it goes', async () => {
+    const { files } = setup();
+    const exact = domainRule(1, 'corp.local');
+    await files.sync(config([exact]), READY);
+    expect(await read('corp.local')).toBe(resolverFileContent('10.30.0.53'));
+
+    const both = await files.sync(config([exact, wildcard(2, '*.corp.local', { dns: '10.30.0.53' })]), READY);
+    expect(both.issues).toEqual(new Map());
+    expect(await read('corp.local')).toBe(PROXY_FILE);
+
+    await files.sync(config([exact]), READY);
+    expect(await read('corp.local')).toBe(resolverFileContent('10.30.0.53'));
+  });
+
+  it('shares the file in either order when the exact rule and the wildcard name the same server', async () => {
+    const { files } = setup();
+    const result = await files.sync(config([wildcard(2, '*.corp.local', { dns: '10.30.0.53' }), domainRule(1, 'corp.local')]), READY);
+    expect(result.issues).toEqual(new Map());
+    expect(await read('corp.local')).toBe(PROXY_FILE);
+  });
+
+  it('has no conflict with an exact rule for the base without `dns`: it needs no file', async () => {
+    const { files } = setup();
+    const result = await files.sync(config([domainRule(1, 'corp.local', { dns: undefined }), wildcard(2, '*.corp.local')]), READY);
+    expect(result.issues).toEqual(new Map());
+    expect(await read('corp.local')).toBe(PROXY_FILE);
+  });
+
+  it('makes the later rule `resolver-conflict` when an exact rule for the base names another server: exact first', async () => {
+    const { files } = setup();
+    const result = await files.sync(config([domainRule(1, 'corp.local'), wildcard(2, '*.corp.local', { dns: '10.30.0.54' })]), READY);
+    expect([...result.issues]).toEqual([
+      [ruleId(2), { reasonCode: 'resolver-conflict', reason: 'Another rule already sets 10.30.0.53 as the DNS server of corp.local' }],
+    ]);
+    expect(await read('corp.local')).toBe(resolverFileContent('10.30.0.53'));
+  });
+
+  it('… and wildcard first: the proxy file stays, the exact rule is in conflict', async () => {
+    const { files } = setup();
+    const result = await files.sync(config([wildcard(2, '*.corp.local'), domainRule(1, 'corp.local')]), READY);
+    expect([...result.issues]).toEqual([
+      [
+        ruleId(1),
+        { reasonCode: 'resolver-conflict', reason: 'Another rule already sends corp.local to the DNS proxy, which asks the system resolvers for it' },
+      ],
+    ]);
+    expect(await read('corp.local')).toBe(PROXY_FILE);
+  });
+
+  it('a wildcard without `dns` and an exact rule with one disagree too (the base would go to the system resolvers)', async () => {
+    const { files } = setup();
+    const result = await files.sync(config([domainRule(1, 'corp.local'), wildcard(2, '*.corp.local')]), READY);
+    expect(result.issues.get(ruleId(2))?.reasonCode).toBe('resolver-conflict');
+    expect(await read('corp.local')).toBe(resolverFileContent('10.30.0.53'));
+  });
+
+  it('two wildcards for one base share the file when they agree, and the later one is in conflict when not', async () => {
+    const { files } = setup();
+    const agree = await files.sync(config([wildcard(1, '*.corp.local'), wildcard(2, '*.corp.local', { iface: 'ethernet', enabled: true })]), READY);
+    expect(agree.issues).toEqual(new Map());
+    const disagree = await files.sync(rawConfig([wildcard(1, '*.corp.local'), wildcard(2, '*.corp.local', { dns: '10.30.0.54' })]), READY);
+    expect(disagree.issues.get(ruleId(2))?.reasonCode).toBe('resolver-conflict');
+    expect(await read('corp.local')).toBe(PROXY_FILE);
+  });
+
+  it('lets the exact rule have its file while the proxy cannot listen: no wildcard asks for the name then', async () => {
+    const { files } = setup();
+    const result = await files.sync(config([wildcard(2, '*.corp.local'), domainRule(1, 'corp.local')]), BUSY);
+    expect([...result.issues.keys()]).toEqual([ruleId(2)]);
+    expect(await read('corp.local')).toBe(resolverFileContent('10.30.0.53'));
+  });
+
+  it('writes nothing for a disabled wildcard, or with the global toggle off, and removes the proxy file then', async () => {
+    const { files } = setup();
+    await files.sync(config([wildcard(1, '*.corp.local')]), READY);
+
+    expect((await files.sync(config([wildcard(1, '*.corp.local', { enabled: false })]), READY)).issues).toEqual(new Map());
+    expect(await list()).toEqual([]);
+
+    await files.sync(config([wildcard(1, '*.corp.local')]), READY);
+    const off = await files.sync(config([wildcard(1, '*.corp.local')], { enabled: false }), READY);
+    expect(off).toEqual({ issues: new Map(), changed: 1, notRemoved: 0 });
+    expect(await list()).toEqual([]);
+  });
+
+  it('removeAll takes the proxy files too (shutdown, uninstall, the leftovers of a crash), and nothing that is not ours', async () => {
+    const { files } = setup();
+    await writeFile(join(dir, 'corp.local'), PROXY_FILE);
+    await writeFile(join(dir, 'lab.local'), 'nameserver 127.0.0.1\nport 954\n');
+
+    const result = await files.removeAll();
+
+    expect(result).toEqual({ issues: new Map(), changed: 1, notRemoved: 0 });
+    expect(await list()).toEqual(['lab.local']);
+  });
+
+  it('never touches a file of someone else at the base: the wildcard rule is `resolver-conflict`', async () => {
+    const { files, runner } = setup();
+    await writeFile(join(dir, 'corp.local'), 'nameserver 127.0.0.1\nport 5353\n');
+
+    const result = await files.sync(config([wildcard(1, '*.corp.local')]), READY);
+
+    expect(result.issues.get(ruleId(1))).toMatchObject({ reasonCode: 'resolver-conflict' });
+    expect(await read('corp.local')).toBe('nameserver 127.0.0.1\nport 5353\n');
+    expect(runner.calls).toEqual([]);
+  });
+
+  it.each([
+    ['a base that is not a domain (traversal)', '*.../etc'],
+    ['a bare wildcard', '*'],
+    ['a wildcard of one label', '*.local'],
+  ])('refuses %s without building a path (`resolver-failed`)', async (_name, target) => {
+    const { files } = setup();
+    const result = await files.sync(rawConfig([wildcard(1, target)]), READY);
+    expect(result.issues.get(ruleId(1))?.reasonCode).toBe('resolver-failed');
+    expect(await readdir(root)).toEqual(['resolver']);
+    expect(await list()).toEqual([]);
+  });
+
+  it.each([
+    ['cut after the address', 'nameserver 127.0.0.1\n'],
+    ['cut in the port line', 'nameserver 127.0.0.1\npor'],
+    ['cut after the port line', 'nameserver 127.0.0.1\nport 954\n'],
+    ['cut in the marker', `nameserver 127.0.0.1\nport 954\n${RESOLVER_MARKER.slice(0, 5)}`],
+    ['complete but for the last newline', `nameserver 127.0.0.1\nport 954\n${RESOLVER_MARKER}`],
+  ])('treats a temporary proxy file cut short (%s) as a leftover of its own', async (_name, content) => {
+    expect(isCutShortContent(content)).toBe(true);
+    const { files } = setup();
+    await writeFile(join(dir, '.routeswitch-corp.local.tmp'), content);
+    await files.sync(config([wildcard(1, '*.corp.local')]), READY);
+    expect(await list()).toEqual(['corp.local']);
+  });
+
+  it.each([
+    ['another port', 'nameserver 127.0.0.1\nport 953\n'],
+    ['a port line after another address', 'nameserver 10.30.0.53\nport 954\n'],
+    ['a port line with more after it', 'nameserver 127.0.0.1\nport 9540'],
+  ])('does not take a temporary name holding %s for its own', (_name, content) => {
+    expect(isCutShortContent(content)).toBe(false);
+  });
+
+  it('has a default with no proxy', () => {
+    expect(NO_WILDCARD_PROXY).toEqual({ state: 'absent' });
+  });
+});
+
+describe('wildcard rules with the engine: the proxy state becomes the rule state', () => {
+  const info = (role: InterfaceInfo['role']): InterfaceInfo => ({
+    role,
+    device: role === 'wifi' ? 'en0' : 'en5',
+    port: 'Port',
+    ip: role === 'wifi' ? '192.168.1.23' : '10.20.4.23',
+    gateway: role === 'wifi' ? '192.168.1.1' : '10.20.4.1',
+    netmask: '255.255.255.0',
+    subnet: role === 'wifi' ? '192.168.1.0/24' : '10.20.4.0/24',
+    up: true,
+    routable: true,
+    reason: null,
+    overridden: false,
+  });
+  const DETECTED: DetectedInterfaces = { ethernet: info('ethernet'), wifi: info('wifi'), adapters: [], degraded: false };
+  const WILD: Rule = { id: ruleId(7), enabled: true, kind: 'domain', target: '*.corp.local', iface: 'ethernet', refreshSec: 600 };
+
+  const engineWith = (sync: Parameters<typeof createEngine>[0]['syncResolvers']) =>
+    createEngine({
+      netinfo: { detectInterfaces: () => Promise.resolve(DETECTED), invalidate: () => undefined },
+      routes: {
+        routeAdd: (request) => Promise.resolve({ ok: true, outcome: 'added', dst: request.dst, kind: 'host', gateway: request.gateway }),
+        routeDelete: (request) => Promise.resolve({ ok: true, outcome: 'deleted', dst: request.dst, kind: 'host' }),
+      },
+      logger: createLogger({ sinks: [] }),
+      helperVersion: '1.2.3',
+      initialConfig: config([WILD]),
+      syncResolvers: sync,
+    });
+
+  it.each([
+    ['ready', { state: 'ready' } as const, { status: 'active', reasonCode: null }],
+    ['starting', { state: 'starting' } as const, { status: 'pending', reasonCode: 'dns-proxy-unavailable' }],
+    ['unavailable', { state: 'unavailable', detail: 'EADDRINUSE' } as const, { status: 'error', reasonCode: 'dns-proxy-unavailable' }],
+  ])('proxy %s', async (_name, proxy, expected) => {
+    const { files } = setup();
+    const engine = engineWith((snapshot) => files.sync(snapshot, proxy));
+    const outcome = await engine.reconcile('startup');
+    expect(outcome.state.rules[0]).toMatchObject(expected);
+    expect(await list()).toEqual(proxy.state === 'ready' ? ['corp.local'] : []);
+  });
+
+  it('passes the DNS servers of the roles a pass knows to the sync (the proxy forwards to them)', async () => {
+    const contexts: unknown[] = [];
+    const engine = engineWith((_snapshot, context) => {
+      contexts.push(context);
+      return { issues: new Map() };
+    });
+    await engine.reconcile('startup');
+    expect(contexts).toEqual([{ roleDnsServers: {} }]);
+  });
+
+  it('makes a wildcard rule `resolver-failed` too when the sync throws: it needs a file as well', async () => {
+    const engine = engineWith(() => {
+      throw new Error('boom');
+    });
+    const outcome = await engine.reconcile('startup');
+    expect(outcome.state.rules[0]).toMatchObject({ status: 'error', reasonCode: 'resolver-failed' });
   });
 });
