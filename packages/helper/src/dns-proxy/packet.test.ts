@@ -24,6 +24,7 @@ import {
   type ExpectedQuestion,
   type ParsedAnswer,
   cnameChainAddresses,
+  cnameChainTargets,
   parseQuery,
   parseResponse,
   refused,
@@ -506,5 +507,47 @@ describe('fuzz: never throws, always a typed result', () => {
     // Some mutants stay valid (the fuzzer really reaches the accept paths), and the whole run is fast.
     expect(accepted).toBeGreaterThan(0);
     expect(performance.now() - started).toBeLessThan(10_000);
+  });
+});
+
+describe('cnameChainTargets (TASK-DELTA-41)', () => {
+  it('lists the names along the chain with the smallest link TTL so far, from a real compressed reply', () => {
+    const parsed = parseResponse(RESPONSE_WWW_CNAME_CHAIN, WWW);
+    expect(cnameChainTargets('WWW.example.com', parsed?.answers ?? [])).toEqual([
+      { name: 'edge.example.com', ttl: 300 },
+      { name: 'cdn.example.net', ttl: 60 },
+    ]);
+  });
+
+  it('takes the smaller TTL of duplicate links and never lists the question', () => {
+    expect(
+      cnameChainTargets('a.corp.local', [
+        answer('a.corp.local', 'CNAME', 'b.corp.local', 50),
+        answer('a.corp.local', 'CNAME', 'b.corp.local', 40),
+        answer('b.corp.local', 'CNAME', 'c.corp.local', 900),
+        answer('c.corp.local', 'A', '10.0.0.3'),
+      ]),
+    ).toEqual([
+      { name: 'b.corp.local', ttl: 40 },
+      { name: 'c.corp.local', ttl: 40 },
+    ]);
+  });
+
+  it('stops at a loop, at a name with two different CNAMEs, and with no CNAME', () => {
+    expect(
+      cnameChainTargets('a.corp.local', [answer('a.corp.local', 'CNAME', 'b.corp.local'), answer('b.corp.local', 'CNAME', 'a.corp.local')]),
+    ).toEqual([{ name: 'b.corp.local', ttl: 300 }]);
+    expect(
+      cnameChainTargets('a.corp.local', [answer('a.corp.local', 'CNAME', 'b.corp.local'), answer('a.corp.local', 'CNAME', 'c.corp.local')]),
+    ).toEqual([]);
+    expect(cnameChainTargets('a.corp.local', [answer('a.corp.local', 'A', '10.0.0.1')])).toEqual([]);
+    expect(cnameChainTargets('a.corp.local', [])).toEqual([]);
+  });
+
+  it(`follows at most ${String(MAX_CNAME_LINKS)} links`, () => {
+    const chain = Array.from({ length: MAX_CNAME_LINKS + 4 }, (_v, i) => answer(`n${String(i)}.corp.local`, 'CNAME', `n${String(i + 1)}.corp.local`));
+    const targets = cnameChainTargets('n0.corp.local', chain);
+    expect(targets).toHaveLength(MAX_CNAME_LINKS);
+    expect(targets.at(-1)?.name).toBe(`n${String(MAX_CNAME_LINKS)}.corp.local`);
   });
 });

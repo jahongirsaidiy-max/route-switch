@@ -13,6 +13,17 @@
  * upstream reply becomes SERVFAIL. Queried names and addresses are logged at
  * `debug` only.
  *
+ * An exact rule's name that is an alias (CNAME) of another name under the
+ * base (`www.corp.local` → `corp.local`): the system resolver looks the
+ * target up on its own, and that lookup would follow the target's rule (the
+ * wildcard's servers). So the CNAME targets in an exact rule's answer are
+ * bound to that rule for the alias's TTL (`CnameBindings`, bounded): a query
+ * for a bound target goes to the exact rule's servers and is learned for it
+ * (TASK-DELTA-41). Only an exact rule's upstream answer makes a binding —
+ * never a client's query; a target that an exact rule of its own owns is
+ * never bound; each use re-checks that the rule still owns its name, and a
+ * config change or `stop()` clears them all.
+ *
  * AAAA and every other type are forwarded and returned unchanged, never
  * learned: IPv6 routes are out of scope (an IPv6-preferring app may still
  * leave over the default route — ADR-002 §6).
@@ -34,6 +45,7 @@ import {
   MAX_TCP_CONNECTIONS,
   TCP_IDLE_MS,
   bindRetryDelay,
+  createCnameBindings,
   createTokenBucket,
   isLoopbackSource,
 } from './limits';
@@ -43,6 +55,7 @@ import {
   QTYPE_A,
   RCODE_NOERROR,
   cnameChainAddresses,
+  cnameChainTargets,
   parseQuery,
   refused,
   servfail,
@@ -121,6 +134,8 @@ export interface DnsProxy {
   /** Closes the listeners, every client connection and every upstream query; cancels the retry. Never rejects. */
   stop(): Promise<void>;
   status(): DnsProxyStatus;
+  /** Forgets every CNAME binding (the rules changed). */
+  clearCnameBindings(): void;
 }
 
 const errorCode = (error: unknown): string => {
@@ -161,6 +176,7 @@ export const createDnsProxy = (options: DnsProxyOptions): DnsProxy => {
   /** Replies waiting on `learn`: `stop()` releases them. */
   const learnWaits = new Set<() => void>();
   let bucket = createTokenBucket(monotonicNow);
+  const cnameBindings = createCnameBindings(monotonicNow);
   const stats = { forwarded: 0, servfail: 0, refused: 0, dropped: 0, learnTimeouts: 0 };
 
   const status = (): DnsProxyStatus => ({ state, address, port, lastError, stats: { ...stats } });
@@ -221,6 +237,52 @@ export const createDnsProxy = (options: DnsProxyOptions): DnsProxy => {
   };
 
   /**
+   * The exact rule a CNAME binding sends `target` to, re-checked against the
+   * rules now: the rule must still own the name the binding came from;
+   * otherwise the binding is dropped and the target follows its own rule.
+   */
+  const boundRoute = (target: string): { readonly route: QueryRoute; readonly source: string } | null => {
+    const binding = cnameBindings.get(target);
+    if (binding === null) return null;
+    let current: QueryRoute | null;
+    try {
+      current = options.resolveRule(binding.source);
+    } catch (error) {
+      log.error('DNS proxy rule lookup failed', { error });
+      current = null;
+    }
+    if (current?.kind !== 'learn' || current.exact !== true || current.ruleId !== binding.ruleId) {
+      cnameBindings.delete(target);
+      log.debug('CNAME binding no longer matches its rule; dropped', { ruleId: binding.ruleId, name: target });
+      return null;
+    }
+    log.debug('CNAME target answered by its exact domain rule', { ruleId: binding.ruleId, name: target, alias: binding.source });
+    return { route: current, source: binding.source };
+  };
+
+  /**
+   * Binds the CNAME targets of an exact rule's answer (`source` is the rule's
+   * own name). A target must lie under a wildcard base (the proxy answers
+   * it at all) and must not be owned by an exact rule of its own.
+   */
+  const bindCnameTargets = (ruleId: string, source: string, query: ParsedQuery, parsed: ParsedResponse): void => {
+    if (query.qclass !== QCLASS_IN || parsed.rcode !== RCODE_NOERROR || parsed.tc) return;
+    for (const target of cnameChainTargets(query.qname, parsed.answers)) {
+      if (target.name === source) continue;
+      let owner: QueryRoute | null;
+      try {
+        owner = options.resolveRule(target.name);
+      } catch (error) {
+        log.error('DNS proxy rule lookup failed', { error });
+        continue;
+      }
+      if (owner === null || (owner.kind === 'learn' && owner.exact === true)) continue;
+      cnameBindings.bind(target.name, { ruleId, source }, target.ttl);
+      log.debug('CNAME target bound to an exact domain rule', { ruleId, name: query.qname, target: target.name, ttlSec: target.ttl });
+    }
+  };
+
+  /**
    * The reply for one raw query, or null for none. `transport` decides how
    * the limits answer: UDP drops silently, TCP says REFUSED. Never rejects.
    */
@@ -245,19 +307,24 @@ export const createDnsProxy = (options: DnsProxyOptions): DnsProxy => {
       return null;
     }
 
-    let route: QueryRoute | null;
+    let ruleRoute: QueryRoute | null;
     try {
-      route = options.resolveRule(query.qname);
+      ruleRoute = options.resolveRule(query.qname);
     } catch (error) {
       log.error('DNS proxy rule lookup failed', { error });
       stats.servfail += 1;
       return servfail(raw);
     }
-    if (route === null) {
+    if (ruleRoute === null) {
       log.debug('DNS query for a name outside every wildcard base refused', { name: query.qname });
       stats.refused += 1;
       return refused(raw);
     }
+    // A name an exact rule owns is that rule's; any other may be a bound CNAME target.
+    const ownedExactly = ruleRoute.kind === 'learn' && ruleRoute.exact === true;
+    const bound = ownedExactly ? null : boundRoute(query.qname);
+    const route = bound?.route ?? ruleRoute;
+    const aliasSource = bound?.source ?? (ownedExactly ? query.qname : null);
     if (route.servers.length === 0) {
       log.debug('No usable upstream DNS server', { name: query.qname, route: route.kind });
       stats.servfail += 1;
@@ -280,6 +347,7 @@ export const createDnsProxy = (options: DnsProxyOptions): DnsProxy => {
       stats.servfail += 1;
       return servfail(raw);
     }
+    if (route.kind === 'learn' && aliasSource !== null) bindCnameTargets(route.ruleId, aliasSource, query, result.parsed);
     if (route.kind === 'learn') await learnBeforeReply(route.ruleId, query, result.parsed);
 
     const reply = withId(result.reply, query.id);
@@ -487,6 +555,7 @@ export const createDnsProxy = (options: DnsProxyOptions): DnsProxy => {
       if (retryTimer !== null) clearTimer(retryTimer);
       retryTimer = null;
       for (const release of [...learnWaits]) release();
+      cnameBindings.clear();
       for (const call of upstreamCalls) call.cancel();
       upstreamCalls.clear();
       for (const connection of [...connections]) connection.close();
@@ -498,6 +567,10 @@ export const createDnsProxy = (options: DnsProxyOptions): DnsProxy => {
       return Promise.resolve();
     },
     status,
+    clearCnameBindings: () => {
+      if (cnameBindings.size() > 0) log.debug('CNAME bindings cleared', { count: cnameBindings.size() });
+      cnameBindings.clear();
+    },
   };
 };
 

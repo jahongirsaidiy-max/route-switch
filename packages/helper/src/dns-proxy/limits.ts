@@ -31,6 +31,18 @@ export const UPSTREAM_TOTAL_TIMEOUT_MS = 5_000;
 export const MAX_UPSTREAM_SERVERS = 3;
 /** The reply waits at most this long for the learned routes, then goes out anyway (fail-open). */
 export const LEARN_WAIT_MS = 1_500;
+/**
+ * CNAME targets bound to an exact domain rule (TASK-DELTA-41): at most this
+ * many at once; one more drops the least recently used binding.
+ */
+export const MAX_CNAME_BINDINGS = 256;
+/**
+ * A binding lives as long as the alias it came from (the CNAME TTL), within
+ * these bounds: never shorter than the follow-up lookup of the target needs,
+ * never longer than a learned route (the engine's ceiling, one day).
+ */
+export const CNAME_BINDING_MIN_TTL_SEC = 60;
+export const CNAME_BINDING_MAX_TTL_SEC = 86_400;
 /** Bind retry: first delay, doubled after every failure up to the ceiling. */
 export const BIND_RETRY_FIRST_MS = 5_000;
 export const BIND_RETRY_MAX_MS = 300_000;
@@ -82,4 +94,66 @@ export const isLoopbackSource = (address: string | undefined): boolean => {
   const parts = v4.split('.');
   if (parts.length !== 4 || parts[0] !== '127') return false;
   return parts.every((part) => /^\d{1,3}$/.test(part) && Number(part) <= 255);
+};
+
+/** Which exact domain rule answers for a CNAME target, and the rule's own name it came from. */
+export interface CnameBinding {
+  readonly ruleId: string;
+  /** The exact rule's name whose answer made the binding (re-checked on every use). */
+  readonly source: string;
+}
+
+export interface CnameBindings {
+  /** Binds `target` for `ttlSec` (clamped to the binding bounds); replaces an older binding of it. */
+  bind(target: string, binding: CnameBinding, ttlSec: number): void;
+  /** The live binding of `target` (and marks it recently used); null when none or expired. */
+  get(target: string): CnameBinding | null;
+  delete(target: string): void;
+  clear(): void;
+  size(): number;
+}
+
+/** `ttlSec` within `CNAME_BINDING_MIN_TTL_SEC`…`CNAME_BINDING_MAX_TTL_SEC`; anything not a finite number reads as the minimum. */
+export const cnameBindingTtlSec = (ttlSec: number): number =>
+  Number.isFinite(ttlSec) ? Math.min(CNAME_BINDING_MAX_TTL_SEC, Math.max(CNAME_BINDING_MIN_TTL_SEC, ttlSec)) : CNAME_BINDING_MIN_TTL_SEC;
+
+/**
+ * A bounded, expiring map of CNAME bindings on a monotonic millisecond clock:
+ * at most `cap` entries; expired ones go first, then the least recently used.
+ */
+export const createCnameBindings = (monotonicNow: () => number, cap: number = MAX_CNAME_BINDINGS): CnameBindings => {
+  const entries = new Map<string, { readonly binding: CnameBinding; readonly expiresAt: number }>();
+
+  const dropExpired = (now: number): void => {
+    for (const [target, entry] of entries) if (entry.expiresAt <= now) entries.delete(target);
+  };
+
+  return {
+    bind: (target, binding, ttlSec) => {
+      const now = monotonicNow();
+      entries.delete(target);
+      if (entries.size >= cap) dropExpired(now);
+      while (entries.size >= cap) {
+        const oldest = entries.keys().next();
+        if (oldest.done === true) break;
+        entries.delete(oldest.value);
+      }
+      entries.set(target, { binding, expiresAt: now + cnameBindingTtlSec(ttlSec) * 1000 });
+    },
+    get: (target) => {
+      const entry = entries.get(target);
+      if (entry === undefined) return null;
+      entries.delete(target);
+      if (entry.expiresAt <= monotonicNow()) return null;
+      entries.set(target, entry);
+      return entry.binding;
+    },
+    delete: (target) => {
+      entries.delete(target);
+    },
+    clear: () => {
+      entries.clear();
+    },
+    size: () => entries.size,
+  };
 };

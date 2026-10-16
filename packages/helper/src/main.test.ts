@@ -2057,6 +2057,7 @@ describe('createWildcardProxyControl (TASK-DELTA-28)', () => {
     let config = initial;
     const calls: string[] = [];
     const reconciles: number[] = [];
+    const bindingClears: number[] = [];
     let state: DnsProxyState = 'stopped';
     let failBind = false;
     let options: DnsProxyOptions | null = null;
@@ -2077,6 +2078,9 @@ describe('createWildcardProxyControl (TASK-DELTA-28)', () => {
         return Promise.resolve();
       },
       status: () => ({ state, address: '127.0.0.1', port: 954, lastError: state === 'unavailable' ? 'EADDRINUSE' : null, stats: { forwarded: 0, servfail: 0, refused: 0, dropped: 0, learnTimeouts: 0 } }),
+      clearCnameBindings: () => {
+        bindingClears.push(1);
+      },
     };
     const scheduler = createFakeScheduler(NOW);
     const control = createWildcardProxyControl({
@@ -2111,6 +2115,7 @@ describe('createWildcardProxyControl (TASK-DELTA-28)', () => {
       },
       /** The proxy changes state on its own (a retried bind). */
       emit: setState,
+      bindingClears,
     };
   };
 
@@ -2243,13 +2248,29 @@ describe('createWildcardProxyControl (TASK-DELTA-28)', () => {
     const { resolveRule } = t.options();
     expect(resolveRule('app.corp.local')).toEqual({ kind: 'learn', ruleId: ID_W, servers: ['10.20.0.53'] });
     // An exact rule under the base learns from its own role's servers (TASK-DELTA-30).
-    expect(resolveRule('www.corp.local')).toEqual({ kind: 'learn', ruleId: ID_D, servers: ['192.168.1.1'] });
+    expect(resolveRule('www.corp.local')).toEqual({ kind: 'learn', ruleId: ID_D, servers: ['192.168.1.1'], exact: true });
     expect(resolveRule('corp.local')).toEqual({ kind: 'passthrough', servers: ['192.0.2.53'] });
     expect(resolveRule('example.com')).toBeNull();
     t.setConfig(parse([WILD], false));
     expect(resolveRule('app.corp.local')).toBeNull();
     t.setConfig(WITHOUT);
     expect(resolveRule('app.corp.local')).toBeNull();
+  });
+
+  it('clears the CNAME bindings when a pass brings other rules or the global toggle changes, not on an unchanged pass (TASK-DELTA-41)', async () => {
+    const exact = parse([WILD, { id: ID_D, kind: 'domain', target: 'www.corp.local', iface: 'wifi' }]);
+    const t = setup(exact);
+    await t.control.beforeSync(exact, CONTEXT);
+    await t.control.beforeSync(exact, CONTEXT);
+    // Same rules, other role servers (a network change): the bindings stay.
+    await t.control.beforeSync(exact, { roleDnsServers: { ethernet: ['10.20.0.54'], wifi: ['192.168.1.2'] } });
+    expect(t.bindingClears).toHaveLength(0);
+    await t.control.beforeSync(parse([WILD, { id: ID_D, kind: 'domain', target: 'www.corp.local', iface: 'ethernet' }]), CONTEXT);
+    expect(t.bindingClears).toHaveLength(1);
+    await t.control.beforeSync(parse([{ ...WILD, enabled: false }, { id: ID_D, kind: 'domain', target: 'www.corp.local', iface: 'ethernet' }]), CONTEXT);
+    expect(t.bindingClears).toHaveLength(2);
+    await t.control.beforeSync(parse([{ ...WILD, enabled: false }, { id: ID_D, kind: 'domain', target: 'www.corp.local', iface: 'ethernet' }], false), CONTEXT);
+    expect(t.bindingClears).toHaveLength(3);
   });
 
   it('tells `diagnose` the servers of a wildcard rule, and nothing for other rules', async () => {

@@ -792,3 +792,230 @@ describe('createDnsProxy — stop cleans everything', () => {
     return connection;
   }
 });
+
+// TASK-DELTA-41 (Real-Mac DELTA-30 finding 3): `www.corp.local` is an exact Wi‑Fi rule under
+// `*.corp.local` → Ethernet, and the Wi‑Fi view answers it with `CNAME corp.local`. The system
+// resolver then looks `corp.local` up on its own; that lookup must follow the exact rule too.
+describe('createDnsProxy — CNAME targets of an exact rule (TASK-DELTA-41)', () => {
+  const EXACT = '22222222-2222-4222-8222-222222222222';
+  const OTHER_EXACT = '33333333-3333-4333-8333-333333333333';
+  const WIFI_DNS = '192.168.1.1';
+  const INTERNAL = '10.0.0.1';
+  const PUBLIC_IP = '203.0.113.5';
+
+  /** A mutable rule table: `exactOn` false is the exact rule removed (or disabled, or its wildcard off). */
+  const rules = { exactOn: true, wildcardOn: true, exactId: EXACT, exactMarked: true };
+  const routes = (qname: string): QueryRoute | null => {
+    if (!rules.wildcardOn) return null;
+    if (qname === 'www.corp.local' && rules.exactOn) {
+      return rules.exactMarked
+        ? { kind: 'learn', ruleId: rules.exactId, servers: [WIFI_DNS], exact: true }
+        : { kind: 'learn', ruleId: rules.exactId, servers: [WIFI_DNS] };
+    }
+    if (qname === 'api.corp.local') return { kind: 'learn', ruleId: OTHER_EXACT, servers: ['10.0.0.9'], exact: true };
+    if (qname === 'corp.local') return { kind: 'passthrough', servers: [INTERNAL] };
+    if (qname.endsWith('.corp.local')) return { kind: 'learn', ruleId: RULE, servers: [INTERNAL] };
+    return null;
+  };
+  const setup = async (): Promise<Harness> => {
+    rules.exactOn = true;
+    rules.wildcardOn = true;
+    rules.exactId = EXACT;
+    rules.exactMarked = true;
+    return started({ resolveRule: routes });
+  };
+
+  /** `www.corp.local CNAME <target>` (TTL `ttl`) + `<target> A <address>`. */
+  const aliasAnswer =
+    (target: string, { ttl = 300, address = PUBLIC_IP, name = 'www.corp.local', flags }: { ttl?: number; address?: string; name?: string; flags?: number } = {}) =>
+    (id: number): Buffer =>
+      buildResponse(name, [cnameRecord(pointer(12), encodeName(target), ttl), aRecord(encodeName(target), address, 600)], {
+        id,
+        ...(flags === undefined ? {} : { flags }),
+      });
+
+  const bindings = (harness: Harness): number => harness.logs.filter((entry) => entry.msg === 'CNAME target bound to an exact domain rule').length;
+
+  /** Sends `name`, returns the upstream server it went to, answers it with `make` from there. */
+  const ask = async (harness: Harness, name: string, make: (id: number) => Buffer, qtype = 1): Promise<string | undefined> => {
+    await sendUdp(harness, query(name, qtype));
+    const server = lastUpstream(harness).sent[0]?.address;
+    await replyUpstream(harness, make, server);
+    return server;
+  };
+
+  it('a CNAME target (the base) goes to the exact rule\'s servers and is learned for the exact rule', async () => {
+    const harness = await setup();
+    expect(await ask(harness, 'www.corp.local', aliasAnswer('corp.local'))).toBe(WIFI_DNS);
+    expect(harness.learnCalls).toEqual([{ ruleId: EXACT, addresses: [PUBLIC_IP], ttl: 600 }]);
+
+    // The follow-up lookup of the target alone: Wi‑Fi DNS, learned for the exact rule — not passthrough to the internal server.
+    expect(await ask(harness, 'corp.local', (id) => aAnswer(id, 'corp.local', PUBLIC_IP, 60))).toBe(WIFI_DNS);
+    expect(harness.learnCalls[1]).toEqual({ ruleId: EXACT, addresses: [PUBLIC_IP], ttl: 60 });
+    expect(harness.listener().sent).toHaveLength(2);
+    expectPrivateLogs(harness.logs);
+  });
+
+  it('binds a target the wildcard owns, and every link of a chain, for the smallest TTL so far', async () => {
+    const harness = await setup();
+    await ask(harness, 'www.corp.local', (id) =>
+      buildResponse(
+        'www.corp.local',
+        [
+          cnameRecord(pointer(12), encodeName('edge.corp.local'), 600),
+          cnameRecord(encodeName('edge.corp.local'), encodeName('crm.corp.local'), 120),
+          aRecord(encodeName('crm.corp.local'), PUBLIC_IP),
+        ],
+        { id },
+      ),
+    );
+    expect(await ask(harness, 'edge.corp.local', (id) => aAnswer(id, 'edge.corp.local', PUBLIC_IP))).toBe(WIFI_DNS);
+    expect(await ask(harness, 'crm.corp.local', (id) => aAnswer(id, 'crm.corp.local', PUBLIC_IP))).toBe(WIFI_DNS);
+    expect(harness.learnCalls.map((call) => call.ruleId)).toEqual([EXACT, EXACT, EXACT]);
+
+    // crm's binding came with TTL 120 (the chain's smallest), edge's with 600.
+    harness.advanceClock(120_000);
+    expect(await ask(harness, 'crm.corp.local', (id) => aAnswer(id, 'crm.corp.local', '10.20.0.5'))).toBe(INTERNAL);
+    expect(harness.learnCalls.at(-1)?.ruleId).toBe(RULE);
+    expect(await ask(harness, 'edge.corp.local', (id) => aAnswer(id, 'edge.corp.local', PUBLIC_IP))).toBe(WIFI_DNS);
+  });
+
+  it('a binding lasts the CNAME TTL: bound at TTL − 1 ms, back to its own rule at the TTL', async () => {
+    const harness = await setup();
+    await ask(harness, 'www.corp.local', aliasAnswer('corp.local', { ttl: 300 }));
+    harness.advanceClock(299_999);
+    expect(await ask(harness, 'corp.local', (id) => aAnswer(id, 'corp.local'))).toBe(WIFI_DNS);
+    harness.advanceClock(1);
+    expect(await ask(harness, 'corp.local', (id) => aAnswer(id, 'corp.local'))).toBe(INTERNAL);
+    // Passthrough again: nothing learned for that lookup.
+    expect(harness.learnCalls).toHaveLength(2);
+  });
+
+  it('clamps the TTL: 0 still binds for 60 s; a huge TTL binds for at most a day', async () => {
+    const harness = await setup();
+    await ask(harness, 'www.corp.local', aliasAnswer('corp.local', { ttl: 0 }));
+    harness.advanceClock(59_999);
+    expect(await ask(harness, 'corp.local', (id) => aAnswer(id, 'corp.local'))).toBe(WIFI_DNS);
+    harness.advanceClock(1);
+    expect(await ask(harness, 'corp.local', (id) => aAnswer(id, 'corp.local'))).toBe(INTERNAL);
+
+    await ask(harness, 'www.corp.local', aliasAnswer('corp.local', { ttl: 0x7fff_ffff }));
+    harness.advanceClock(86_400_000 - 1);
+    expect(await ask(harness, 'corp.local', (id) => aAnswer(id, 'corp.local'))).toBe(WIFI_DNS);
+    harness.advanceClock(1);
+    expect(await ask(harness, 'corp.local', (id) => aAnswer(id, 'corp.local'))).toBe(INTERNAL);
+  });
+
+  it('never binds from a client query or from a wildcard / passthrough answer', async () => {
+    const harness = await setup();
+    // The target asked first: nothing is bound yet.
+    expect(await ask(harness, 'corp.local', (id) => aAnswer(id, 'corp.local'))).toBe(INTERNAL);
+    // A wildcard name that is an alias of the base, and the base answered with an alias of www: no binding.
+    await ask(harness, 'app.corp.local', aliasAnswer('corp.local', { name: 'app.corp.local' }));
+    await ask(harness, 'corp.local', aliasAnswer('www.corp.local', { name: 'corp.local' }));
+    expect(await ask(harness, 'corp.local', (id) => aAnswer(id, 'corp.local'))).toBe(INTERNAL);
+    // A client query that carries records of its own is malformed and dropped.
+    await sendUdp(harness, buildResponse('corp.local', [cnameRecord(pointer(12), encodeName('www.corp.local'))], { flags: 0x0100 }));
+    expect(await ask(harness, 'corp.local', (id) => aAnswer(id, 'corp.local'))).toBe(INTERNAL);
+    expect(bindings(harness)).toBe(0);
+  });
+
+  it('does not bind a target outside every wildcard base (still REFUSED) or one an exact rule of its own owns', async () => {
+    const harness = await setup();
+    await ask(harness, 'www.corp.local', aliasAnswer('cdn.example.net'));
+    await sendUdp(harness, query('cdn.example.net'));
+    expect(rcodeOf(harness.listener().sent.at(-1)?.data)).toBe(RCODE_REFUSED);
+
+    await ask(harness, 'www.corp.local', aliasAnswer('api.corp.local'));
+    expect(bindings(harness)).toBe(0);
+    expect(await ask(harness, 'api.corp.local', (id) => aAnswer(id, 'api.corp.local', '10.20.0.6'))).toBe('10.0.0.9');
+    expect(harness.learnCalls.at(-1)?.ruleId).toBe(OTHER_EXACT);
+  });
+
+  it('binds nothing from NXDOMAIN, a truncated reply, or a reply the parser rejects (a CNAME pointing at itself)', async () => {
+    const harness = await setup();
+    await ask(harness, 'www.corp.local', aliasAnswer('corp.local', { flags: 0x8183 }));
+    await ask(harness, 'www.corp.local', aliasAnswer('corp.local', { flags: 0x8380 }));
+    // CNAME RDATA = a pointer to its own offset: a loop the parser refuses → SERVFAIL, nothing bound.
+    const questionEnd = 12 + encodeName('www.corp.local').length + 4;
+    const rdataAt = questionEnd + 2 + 10;
+    await ask(harness, 'www.corp.local', (id) => buildResponse('www.corp.local', [cnameRecord(pointer(12), pointer(rdataAt))], { id }));
+    // Over UDP a reply the parser rejects is dropped and the wait goes on, to the 5 s budget.
+    harness.advanceClock(5_000);
+    await flush();
+    expect(rcodeOf(harness.listener().sent.at(-1)?.data)).toBe(RCODE_SERVFAIL);
+    expect(await ask(harness, 'corp.local', (id) => aAnswer(id, 'corp.local'))).toBe(INTERNAL);
+  });
+
+  it('binds from an AAAA answer too (the alias is the same), learning nothing from it', async () => {
+    const harness = await setup();
+    await ask(harness, 'www.corp.local', (id) => buildResponse('www.corp.local', [cnameRecord(pointer(12), encodeName('corp.local'))], { id, qtype: 28 }), 28);
+    expect(harness.learnCalls).toEqual([]);
+    expect(await ask(harness, 'corp.local', (id) => aAnswer(id, 'corp.local'))).toBe(WIFI_DNS);
+    expect(harness.learnCalls).toEqual([{ ruleId: EXACT, addresses: ['10.20.0.5'], ttl: 300 }]);
+  });
+
+  it('re-checks the rule on every use: an exact rule that no longer owns its name drops the binding', async () => {
+    const harness = await setup();
+    await ask(harness, 'www.corp.local', aliasAnswer('corp.local'));
+    rules.exactOn = false;
+    expect(await ask(harness, 'corp.local', (id) => aAnswer(id, 'corp.local'))).toBe(INTERNAL);
+    // Dropped for good: the rule coming back does not revive it.
+    rules.exactOn = true;
+    expect(await ask(harness, 'corp.local', (id) => aAnswer(id, 'corp.local'))).toBe(INTERNAL);
+
+    // The name now owned by another exact rule (the rule deleted and added again): not the binding's rule.
+    await ask(harness, 'www.corp.local', aliasAnswer('corp.local'));
+    rules.exactId = OTHER_EXACT;
+    expect(await ask(harness, 'corp.local', (id) => aAnswer(id, 'corp.local'))).toBe(INTERNAL);
+  });
+
+  it('re-checks that the source is still exact: the same ruleId owning it without `exact` drops the binding', async () => {
+    const harness = await setup();
+    await ask(harness, 'www.corp.local', aliasAnswer('corp.local'));
+    rules.exactMarked = false;
+    expect(await ask(harness, 'corp.local', (id) => aAnswer(id, 'corp.local'))).toBe(INTERNAL);
+    expect(harness.learnCalls).toHaveLength(1);
+    // Dropped, not just skipped: marking it exact again does not revive it.
+    rules.exactMarked = true;
+    expect(await ask(harness, 'corp.local', (id) => aAnswer(id, 'corp.local'))).toBe(INTERNAL);
+  });
+
+  it('a wildcard turned off: the target is REFUSED like any name outside a base', async () => {
+    const harness = await setup();
+    await ask(harness, 'www.corp.local', aliasAnswer('corp.local'));
+    rules.wildcardOn = false;
+    await sendUdp(harness, query('corp.local'));
+    expect(rcodeOf(harness.listener().sent.at(-1)?.data)).toBe(RCODE_REFUSED);
+  });
+
+  it('clearCnameBindings and stop forget every binding', async () => {
+    const harness = await setup();
+    await ask(harness, 'www.corp.local', aliasAnswer('corp.local'));
+    harness.proxy.clearCnameBindings();
+    expect(await ask(harness, 'corp.local', (id) => aAnswer(id, 'corp.local'))).toBe(INTERNAL);
+
+    await ask(harness, 'www.corp.local', aliasAnswer('corp.local'));
+    await harness.proxy.stop();
+    const before = harness.network.udpSockets.length;
+    await harness.proxy.start();
+    const listener = harness.network.udpSockets[before];
+    listener?.deliver(query('corp.local'), CLIENT);
+    await flush();
+    expect(harness.network.udpSockets.at(-1)?.sent[0]?.address).toBe(INTERNAL);
+  });
+
+  it('the exact rule\'s own name is never answered from a binding (an alias back to it changes nothing)', async () => {
+    const harness = await setup();
+    await ask(harness, 'www.corp.local', (id) =>
+      buildResponse(
+        'www.corp.local',
+        [cnameRecord(pointer(12), encodeName('corp.local')), cnameRecord(encodeName('corp.local'), encodeName('www.corp.local'))],
+        { id },
+      ),
+    );
+    expect(bindings(harness)).toBe(1);
+    expect(await ask(harness, 'www.corp.local', (id) => aAnswer(id, 'www.corp.local'))).toBe(WIFI_DNS);
+    expect(await ask(harness, 'corp.local', (id) => aAnswer(id, 'corp.local'))).toBe(WIFI_DNS);
+  });
+});
