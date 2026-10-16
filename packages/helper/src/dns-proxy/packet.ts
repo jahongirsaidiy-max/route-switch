@@ -24,7 +24,7 @@ export const MAX_LABEL_BYTES = 63;
 export const MAX_POINTER_HOPS = 16;
 /** Responses announcing more answers than this are rejected outright. */
 export const MAX_ANSWERS = 64;
-/** CNAME links followed by `cnameChainAddresses`. */
+/** CNAME links followed by `cnameChainAddresses` and `cnameChainTargets`. */
 export const MAX_CNAME_LINKS = 8;
 
 export const DNS_HEADER_BYTES = 12;
@@ -314,6 +314,40 @@ export const cnameChainAddresses = (qname: string, answers: readonly ParsedAnswe
     current = next;
   }
   return addresses;
+};
+
+export interface CnameTarget {
+  /** A name reached from the question through CNAMEs, normalised like `ParsedQuery.qname`. */
+  readonly name: string;
+  /** Smallest TTL of the CNAME links from the question to this name: how long the alias holds. */
+  readonly ttl: number;
+}
+
+/**
+ * The names `qname` is an alias of inside this answer set, in chain order:
+ * the same walk as `cnameChainAddresses` (one CNAME per name, at most
+ * `MAX_CNAME_LINKS` links, a loop or a name with two different CNAMEs ends
+ * it). The question itself is never in the list.
+ */
+export const cnameChainTargets = (qname: string, answers: readonly ParsedAnswer[]): CnameTarget[] => {
+  const targets: CnameTarget[] = [];
+  const visited = new Set<string>();
+  let current = qname.toLowerCase();
+  let ttl: number | null = null;
+
+  for (let links = 0; links < MAX_CNAME_LINKS; links += 1) {
+    visited.add(current);
+    const records = answers.filter((a) => a.type === 'CNAME' && a.name === current);
+    const names = new Set(records.map((a) => a.data));
+    if (names.size !== 1) break;
+    const [next] = names;
+    if (next === undefined || visited.has(next)) break;
+    const linkTtl = Math.min(...records.map((a) => a.ttl));
+    ttl = ttl === null ? linkTtl : Math.min(ttl, linkTtl);
+    targets.push({ name: next, ttl });
+    current = next;
+  }
+  return targets;
 };
 
 /** A copy of `buf` with the 16-bit message ID replaced; `buf` is not modified. */

@@ -5,6 +5,29 @@ All notable changes to RouteSwitch are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.1] — 2026-10-16
+
+### Fixed
+
+- An exact domain rule under a wildcard now also covers the name it is an
+  alias of. Example: `www.example.com` → Wi‑Fi under `*.example.com` →
+  Ethernet, where `www.example.com` is a CNAME of `example.com` (or of
+  another name under the wildcard). macOS looks the alias target up on its
+  own; that lookup used to follow the target's rule, so apps got the
+  wildcard side's address. Now, for as long as the alias is valid (its TTL,
+  at least a minute and at most a day), the target is resolved through the
+  exact rule's DNS servers and its address is routed through the exact
+  rule's interface. A target that has an exact rule of its own keeps it; a
+  target outside every wildcard domain is not affected. Changing the rules
+  or turning routing off forgets these aliases at once.
+
+### Updating from 0.3.0
+
+- The fix is in the helper, and the 0.3.0 helper speaks the same protocol,
+  so the app does not ask for a reinstall. Update the helper once from
+  Terminal (your rules are kept):
+  `sudo /bin/bash /Applications/RouteSwitch.app/Contents/Resources/helper/install-helper.sh /Applications/RouteSwitch.app/Contents/Resources/helper`
+
 ## [0.3.0] — 2026-10-15
 
 ### Added
@@ -52,7 +75,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Wi‑Fi under `*.example.com` → Ethernet) applies to that name's own records.
   If the name is an alias (CNAME) of another name under the same wildcard,
   macOS looks the alias target up separately and that lookup follows the
-  target's own rule. Planned fix in 0.3.1.
+  target's own rule. Fixed in 0.3.1.
 - The builds are still signed ad hoc, not with a Developer ID and not
   notarized (see README → Download).
 - Not supported: IPv6 routes, VPN (`utun`) interfaces, per-application

@@ -81,11 +81,25 @@ export interface SocketFactory {
  *                   a plain hostname such as `_ldap._tcp.…`): forward to the
  *                   covering wildcard's `dns` (else the system's), learn
  *                   nothing — no rule routes such a name.
+ * An exact rule's name may be an alias (CNAME) of another name under the
+ * base; the proxy then answers that target the exact rule's way too, for the
+ * alias's TTL (`server.ts`, TASK-DELTA-41) — `routeQuery` itself only looks
+ * at rules.
  * `servers` are already filtered (`upstreamServers`); empty means SERVFAIL.
  * A name under no wildcard base at all gets no route (null → REFUSED).
  */
 export type QueryRoute =
-  | { readonly kind: 'learn'; readonly ruleId: string; readonly servers: readonly string[] }
+  | {
+      readonly kind: 'learn';
+      readonly ruleId: string;
+      readonly servers: readonly string[];
+      /**
+       * Set for an exact domain rule (absent for a wildcard): the CNAME
+       * targets of its answers under a wildcard base are bound to it
+       * (`CnameBindings`, TASK-DELTA-41).
+       */
+      readonly exact?: true;
+    }
   | { readonly kind: 'passthrough'; readonly servers: readonly string[] };
 
 export type ProxyRule = Pick<Rule, 'id' | 'enabled' | 'kind' | 'target' | 'iface' | 'dns'>;
@@ -134,14 +148,15 @@ export const routeQuery = (qname: string, rules: readonly ProxyRule[], sources: 
   const match = matchDomainRule(qname, rules);
   if (match !== null) {
     const { rule } = match;
-    if (rule.dns !== undefined) return { kind: 'learn', ruleId: rule.id, servers: upstreamServers([rule.dns]) };
+    const exact = match.via === 'domain';
+    const learn = (servers: readonly string[]): QueryRoute =>
+      exact ? { kind: 'learn', ruleId: rule.id, servers, exact: true } : { kind: 'learn', ruleId: rule.id, servers };
+    if (rule.dns !== undefined) return learn(upstreamServers([rule.dns]));
     const servers = upstreamServers(sources.roleServers(rule.iface));
     // An exact rule's lookup falls back to the system resolvers when its role has no servers
     // (`dns.ts`); a wildcard has no lookup of its own and fails instead.
-    if (servers.length === 0 && match.via === 'domain') {
-      return { kind: 'learn', ruleId: rule.id, servers: upstreamServers(sources.systemServers()) };
-    }
-    return { kind: 'learn', ruleId: rule.id, servers };
+    if (servers.length === 0 && exact) return learn(upstreamServers(sources.systemServers()));
+    return learn(servers);
   }
   const { dns } = covering.rule;
   return { kind: 'passthrough', servers: upstreamServers(dns === undefined ? sources.systemServers() : [dns]) };

@@ -93,7 +93,7 @@ import { UNINSTALL_REPLY_TIMEOUT_MS, requestUninstall, type UninstallReply } fro
  */
 
 /** Version of the helper, reported in `EngineState.helperVersion`. Kept equal to `package.json` by a test. */
-export const HELPER_VERSION = '0.3.0';
+export const HELPER_VERSION = '0.3.1';
 
 export const EXIT_CODES = {
   ok: 0,
@@ -507,6 +507,8 @@ export const createWildcardProxyControl = (deps: WildcardProxyDeps): WildcardPro
   let reported: WildcardProxyStatus['state'] | null = null;
   /** Starts and stops run one after another. */
   let queue: Promise<unknown> = Promise.resolve();
+  /** The rules the proxy's CNAME bindings were made under; a pass with other rules clears them (TASK-DELTA-41). */
+  let bindingRules: string | null = null;
 
   const proxy: DnsProxy = (deps.createProxy ?? createDnsProxy)({
     logger: deps.logger,
@@ -570,6 +572,9 @@ export const createWildcardProxyControl = (deps: WildcardProxyDeps): WildcardPro
   return {
     beforeSync: async (config, context) => {
       roleServers = { ...context.roleDnsServers };
+      const rules = JSON.stringify([config.enabled, config.rules]);
+      if (bindingRules !== null && rules !== bindingRules) proxy.clearCnameBindings();
+      bindingRules = rules;
       await startIfWanted(config);
       const status = proxyFileStatus(proxy.status());
       reported = status.state;

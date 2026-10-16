@@ -2,6 +2,11 @@ import { describe, expect, it } from 'vitest';
 
 import {
   BIND_RETRY_FIRST_MS,
+  CNAME_BINDING_MAX_TTL_SEC,
+  CNAME_BINDING_MIN_TTL_SEC,
+  MAX_CNAME_BINDINGS,
+  cnameBindingTtlSec,
+  createCnameBindings,
   BIND_RETRY_MAX_MS,
   LEARN_WAIT_MS,
   MAX_CONCURRENT_UPSTREAM,
@@ -142,4 +147,76 @@ describe('isLoopbackSource', () => {
       expect(isLoopbackSource(address)).toBe(false);
     },
   );
+});
+
+describe('CNAME bindings (TASK-DELTA-41)', () => {
+  const RULE = { ruleId: 'r1', source: 'www.corp.local' };
+  const clock = () => {
+    let now = 0;
+    return { now: () => now, advance: (ms: number) => (now += ms) };
+  };
+
+  it('pins the bounds: 256 bindings, 60 s … 1 day', () => {
+    expect(MAX_CNAME_BINDINGS).toBe(256);
+    expect(CNAME_BINDING_MIN_TTL_SEC).toBe(60);
+    expect(CNAME_BINDING_MAX_TTL_SEC).toBe(86_400);
+    expect([0, 59, 60, 300, 86_400, 86_401, 0x7fff_ffff, -5, Number.NaN, Number.POSITIVE_INFINITY].map(cnameBindingTtlSec)).toEqual([
+      60, 60, 60, 300, 86_400, 86_400, 86_400, 60, 60, 60,
+    ]);
+  });
+
+  it('a binding lives exactly its clamped TTL, and an expired one is gone', () => {
+    const c = clock();
+    const bindings = createCnameBindings(c.now);
+    bindings.bind('corp.local', RULE, 120);
+    c.advance(119_999);
+    expect(bindings.get('corp.local')).toEqual(RULE);
+    c.advance(1);
+    expect(bindings.get('corp.local')).toBeNull();
+    expect(bindings.size()).toBe(0);
+    expect(bindings.get('other.corp.local')).toBeNull();
+  });
+
+  it('a newer binding of the same target replaces the older one (rule and lifetime)', () => {
+    const c = clock();
+    const bindings = createCnameBindings(c.now);
+    bindings.bind('corp.local', RULE, 86_400);
+    bindings.bind('corp.local', { ruleId: 'r2', source: 'mail.corp.local' }, 60);
+    expect(bindings.size()).toBe(1);
+    c.advance(60_000);
+    expect(bindings.get('corp.local')).toBeNull();
+  });
+
+  it(`holds at most ${String(MAX_CNAME_BINDINGS)}: expired ones go first, then the least recently used`, () => {
+    const c = clock();
+    const bindings = createCnameBindings(c.now);
+    for (let i = 0; i < MAX_CNAME_BINDINGS; i += 1) bindings.bind(`n${String(i)}.corp.local`, RULE, i === 5 ? 60 : 3_600);
+    expect(bindings.size()).toBe(MAX_CNAME_BINDINGS);
+    // n5 expires; one more evicts it, not n0.
+    c.advance(60_000);
+    bindings.bind('extra1.corp.local', RULE, 3_600);
+    expect(bindings.size()).toBe(MAX_CNAME_BINDINGS);
+    expect(bindings.get('n0.corp.local')).toEqual(RULE);
+    // n0 was just used: the next one evicts n1, the least recently used.
+    bindings.bind('extra2.corp.local', RULE, 3_600);
+    expect(bindings.size()).toBe(MAX_CNAME_BINDINGS);
+    expect(bindings.get('n1.corp.local')).toBeNull();
+    expect(bindings.get('n0.corp.local')).toEqual(RULE);
+    expect(bindings.get('extra1.corp.local')).toEqual(RULE);
+    expect(bindings.get('extra2.corp.local')).toEqual(RULE);
+    // A flood never grows it.
+    for (let i = 0; i < 10_000; i += 1) bindings.bind(`flood${String(i)}.corp.local`, RULE, 3_600);
+    expect(bindings.size()).toBe(MAX_CNAME_BINDINGS);
+  });
+
+  it('delete and clear', () => {
+    const bindings = createCnameBindings(() => 0);
+    bindings.bind('a.corp.local', RULE, 300);
+    bindings.bind('b.corp.local', RULE, 300);
+    bindings.delete('a.corp.local');
+    expect(bindings.get('a.corp.local')).toBeNull();
+    expect(bindings.size()).toBe(1);
+    bindings.clear();
+    expect(bindings.size()).toBe(0);
+  });
 });
